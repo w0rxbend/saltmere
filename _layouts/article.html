@@ -3,16 +3,19 @@ layout: default
 ---
 {% assign track = site.tracks | where: "id", page.track | first %}
 <article class="article">
-  <p class="crumb"><a href="{{ '/' | relative_url }}">Home</a>
-    {% if track %} / <a href="{{ '/#' | append: track.id | relative_url }}">{{ track.name }}</a>{% endif %}
+  <p class="crumb"><a href="{{ '/' | relative_url }}">Saltmere</a>
+    {% if track %} → <a href="{{ '/#' | append: track.id | relative_url }}">{{ track.name }}</a>{% endif %}
   </p>
-  <h1>{{ page.title }}</h1>
-  <p class="meta">
-    {% if page.date %}<time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%B %-d, %Y" }}</time>{% endif %}
-    {% if page.reading_time %} · {{ page.reading_time }} min read{% endif %}
-    {% if track %} · <span class="tag">{{ track.name }}</span>{% endif %}
-  </p>
-  {% if page.summary %}<p class="summary">{{ page.summary }}</p>{% endif %}
+
+  <header class="article-head">
+    {% if track %}<p class="eyebrow">{{ track.name }}</p>{% endif %}
+    <h1>{{ page.title }}</h1>
+    <p class="meta">
+      {% if page.date %}<time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%B %-d, %Y" }}</time>{% endif %}
+      {% if page.reading_time %}<span class="dot">·</span>{{ page.reading_time }} min read{% endif %}
+    </p>
+    {% if page.summary %}<p class="summary">{{ page.summary }}</p>{% endif %}
+  </header>
 
   <div class="body">
     {{ content }}
@@ -24,7 +27,7 @@ layout: default
 
   {% if page.sources and page.sources.size > 0 %}
   <div class="sources">
-    <h2>Sources & further reading</h2>
+    <h2>Sources &amp; further reading</h2>
     <ul>
       {% for s in page.sources %}
       <li><a href="{{ s.url }}" rel="noopener">{{ s.title }}</a></li>
@@ -32,4 +35,6 @@ layout: default
     </ul>
   </div>
   {% endif %}
+
+  <p class="article-foot"><a href="{{ '/' | relative_url }}">← Back to all articles</a></p>
 </article>

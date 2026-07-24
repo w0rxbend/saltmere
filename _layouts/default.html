@@ -3,28 +3,67 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#14120f">
   {% seo %}
+
+  <!-- Set theme before paint to avoid a flash -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('saltmere-theme');
+        if (t) document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..600&family=Literata:ital,opsz,wght@0,7..72,400..600;1,7..72,400..500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ '/assets/style.css' | relative_url }}">
 </head>
 <body>
   <header class="site-header">
-    <div class="wrap">
-      <a class="brand" href="{{ '/' | relative_url }}">Saltmere</a>
-      <nav>
+    <div class="wrap header-inner">
+      <a class="brand" href="{{ '/' | relative_url }}">
+        <span class="brand-mark">✦</span> Saltmere
+      </a>
+      <nav class="site-nav">
         {% for t in site.tracks %}
         <a href="{{ '/#' | append: t.id | relative_url }}">{{ t.name }}</a>
         {% endfor %}
       </nav>
+      <button class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle light / dark">
+        <span class="tt-sun" aria-hidden="true">☀</span>
+        <span class="tt-moon" aria-hidden="true">☾</span>
+      </button>
     </div>
   </header>
+
   <main class="wrap">
     {{ content }}
   </main>
+
   <footer class="site-footer">
     <div class="wrap">
-      <p>{{ site.tagline }}</p>
-      <p class="muted">Auto-published twice daily · <a href="https://github.com/w0rxbend/saltmere">source on GitHub</a></p>
+      <p class="foot-tag">{{ site.tagline }}</p>
+      <p class="muted">Auto-published twice daily · 09:00 &amp; 21:00 Europe/Kyiv · <a href="https://github.com/w0rxbend/saltmere">source</a></p>
     </div>
   </footer>
+
+  <script>
+    (function () {
+      var btn = document.querySelector('.theme-toggle');
+      if (!btn) return;
+      function current() {
+        return document.documentElement.getAttribute('data-theme')
+          || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      }
+      btn.addEventListener('click', function () {
+        var next = current() === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', next);
+        try { localStorage.setItem('saltmere-theme', next); } catch (e) {}
+      });
+    })();
+  </script>
 </body>
 </html>

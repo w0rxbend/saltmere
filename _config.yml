@@ -1,8 +1,9 @@
 title: Saltmere
-tagline: A daily learning journal — distributed systems, Linux, Scala/JVM, IoT, observability & CAD
+tagline: A daily engineering journal — distributed systems, microservices, Linux, Scala/JVM, IoT, observability & CAD
 description: >-
   Short, implementable articles researched and published twice a day. Distributed
-  systems (van Steen & Tanenbaum), practical Linux tools, Scala 3 & the JVM,
+  systems theory (van Steen & Tanenbaum), microservices & architecture (Newman),
+  distributed system patterns (Burns), practical Linux tools, Scala 3 & the JVM,
   IoT / embedded (Arduino, ESP, air-quality sensors), monitoring & observability,
   and parametric CAD / 3D printing.
 author: worxbend
@@ -12,20 +13,16 @@ lang: en
 url: "https://w0rxbend.github.io"
 baseurl: "/saltmere"
 
-# --- Build settings (GitHub Pages zero-build Jekyll) ---
+# --- Build settings (GitHub Pages Jekyll) ---
 markdown: kramdown
 kramdown:
   input: GFM
   syntax_highlighter: rouge
-  syntax_highlighter_opts:
-    block:
-      line_numbers: false
 
 plugins:
   - jekyll-seo-tag
   - jekyll-sitemap
 
-# Articles collection. Each Markdown file under _articles/<track>/ becomes a page.
 collections:
   articles:
     output: true
@@ -42,7 +39,13 @@ defaults:
 tracks:
   - id: distributed-systems
     name: Distributed Systems
-    blurb: "Processes, communication, coordination, naming, consistency, fault tolerance & security — following van Steen & Tanenbaum."
+    blurb: "Foundations & theory — processes, communication, coordination, naming, consistency, fault tolerance & security, following van Steen & Tanenbaum."
+  - id: microservices
+    name: Microservices & Architecture
+    blurb: "Service communication, sagas, service mesh, resiliency & stability patterns, scaling, progressive delivery, zero-trust security, and team topologies — following Sam Newman's Building Microservices."
+  - id: sys-patterns
+    name: Distributed System Patterns
+    blurb: "Reusable patterns — sidecar, ambassador, adapter, replication, sharding, work queues, event-driven & FaaS, plus AI infrastructure — following Brendan Burns' Designing Distributed Systems."
   - id: linux-tools
     name: Practical Linux Tools
     blurb: "Command-line tools and small experiments that teach you how the system actually works."
