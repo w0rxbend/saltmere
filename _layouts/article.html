@@ -1,0 +1,35 @@
+---
+layout: default
+---
+{% assign track = site.tracks | where: "id", page.track | first %}
+<article class="article">
+  <p class="crumb"><a href="{{ '/' | relative_url }}">Home</a>
+    {% if track %} / <a href="{{ '/#' | append: track.id | relative_url }}">{{ track.name }}</a>{% endif %}
+  </p>
+  <h1>{{ page.title }}</h1>
+  <p class="meta">
+    {% if page.date %}<time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%B %-d, %Y" }}</time>{% endif %}
+    {% if page.reading_time %} · {{ page.reading_time }} min read{% endif %}
+    {% if track %} · <span class="tag">{{ track.name }}</span>{% endif %}
+  </p>
+  {% if page.summary %}<p class="summary">{{ page.summary }}</p>{% endif %}
+
+  <div class="body">
+    {{ content }}
+  </div>
+
+  {% if page.tags and page.tags.size > 0 %}
+  <p class="tags">{% for tag in page.tags %}<span class="tag">#{{ tag }}</span> {% endfor %}</p>
+  {% endif %}
+
+  {% if page.sources and page.sources.size > 0 %}
+  <div class="sources">
+    <h2>Sources & further reading</h2>
+    <ul>
+      {% for s in page.sources %}
+      <li><a href="{{ s.url }}" rel="noopener">{{ s.title }}</a></li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</article>

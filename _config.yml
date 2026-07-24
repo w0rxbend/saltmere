@@ -1,0 +1,62 @@
+title: Saltmere
+tagline: A daily learning journal — distributed systems, Linux, Scala/JVM, IoT, observability & CAD
+description: >-
+  Short, implementable articles researched and published twice a day. Distributed
+  systems (van Steen & Tanenbaum), practical Linux tools, Scala 3 & the JVM,
+  IoT / embedded (Arduino, ESP, air-quality sensors), monitoring & observability,
+  and parametric CAD / 3D printing.
+author: worxbend
+lang: en
+
+# --- Build settings (GitHub Pages zero-build Jekyll) ---
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# Articles collection. Each Markdown file under _articles/<track>/ becomes a page.
+collections:
+  articles:
+    output: true
+    permalink: /:collection/:path/
+
+defaults:
+  - scope:
+      path: ""
+      type: articles
+    values:
+      layout: article
+
+# Human-readable names + order for the topic tracks.
+tracks:
+  - id: distributed-systems
+    name: Distributed Systems
+    blurb: "Processes, communication, coordination, naming, consistency, fault tolerance & security — following van Steen & Tanenbaum."
+  - id: linux-tools
+    name: Practical Linux Tools
+    blurb: "Command-line tools and small experiments that teach you how the system actually works."
+  - id: scala-jvm
+    name: Scala 3 & the JVM
+    blurb: "Scala 3 language features, JVM internals, performance and the ecosystem."
+  - id: iot-embedded
+    name: IoT & Embedded
+    blurb: "Arduino, ESP32, air-quality sensors, and backend architecture for massive IoT fleets."
+  - id: observability
+    name: Monitoring & Observability
+    blurb: "Metrics, logs, traces, and the systems that make large backends legible."
+  - id: cad-3dprint
+    name: CAD & 3D Printing
+    blurb: "Parametric modeling with FreeCAD, KiCad, and the print pipeline."
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+  - vendor

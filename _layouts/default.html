@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="{{ site.lang | default: 'en' }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% seo %}
+  <link rel="stylesheet" href="{{ '/assets/style.css' | relative_url }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="{{ '/' | relative_url }}">Saltmere</a>
+      <nav>
+        {% for t in site.tracks %}
+        <a href="{{ '/#' | append: t.id | relative_url }}">{{ t.name }}</a>
+        {% endfor %}
+      </nav>
+    </div>
+  </header>
+  <main class="wrap">
+    {{ content }}
+  </main>
+  <footer class="site-footer">
+    <div class="wrap">
+      <p>{{ site.tagline }}</p>
+      <p class="muted">Auto-published twice daily · <a href="https://github.com/w0rxbend/saltmere">source on GitHub</a></p>
+    </div>
+  </footer>
+</body>
+</html>
