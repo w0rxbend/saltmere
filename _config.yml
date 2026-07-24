@@ -8,6 +8,10 @@ description: >-
 author: worxbend
 lang: en
 
+# Project site served at https://w0rxbend.github.io/saltmere/
+url: "https://w0rxbend.github.io"
+baseurl: "/saltmere"
+
 # --- Build settings (GitHub Pages zero-build Jekyll) ---
 markdown: kramdown
 kramdown:
