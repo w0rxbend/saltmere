@@ -80,7 +80,7 @@ $ curl -s http://127.0.0.1:8500/v1/catalog/service/orders | \
 
 Notice this is *client-side* discovery in raw form — the caller pulls the instance list and chooses. Consul can also front the same catalog with DNS (`orders.service.consul`), giving you the server-side shape from the identical registry. The pattern is a client choice, not a property of the tool.
 
-Two knobs govern staleness. **Check interval** decides how fast a dead instance is noticed; **TTL / deregister-after** decides how long a flapping one lingers. Set them too loose and you route to corpses; too tight and a slow GC pause evicts a healthy node mid-request. This is the same freshness-vs-noise tension the [circuit breaker]({% post_url microservices/2026-07-24-circuit-breakers-resilience4j %}) exists to paper over when discovery is momentarily wrong.
+Two knobs govern staleness. **Check interval** decides how fast a dead instance is noticed; **TTL / deregister-after** decides how long a flapping one lingers. Set them too loose and you route to corpses; too tight and a slow GC pause evicts a healthy node mid-request. This is the same freshness-vs-noise tension the [circuit breaker](/articles/microservices/2026-07-24-circuit-breakers-resilience4j/) exists to paper over when discovery is momentarily wrong.
 
 ## The trade-off
 
@@ -94,6 +94,6 @@ Two knobs govern staleness. **Check interval** decides how fast a dead instance 
 
 Newman, in *Building Microservices* (2nd ed.), frames the practical default: DNS-plus-load-balancer server-side discovery is the low-friction choice because it needs nothing special in the client, and a dedicated registry like Consul or Eureka earns its keep once you want richer, faster, health-aware routing than DNS TTLs can give. In practice most teams on Kubernetes get server-side discovery for free from the platform and never run a separate registry at all.
 
-This is deliberately the *plumbing* layer — finding an instance. Deciding call policy across those instances (mTLS, retries, traffic splitting) is the [service mesh]({% post_url microservices/2026-07-26-istio-ambient-mesh-sidecarless %})'s job, and exposing services to outside clients is the API gateway's; both sit a layer above what discovery answers.
+This is deliberately the *plumbing* layer — finding an instance. Deciding call policy across those instances (mTLS, retries, traffic splitting) is the [service mesh](/articles/microservices/2026-07-26-istio-ambient-mesh-sidecarless/)'s job, and exposing services to outside clients is the API gateway's; both sit a layer above what discovery answers.
 
 **Try next:** In a kind or minikube cluster, `kubectl run tmp --rm -it --image=nicolaka/netshoot -- dig orders.shop.svc.cluster.local`, then scale the Deployment (`kubectl scale deploy/orders --replicas=3`) and re-run `dig` against the *headless* variant — watch the A-record set grow while the ClusterIP name stays a single stable address. That difference *is* server-side vs client-side, live.
