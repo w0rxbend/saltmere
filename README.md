@@ -44,6 +44,41 @@ Everything degrades gracefully: with JavaScript turned off you still get every
 article, every link and the full track listings — you only lose search,
 filtering and the theme toggle.
 
+## Writing style
+
+`STYLE.md` is the house style, and it binds both the publishing job and any
+editing pass. In short: third-person academic register, no filler and no hype,
+a `**Gist.**` paragraph opening every article, mechanism-level depth with the
+load-bearing detail in bold, a 20-40 line Scala 3 sketch where the topic admits
+one, and a `## Pitfalls` section of concrete symptom-and-cause entries.
+
+Its most important section is **Evidence discipline**. Asking a writer to "add
+depth" reliably produces invented precision — a plausible benchmark number, a
+documentation chapter that has since been renumbered, a reconstructed motive for
+a design decision, a vendor guarantee quoted the wrong way round. Depth must
+come from explaining mechanisms already established. Where a claim cannot be
+supported from a cited source, it gets cut: a shorter accurate article is worth
+more than a longer confident one.
+
+Two checkers enforce what can be checked mechanically:
+
+```bash
+python3 tools/check_style.py                       # whole corpus
+python3 tools/check_style.py _articles/x/y.md ...  # named files
+python3 tools/style_progress.py                    # conversion progress by track
+```
+
+`check_style.py` finds second person, filler, hype, a missing `**Gist.**`
+opener and a missing `## Pitfalls` section. It exempts code blocks and inline
+code — `git rebase --just-in-case` is a command, not filler — and it also
+inspects the front matter's `title` and `summary`, which are rendered on cards
+and article headers.
+
+It is deliberately **not** wired into CI yet: the corpus is being converted
+track by track, and the checker would currently fail the build on every article
+that has not been converted. Wire it in once `tools/style_progress.py` reports
+100%.
+
 ## Local preview
 
 The real site is built by Jekyll, which needs Ruby:
