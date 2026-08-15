@@ -18,95 +18,84 @@ sources:
     url: "https://www.mintlify.com/ben-manes/caffeine/advanced/efficiency"
 ---
 
-A cache is finite, so a cache is defined less by what it stores than by **what it decides to forget**. When the cache is full and a new item arrives, the eviction (or replacement) policy picks the victim. That single decision, made millions of times a second, sets your hit ratio — and a few points of hit ratio is the difference between a database that idles and one that melts.
+**Gist.** A cache of capacity *C* must choose a victim every time a miss arrives at a full cache, and that choice — not the storage — determines the hit ratio. Every deployed policy approximates Belady's optimal offline rule (evict the item whose next reference is furthest in the future, unimplementable online) with a heuristic over past references: recency, frequency, or a blend. The cost of the heuristic is metadata per entry plus, in the case of least-recently-used (LRU), a **mutation of shared state on every read**, which converts a read-mostly workload into a write-mostly one at the lock.
 
-This article is about **eviction**: given a full cache, what do you remove? A closely related question — *admission*, i.e. whether a new item deserves to enter at all — is covered in a [separate article on TinyLFU's doorkeeper](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/). Here I mention admission only where a modern policy (W-TinyLFU, S3-FIFO) blends the two.
+This article covers **eviction**. The complementary question — *admission*, whether an arriving item deserves entry at all — is treated in a [separate article on TinyLFU's doorkeeper](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/), and appears below only where a modern policy blends the two.
 
-## The tension: recency vs. frequency vs. scans
+## The tension: recency, frequency, scans
 
-Every policy is a bet about the future encoded as a heuristic about the past. Two signals dominate:
+Each policy is a bet about the future encoded as a statistic about the past. Two signals dominate.
 
-- **Recency** — "recently used means soon-to-be-used." Great for temporal locality (a user paging through their own data). This is LRU's bet.
-- **Frequency** — "often used means valuable." Great for a stable hot set (the top 1% of products that 50% of traffic wants). This is LFU's bet.
+- **Recency** — the reuse-distance distribution has mass near zero, so a recently referenced item is likely to be referenced again. This is LRU's bet.
+- **Frequency** — under a Zipf-like popularity distribution with skew α ≈ 0.8–1.0, a small head of the keyspace absorbs most requests, so long-run reference count predicts value. This is least-frequently-used (LFU)'s bet.
 
-Neither alone is enough. Pure LRU is wrecked by a **scan**: one sequential pass over a large cold dataset (a batch job, a full-table backup) touches every item exactly once, and each touch shoves a genuinely hot item out of the cache. This is **cache pollution**, and resistance to it — **scan resistance** — is the property that separates toy policies from production ones. Pure LFU has the opposite failure: it clings to items that were hot last week and never lets a newly-popular item build up enough frequency to survive. The good modern policies **adapt** between recency and frequency, or use a small filter to keep scans out.
+Neither is sufficient, and the failure modes are complementary. LRU is destroyed by a **scan**: a sequential pass over *N* > *C* distinct cold items references each exactly once, and since every reference is a miss that inserts at the most-recently-used end, the entire working set is displaced. **The number of hot entries surviving a scan of length N is max(0, C − N), so any scan of length ≥ C empties the cache** — hit ratio drops to zero and recovers only over a full re-warm. Resistance to this, **scan resistance**, separates toy policies from production ones. LFU fails in the opposite direction: an item with a large accumulated count is unevictable long after its popularity ends, and a newly popular item cannot accumulate enough count to displace it. Practical LFU therefore requires **aging** — periodic halving or windowed decay of counters.
 
 ## The classics
 
-**FIFO** evicts in insertion order — a plain queue, no per-access bookkeeping. Cheap and lock-free-friendly, but blind to reuse: a hot item inserted early gets evicted on schedule regardless of how often it's hit. Rarely the best hit ratio, but its simplicity is why the 2023–24 designs came back to it.
+**FIFO** (first-in, first-out) evicts in insertion order. Per-hit cost is zero: hits touch no shared state, so the structure is trivially concurrent. It is blind to reuse — an item inserted early is evicted on schedule regardless of reference count — and its hit ratio is normally the worst of the group. The zero-cost hit path is why the 2023–24 designs returned to it.
 
-**LRU** evicts the least-recently-used item. Every access moves the item to the "most recent" end. It captures recency perfectly and is the industry default (Redis approximates it, Memcached uses it). Weaknesses: no frequency signal, and it is **not scan-resistant** — a scan flushes the working set. It also mutates shared state on *every read* (moving a node to the head), which is a lock contention headache under concurrency.
+**LRU** evicts the least-recently-used entry and gives O(1) `get` and `put` via a hash map for lookup plus a doubly linked list for ordering: the map yields O(1) find, the list yields O(1) unlink and O(1) splice to the head, and the tail is the victim. Sentinel head and tail nodes remove every null check for the empty and single-element cases — the detail an interviewer is checking for. Two structural weaknesses follow from the design: there is no frequency signal, and the promotion on `get` is a **write on the read path**, so under concurrency every hit contends for the list lock. Redis approximates LRU by sampling (`maxmemory-samples`, default 5 candidates) precisely to avoid maintaining the list at all.
 
-**LFU** evicts the least-frequently-used, keeping a counter per item. Strong on stable skewed workloads, but has three classic problems: stale counters (yesterday's hot item), slow adaptation, and the cost of maintaining a min-frequency structure. Practical LFUs need **aging** (periodically decay counts) to stay relevant.
+**LFU** keeps a per-entry counter and needs a structure supporting O(1) increment and O(1) minimum — typically buckets of equal-count entries in a linked list of frequencies. Its costs are counter memory, bucket bookkeeping, and the staleness above.
 
-### The O(1) LRU — the classic interview question
+## The middle generation
 
-The interview task: `get` and `put` in O(1). The trick is a **hash map for lookup** plus a **doubly linked list for ordering**. The map gives O(1) find; the list gives O(1) move-to-front and O(1) tail eviction.
+**CLOCK / second chance** approximates LRU with **one reference bit per entry** and no list surgery. Entries occupy a circular buffer; a hit sets the bit. A hand sweeps: bit = 1 → clear it and advance (second chance); bit = 0 → evict. The state machine per entry is `{resident,1} → {resident,0} → evicted`, with any hit resetting to `{resident,1}`. Amortised sweep cost is O(1); worst case is one full revolution when every bit is set. Operating-system page replacement uses this because the hit path is a single bit store.
 
-```python
-class Node:
-    __slots__ = ("key", "val", "prev", "next")
-    def __init__(self, key=0, val=0):
-        self.key, self.val = key, val
-        self.prev = self.next = None
+**2Q** (Johnson & Shasha, VLDB 1994) adds scan resistance with two structures: arrivals enter a small FIFO, and **only a second reference promotes an entry to the main LRU queue**. A one-shot scan therefore dies in the FIFO. **SLRU** (segmented LRU) expresses the same invariant as a probationary and a protected segment with eviction always drawn from probation; it is the internal structure of W-TinyLFU's main region.
 
-class LRUCache:
-    def __init__(self, capacity: int):
-        self.cap = capacity
-        self.map = {}                      # key -> Node
-        self.head, self.tail = Node(), Node()  # sentinels
-        self.head.next = self.tail         # head <-> ... <-> tail
-        self.tail.prev = self.head         # head side = MRU, tail side = LRU
+**LIRS** (Jiang & Zhang, SIGMETRICS 2002) ranks by **reuse distance** — the count of distinct items referenced between two references to the same item — rather than by recency. It is strong on looping storage workloads; its stack-pruning bookkeeping is intricate.
 
-    def _remove(self, node):
-        node.prev.next, node.next.prev = node.next, node.prev
+**ARC** (Megiddo & Modha, USENIX FAST '03) maintains two LRU lists, T1 for items seen once and T2 for items seen at least twice, plus two **ghost lists** B1 and B2 holding only the keys of recently evicted entries, no data. The invariant is |T1| + |T2| ≤ C and |T1| + |B1| ≤ C. A hit in B1 proves the recency side was starved and increases the target size `p` for T1; a hit in B2 increases T2's share. **ARC self-tunes with no workload-specific constant, is scan-resistant because a single-reference item never enters T2 — it is evicted from T1 into the ghost list B1 without ever displacing the frequency-side working set — and costs roughly 2× LRU's metadata** for the ghost keys. IBM patents on ARC pushed several open-source systems toward alternatives.
 
-    def _add_front(self, node):            # insert right after head (MRU)
-        node.prev, node.next = self.head, self.head.next
-        self.head.next.prev = node
-        self.head.next = node
+## The 2023–24 rethink: FIFO suffices
 
-    def get(self, key: int) -> int:
-        if key not in self.map:
-            return -1
-        node = self.map[key]
-        self._remove(node)                 # touch: promote to MRU
-        self._add_front(node)
-        return node.val
+**W-TinyLFU**, the policy in [Caffeine](https://www.mintlify.com/ben-manes/caffeine/advanced/efficiency), places a small LRU **window** (about 1 % of capacity) ahead of an SLRU **main** region guarded by TinyLFU admission. Frequency is estimated by a **4-bit Count–Min sketch sized to the cache's maximum entry count**, four counters consulted per key, halved every *W* increments so stale popularity decays geometrically. On eviction the candidate and the victim are compared by estimated frequency and the higher wins. Reported hit ratios sit within a few percent of Belady's optimum on many traces at O(1) cost.
 
-    def put(self, key: int, value: int) -> None:
-        if key in self.map:
-            self._remove(self.map[key])
-        node = Node(key, value)
-        self.map[key] = node
-        self._add_front(node)
-        if len(self.map) > self.cap:
-            lru = self.tail.prev           # evict from tail
-            self._remove(lru)
-            del self.map[lru.key]
+**S3-FIFO** (Yang et al., SOSP '23) discards linked-list LRU for three FIFO queues: **small** (≈10 % of capacity), **main** (≈90 %), and a ghost queue of evicted keys. The load-bearing idea is **quick demotion**: on skewed traces most objects are one-hit wonders, so evicting them within one small-queue traversal preserves the main queue. A second hit in small promotes to main; a ghost hit admits directly to main. The paper reports approximately **6× throughput at 16 threads relative to LRU** alongside an equal or better hit ratio.
+
+**SIEVE** (Zhang et al., USENIX NSDI '24) is a single FIFO with one **visited bit** per object and a hand that moves from tail toward head, skipping and clearing set bits and evicting the first clear one. Insertions go to the head; the hand does not reset to the tail on insertion, which is what distinguishes SIEVE from CLOCK. Crucially **a hit only sets a bit — the object is never moved — so the hit path performs no list mutation and needs no lock**, the inverse of LRU's write-on-read.
+
+### Implementation sketch (Scala)
+
+```scala
+final class Sieve[K, V](capacity: Int):
+  private final class Node(val key: K, var value: V):
+    var visited: Boolean = false
+    var prev, next: Node = null          // head side = newest
+
+  private val index = scala.collection.mutable.HashMap.empty[K, Node]
+  private var head, tail, hand: Node = null
+
+  def get(key: K): Option[V] = index.get(key).map { n =>
+    n.visited = true                     // the entire hit path: one bit store
+    n.value
+  }
+
+  def put(key: K, value: V): Unit = index.get(key) match
+    case Some(n) => n.value = value; n.visited = true
+    case None =>
+      if index.size >= capacity then evict()
+      val n = Node(key, value)
+      n.next = head
+      if head != null then head.prev = n else tail = n
+      head = n
+      index(key) = n
+
+  private def evict(): Unit =
+    var c = if hand != null then hand else tail
+    while c.visited do                   // second chance, then move toward head
+      c.visited = false
+      c = if c.prev != null then c.prev else tail
+    hand = c.prev                        // hand survives across evictions
+    unlink(c)
+    index -= c.key
+
+  private def unlink(n: Node): Unit = ??? // ... standard list splice
 ```
 
-Sentinel head/tail nodes remove all the null-checking around empty and single-element cases — the detail interviewers look for. Note the write-on-read in `get`: that's exactly the property SIEVE later attacks.
-
-## The smarter middle generation
-
-**CLOCK / Second-Chance** is an approximation of LRU that avoids LRU's per-read list surgery. Items sit in a circular buffer, each with a **reference bit** set on access. A "hand" sweeps: if the bit is 1, clear it and give a second chance; if 0, evict. It's what OS page replacement actually uses because it needs no work on a hit beyond setting a bit — cheap and concurrency-friendly.
-
-**2Q** (Johnson & Shasha) adds scan resistance with two queues: new items enter a small FIFO "in" queue; only items referenced *again* graduate to a main LRU queue. A one-shot scan dies in the FIFO and never pollutes the hot set. This "prove yourself on a second access" idea recurs everywhere below.
-
-**SLRU** (Segmented LRU) splits the cache into a **probationary** and a **protected** segment. New items land in probation; a second hit promotes them to protected. Eviction always comes from probation first. Same principle as 2Q, and it's the internal structure of W-TinyLFU's main region.
-
-**LIRS** (Jiang & Zhang, SIGMETRICS 2002) uses **reuse distance** (inter-reference recency) rather than plain recency, distinguishing "low reuse-distance" hot blocks from "high reuse-distance" cold ones. Excellent on looping/scan-heavy storage workloads, but the bookkeeping is intricate.
-
-**ARC** (Megiddo & Modha, FAST '03) is the elegant one. It keeps **two LRU lists** — T1 for items seen once (recency) and T2 for items seen at least twice (frequency) — plus two **ghost lists** (B1, B2) that remember *keys of recently evicted items with no data*. A hit in a ghost list is a signal: "I evicted this too soon from the recency side (or frequency side)." ARC uses that signal to **adaptively move a target boundary `p`**, shrinking one list and growing the other. It self-tunes between recency and frequency with no magic constants, is scan-resistant, and costs only ~2× the metadata of LRU. (Its main real-world friction is that IBM held patents on it — a reason open-source systems often reached for alternatives.)
-
-## The 2023–24 rethink: FIFO is enough
-
-**W-TinyLFU** (the policy behind [Caffeine](https://www.mintlify.com/ben-manes/caffeine/advanced/efficiency)) combines a tiny LRU **window** (~1% of capacity) with a large **main** region managed by SLRU and guarded by **TinyLFU admission**. Frequency is estimated by a **4-bit Count-Min sketch** (~2 bytes/entry) that is **periodically halved** to age out stale popularity. On a main-region eviction, the incoming candidate and the victim are compared by estimated frequency — *higher frequency wins*. The small window captures bursts and recency; the frequency filter keeps one-hit scan items out of the main region. The result: hit ratios within a few percent of Belady's optimal on many traces, well above plain LRU, at O(1) cost.
-
-**S3-FIFO** (Yang, Zhang, Qiu, Yue & Vinayak, SOSP '23 — *"FIFO Queues Are All You Need for Cache Eviction"*) throws out linked-list LRU entirely and uses **three FIFO queues**: a **small** queue (~10%) that filters new arrivals, a **main** queue (~90%), and a **ghost** queue of evicted keys. The insight is **quick demotion**: in skewed workloads most objects are one-hit wonders, so evict them fast. An item in the small queue that gets a second hit is promoted to main; otherwise it's demoted (its key parked in the ghost). A later hit on a ghost key means "should've kept it" and admits it straight to main. FIFO queues are far more scalable than LRU (the paper reports ~6× throughput at 16 threads) *and* often a better hit ratio, because quick demotion is exactly what scan-heavy, skewed traffic wants.
-
-**SIEVE** (Zhang, Yang, Yue, Vigfusson & Rashmi, NSDI '24 — *"SIEVE is Simpler than LRU"*) is almost embarrassingly simple. It's a single FIFO queue where each object has one **visited bit**. A moving **hand** pointer sweeps from tail toward head: visited bit set → clear it and skip (a second chance); bit clear → evict. New items are always inserted at the head, and — crucially — **a hit only sets the bit, it never moves the object** (lazy promotion). That means cache hits require **no list mutation and no locking**, the exact opposite of LRU's write-on-read. Despite the simplicity, SIEVE matches or beats far more complex policies on web-cache traces and is trivial to drop into an existing FIFO/LRU codebase.
+The loop terminates because each iteration clears one bit and no bit is set inside `evict`, bounding the sweep by the number of resident entries.
 
 ## Comparison table
 
@@ -114,17 +103,23 @@ Sentinel head/tail nodes remove all the null-checking around empty and single-el
 |---|---|---|---|---|---|
 | FIFO | insertion order | No | No | Very low | Simplicity, streaming |
 | LRU | recency | No | No | O(1), write-on-read | Temporal locality |
-| LFU (+aging) | frequency | Partly | No | Min-freq structure | Stable hot set |
+| LFU (+aging) | frequency | No | No | Min-freq structure | Stable hot set |
 | CLOCK | approx recency | No | No | 1 bit/item | OS pages, low overhead |
 | 2Q / SLRU | recency + reuse | Yes | Weakly | ~2 queues | General workloads |
 | LIRS | reuse distance | Yes | Partly | Higher, intricate | Storage / loops |
 | ARC | recency + freq | Yes | **Yes** (ghosts) | ~2× LRU | Mixed, self-tuning |
-| W-TinyLFU | freq sketch + LRU window | Yes | Yes | ~2 B/entry sketch | Skewed web/app caches |
+| W-TinyLFU | freq sketch + LRU window | Yes | Yes | 4-bit sketch + window | Skewed web/app caches |
 | S3-FIFO | freq-of-2 via FIFOs | Yes | Yes | 3 FIFOs + ghost | Skewed, high-concurrency |
 | SIEVE | 1 visited bit + hand | Yes | Weakly | 1 bit/item, lock-free hits | Web caches, turn-key |
 
-## What to actually reach for
+## Pitfalls
 
-If you need a default that is simple, concurrent, and hard to beat on skewed traffic, **SIEVE** or **S3-FIFO** are the current sweet spot — FIFO-based, lock-light, scan-resistant. If you're on the JVM, **Caffeine's W-TinyLFU** is the mature, battle-tested choice. **ARC** remains the textbook example of principled self-tuning. And plain **LRU** is still fine when locality is strong and scans are absent — just know that the moment a batch job walks your keyspace, its hit ratio falls off a cliff.
+- A batch job or backup that walks the keyspace collapses an LRU cache's hit ratio to near zero for the duration plus the re-warm period, because every scanned item is a miss inserted at the most-recently-used end.
+- An LFU without aging serves last week's hot set indefinitely: counters are monotonic, so a decayed item still outranks any newcomer that has not accumulated the same count.
+- LRU under concurrency degrades to a single-writer structure, because the promotion in `get` mutates the shared list and therefore takes the same lock the writes take.
+- Sizing a ghost list smaller than the cache breaks ARC's adaptation: with |T1| + |B1| < C the "evicted too soon" signal is discarded before it can arrive, and `p` stops moving.
+- Sizing W-TinyLFU's window at zero rejects bursty new content outright, since an item with sketch estimate 0 loses every admission comparison against a resident victim.
+- Resetting SIEVE's hand to the tail on each eviction turns it into CLOCK and forfeits the property that the hand partitions old from newly inserted objects.
+- Measuring policies on a uniform-random trace ranks them all equal, because no policy beats random replacement when reuse distance carries no information.
 
-**Try next:** run your own production trace through the open-source [libCacheSim](https://github.com/1a1a11a/libCacheSim) simulator and compare LRU vs. SIEVE vs. W-TinyLFU hit ratios — then re-read the [TinyLFU admission](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/) article to see how *admission* control stacks on top of the eviction policy you just picked.
+**Try next:** replay a production trace through [libCacheSim](https://github.com/1a1a11a/libCacheSim), comparing LRU, SIEVE and W-TinyLFU at the deployed capacity, then read the [TinyLFU admission](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/) article.
