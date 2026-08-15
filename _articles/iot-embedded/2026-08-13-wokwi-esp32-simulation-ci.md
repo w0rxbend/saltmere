@@ -93,6 +93,7 @@ wokwi-cli . --timeout 10000 --scenario button.test.yaml \
 
 In GitHub Actions, build first, then hand off to the action (it wraps the CLI):
 
+{% raw %}
 ```yaml
 - name: Simulate with Wokwi
   uses: wokwi/wokwi-ci-action@v1
@@ -104,6 +105,7 @@ In GitHub Actions, build first, then hand off to the action (it wraps the CLI):
     expect_text: 'Button pressed 3 times'
     fail_text: 'panic'
 ```
+{% endraw %}
 
 The token comes from the Wokwi CI dashboard, starts with `wok_`, and is 44 characters — store it as a repo secret. Because the simulation has real network access, you can even boot firmware that connects to Wi-Fi and publishes an MQTT message, then assert on the broker side.
 

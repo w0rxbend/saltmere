@@ -104,6 +104,7 @@ Once the contract is published, three things follow. Downstream teams **depend o
 
 Wire that into CI and the guarantee becomes mechanical. A minimal GitHub Actions step:
 
+{% raw %}
 ```yaml
 - uses: bufbuild/buf-action@v1
   with:
@@ -111,6 +112,7 @@ Wire that into CI and the guarantee becomes mechanical. A minimal GitHub Actions
     breaking: true
     breaking_against: 'https://github.com/${{ github.repository }}.git#branch=main'
 ```
+{% endraw %}
 
 Now a pull request that deletes a field or reuses a tag number fails before merge — the same shape of guardrail as a schema-registry compatibility check or a consumer-driven contract test, but enforced on the `.proto` itself.
 

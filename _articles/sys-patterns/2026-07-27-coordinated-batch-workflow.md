@@ -43,6 +43,7 @@ The three are chosen by coupling, not by scale. A **work queue** suits embarrass
 
 Argo Workflows expresses stage dependencies with the `dependencies` field: a task runs only after every task it lists has completed. That is exactly a barrier/join. Here is a three-stage pipeline — split, three parallel shard-processors, then reduce:
 
+{% raw %}
 ```yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Workflow
@@ -81,6 +82,7 @@ spec:
   - name: reducer
     container: {image: pipeline/reducer:1.0, command: [/reduce]}
 ```
+{% endraw %}
 
 Mapping each stage to a pattern:
 

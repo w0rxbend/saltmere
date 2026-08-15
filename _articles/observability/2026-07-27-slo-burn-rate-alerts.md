@@ -71,6 +71,7 @@ groups:
 
 Then the alert `or`s together the fast and slow window pairs. `0.001` is the error budget (`1 - 0.999`); each threshold is `burn_rate × budget`:
 
+{% raw %}
 ```yaml
 - alert: ErrorBudgetBurn
   expr: |
@@ -90,6 +91,7 @@ Then the alert `or`s together the fast and slow window pairs. `0.001` is the err
   annotations:
     summary: "High error-budget burn on {{ $labels.job }}"
 ```
+{% endraw %}
 
 Because both sub-conditions in each pair must hold, you get the precision of the long window with the fast reset of the short one — the whole point of the multi-window design. Add the `3d`/`6h`, burn-rate-1 pair as a separate `severity: ticket` alert for slow leaks.
 

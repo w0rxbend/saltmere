@@ -30,6 +30,7 @@ By August 2026 OpenBao is well past "the fork": the current line is **2.6** (2.6
 
 The core trick: OpenBao holds one privileged DB account and uses it to `CREATE ROLE` on demand. Each service login gets a **fresh username/password pair with a TTL**; when the lease expires, OpenBao drops the role. Nothing long-lived ever reaches the application.
 
+{% raw %}
 ```bash
 bao server -dev                      # dev mode: in-memory, auto-unsealed. Never prod.
 
@@ -49,6 +50,7 @@ bao write database/roles/orders-svc \
 bao read database/creds/orders-svc
 # username  v-kubernet-orders-svc-x7Qw...   password  A1b2...   lease_duration  1h
 ```
+{% endraw %}
 
 Two operational notes. First, run `bao write -f database/rotate-root/appdb` after config — OpenBao rotates the root DB password so even *you* no longer know it. Second, a leaked dynamic credential is contained twice over: it expires on its own, and `bao lease revoke -prefix database/creds/orders-svc` kills every outstanding lease now.
 

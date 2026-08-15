@@ -22,8 +22,9 @@ Elsewhere in this track we built the Google SRE Workbook's multi-window multi-bu
 
 ## The spec is the whole point
 
-Here is a complete availability SLO for an HTTP service. The SLI is defined by two PromQL queries; Sloth fills in `{{.window}}` for each burn window it needs.
+Here is a complete availability SLO for an HTTP service. The SLI is defined by two PromQL queries; Sloth fills in {% raw %}`{{.window}}`{% endraw %} for each burn window it needs.
 
+{% raw %}
 ```yaml
 version: "prometheus/v1"
 service: "myservice"
@@ -44,6 +45,7 @@ slos:
       ticket_alert:
         labels: {severity: ticket}
 ```
+{% endraw %}
 
 That is the entire input. `objective: 99.9` sets the target; the error budget (`1 - 0.999 = 0.1%` over the rolling 30-day window) is derived. `page_alert` and `ticket_alert` map to the fast-burn and slow-burn tiers.
 

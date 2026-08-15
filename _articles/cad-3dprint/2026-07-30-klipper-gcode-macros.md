@@ -39,8 +39,8 @@ Now `HELLO` is a first-class G-code command. Type it in the console, call it fro
 
 Klipper evaluates each `gcode:` block as a [Jinja2](https://www.klipper3d.org/Command_Templates.html) template *before* running it. Two constructs matter:
 
-- **`{ ... }`** — evaluate an expression and substitute the result. (Note: single braces, not Jinja's usual `{{ }}`.)
-- **`{% ... %}`** — a statement: `set`, `if`, `for`.
+- **`{ ... }`** — evaluate an expression and substitute the result. (Note: single braces, not Jinja's usual {% raw %}`{{ }}`{% endraw %}.)
+- **{% raw %}`{% ... %}`{% endraw %}** — a statement: `set`, `if`, `for`.
 
 {% raw %}
 ```

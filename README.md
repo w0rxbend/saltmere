@@ -83,3 +83,22 @@ sources:
 
 Article body in Markdown…
 ```
+
+### Escaping other tools' templates
+
+Jekyll runs each article through Liquid first, and Liquid owns `{% raw %}{% ... %}{% endraw %}`
+and `{% raw %}{{ ... }}{% endraw %}`. Many tools these articles cover use the same braces —
+GitHub Actions, Prometheus, Vault, Argo, Helm, Jinja, Klipper. An unescaped
+snippet either aborts the build or silently renders as nothing, so wrap the
+code block:
+
+    {% raw %}
+    ```yaml
+    token: ${{ secrets.WOKWI_CLI_TOKEN }}
+    ```
+    {% endraw %}
+
+`python3 tools/check_liquid.py` flags any article that needs this; CI runs it
+before the Jekyll build so a mistake names the file and line rather than
+producing a Ruby stack trace. Deliberate Liquid in prose, such as a
+`{% raw %}{{ site.baseurl }}{% endraw %}` cross-link, is fine and left alone.

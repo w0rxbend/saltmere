@@ -49,6 +49,7 @@ The `??` operator supplies a fallback when the left side errors or is null. `abo
 
 This TOML wires a `file` source into a `remap` transform, then a `sample` transform to thin out high-cardinality info logs, and finally two sinks — Loki for the useful data and a `console` sink so you can watch it during development.
 
+{% raw %}
 ```toml
 [sources.app_logs]
 type = "file"
@@ -89,6 +90,7 @@ inputs = ["parse"]
   [sinks.debug.encoding]
   codec = "json"
 ```
+{% endraw %}
 
 Note `exclude` on the `sample` transform: it's a VRL condition marking events that must **always** pass, so errors and warnings survive sampling while routine info logs are cut 90%. Validate before deploying with `vector validate config.toml`, which type-checks the VRL at startup rather than at 3 a.m.
 

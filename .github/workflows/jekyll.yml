@@ -46,6 +46,13 @@ jobs:
         with:
           # Provision the Pages site automatically on first run — no manual toggle needed.
           enablement: true
+      # Articles routinely quote GitHub Actions, Prometheus, Vault and Helm
+      # templates, which use the same {{ }} braces as Liquid. Catch those here
+      # so the failure names the file and line instead of surfacing as a Ruby
+      # stack trace from deep inside Jekyll.
+      - name: Check articles for unescaped Liquid
+        run: python3 tools/check_liquid.py
+
       - name: Build with Jekyll
         # Outputs to the './_site' directory by default
         run: bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}"

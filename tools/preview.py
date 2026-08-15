@@ -178,9 +178,12 @@ def main():
         write(fm["permalink"], html)
 
     # articles
+    raw_tag = re.compile(r"\{%-?\s*(end)?raw\s*-?%\}\n?")
     for a in site["articles"]:
         mdconv.reset()
-        content = mdconv.convert(a["body_md"])
+        # Jekyll consumes {% raw %} markers; strip them so the preview shows
+        # the same thing the published page does.
+        content = mdconv.convert(raw_tag.sub("", a["body_md"]))
         html = render_layout(env, site, "article", a, content)
         write(a["url"], html)
 

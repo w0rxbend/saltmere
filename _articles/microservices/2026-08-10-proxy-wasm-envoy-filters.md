@@ -52,6 +52,7 @@ The execution model has two context types. A **RootContext** exists once per plu
 
 Here is a complete HTTP filter using the [Rust SDK](https://github.com/proxy-wasm/proxy-wasm-rust-sdk) (crate `proxy-wasm`, current published `0.2.5`). It checks for an inbound `x-api-key` header, rejects the request with `403` if it is missing, and otherwise stamps an `x-wasm-filter` header before the request continues upstream.
 
+{% raw %}
 ```rust
 use log::info;
 use proxy_wasm::traits::*;
@@ -108,6 +109,7 @@ impl HttpContext for ApiKeyFilter {
     }
 }
 ```
+{% endraw %}
 
 Every name here is real SDK surface: `set_root_context`, the `Context` / `RootContext` / `HttpContext` traits, `get_type` returning `ContextType::HttpContext`, `create_http_context`, `on_http_request_headers`, `get_http_request_header`, `add_http_request_header`, `send_http_response`, and the `Action::Continue` / `Action::Pause` return values. `Continue` lets the filter chain proceed; `Pause` stops it — here because we've already produced the response.
 
