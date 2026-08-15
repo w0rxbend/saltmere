@@ -1,9 +1,9 @@
 ---
-title: "The Foreign Function & Memory API: calling C without JNI, finally stable"
+title: "The Foreign Function & Memory API: calling C without JNI"
 date: 2026-07-30
 track: scala-jvm
-summary: "JEP 454 finalized the Foreign Function & Memory API in JDK 22, retiring JNI boilerplate and the soon-to-be-removed sun.misc.Unsafe. Arena, MemorySegment, and a Linker-bound MethodHandle let you call a libc function in a dozen lines — from Java or Scala."
-reading_time: 5
+summary: "JEP 454 finalized the Foreign Function & Memory API in JDK 22, retiring JNI boilerplate and the deprecated memory-access methods of sun.misc.Unsafe. Arena, MemorySegment, and a Linker-bound MethodHandle express a libc call in a dozen lines of Java or Scala."
+reading_time: 6
 tags: [jvm, panama, ffm, native-interop, scala, java22]
 sources:
   - title: "JEP 454: Foreign Function & Memory API"
@@ -18,28 +18,30 @@ sources:
     url: "https://www.baeldung.com/java-project-panama"
 ---
 
-For 25 years, "call this C function from Java" meant JNI: a hand-written header, a companion `.c` shim compiled per platform, manual `GetPrimitiveArrayCritical`/`Release` pairs, and a JVM crash if you got the pin/release dance wrong. The escape hatch for off-heap memory was worse — `sun.misc.Unsafe`, an internal class that was never meant to be public and is now on death row. The **Foreign Function & Memory API** (FFM), finalized as [JEP 454](https://openjdk.org/jeps/454) in **JDK 22** (March 2024), replaces both. The JEP's own framing: it lets programs "call native libraries and process native data without the brittleness and danger of JNI."
+**Gist.** Reaching native code from the Java Virtual Machine (JVM) historically required the Java Native Interface (JNI) — a generated header, a hand-written C shim compiled once per platform, and manual pin/release pairs whose misuse crashes the process — while off-heap memory required the internal class `sun.misc.Unsafe`. The **Foreign Function & Memory API** (FFM), finalized as [JEP 454](https://openjdk.org/jeps/454) in **JDK 22**, replaces both: a `Linker` binds a native symbol to a `MethodHandle`, and an `Arena` owns the lifetime of every `MemorySegment` allocated within it. The cost is that **each access is bounds- and liveness-checked**, that the C signature must be restated as a `FunctionDescriptor` the compiler cannot verify against the header, and that downcalls are a restricted operation gated behind a launcher flag.
 
-## The two things it actually replaces
+## What FFM displaces
 
-**JNI boilerplate.** FFM calls a native function directly through a `MethodHandle`. No C shim, no `javah`/`javac -h`, no per-platform build step — the binding is pure Java.
+**JNI glue.** FFM invokes a native function through a `MethodHandle` obtained from `Linker.downcallHandle`. There is no C shim, no `javah`/`javac -h` step, and no per-platform native build: the binding is ordinary Java code.
 
-**`sun.misc.Unsafe`.** [JEP 471](https://openjdk.org/jeps/471) deprecated the 79 memory-access methods of `Unsafe` for removal, starting in JDK 23, and JDK 24 turns their use into runtime warnings. The named replacements are `VarHandle` (for on-heap) and FFM's `MemorySegment` (for off-heap). If you have code doing `Unsafe.allocateMemory`/`putLong`, FFM is the migration target, and it comes with bounds and lifetime checks `Unsafe` never had.
+**`sun.misc.Unsafe` memory access.** [JEP 471](https://openjdk.org/jeps/471) deprecated the **79 memory-access methods** of `Unsafe` for removal in JDK 23, with warnings on use and eventual removal deferred to later releases. The nominated replacements are `VarHandle` for on-heap access and FFM's `MemorySegment` for off-heap access. Code built on `Unsafe.allocateMemory` and `Unsafe.putLong` migrates onto `MemorySegment`, which adds the bounds and lifetime checks `Unsafe` lacks.
 
-Two LTS releases now carry the relevant context: FFM is still a *preview* in JDK 21 (the previous LTS), and *final* everywhere from JDK 22 onward — including JDK 25, the current LTS. If you're on 21, you need `--enable-preview`; on 22+ you don't.
+Two long-term-support (LTS) releases bracket the transition. FFM is a **preview API in JDK 21**, the preceding LTS, and **final from JDK 22 onward**, including JDK 25. On JDK 21 the compiler and runtime require `--enable-preview`; from JDK 22 they do not.
 
 ## The core abstractions
 
-Four types do the work, all in `java.lang.foreign`:
+Four types in `java.lang.foreign` carry the work.
 
-- **`Arena`** controls the lifetime of native memory. The Javadoc: it "controls the lifecycle of native memory segments, providing both flexible allocation and timely deallocation." `Arena.ofConfined()` is a `try`-with-resources scope — when it closes, every segment it allocated is freed *and invalidated*, so a later access throws instead of corrupting the heap.
-- **`MemorySegment`** is a bounds-checked view over a contiguous region of memory, on- or off-heap. This is the `Unsafe` pointer, made safe.
-- **`Linker`** + **`FunctionDescriptor`** describe a C function's signature and hand you a **`MethodHandle`** to call it. `SymbolLookup` resolves the symbol address.
-- **`jextract`** is the tool that reads C headers and generates these bindings for you — "a tool to mechanically derive Java bindings from a set of native headers." You write the hand-rolled linker code below only for one-off calls; for a real library (SQLite, libgit2, OpenSSL) you run `jextract` once and import the generated class.
+- **`Arena`** controls the lifetime of native memory. The Javadoc describes it as controlling "the lifecycle of native memory segments, providing both flexible allocation and timely deallocation." `Arena.ofConfined()` yields a scope usable with try-with-resources; on close, every segment allocated from it is **freed and invalidated**, so a subsequent access throws rather than reading reclaimed memory.
+- **`MemorySegment`** is a bounds-checked view over a contiguous region, on- or off-heap. It occupies the role of the raw pointer, with the bound carried alongside the address.
+- **`Linker`** and **`FunctionDescriptor`** describe a C function's signature and produce a **`MethodHandle`**; `SymbolLookup` resolves the symbol to an address.
+- **`jextract`** mechanically generates Java bindings from native library headers. Hand-written linker code of the kind shown below suits one-off calls; a library of any size (SQLite, libgit2, OpenSSL) is bound once with `jextract` and the generated class imported.
+
+The invariant that distinguishes FFM from `Unsafe` is **temporal, not spatial**: a segment records the arena that produced it, and every access first checks that this arena is still alive. A confined arena additionally records its owning thread, so access from another thread is rejected. The failure mode of `Unsafe` — a use-after-free that reads or writes an unrelated allocation and manifests as corruption at an unrelated point in the program — becomes a thrown exception at the point of the offending access.
 
 ## Calling `strlen` from libc
 
-A complete, compilable JDK 22 program. `strlen` has the C signature `size_t strlen(const char *s)` — one pointer in, an integer out:
+`strlen` has the C signature `size_t strlen(const char *s)`: one pointer in, an integer out.
 
 ```java
 import java.lang.foreign.*;
@@ -66,13 +68,13 @@ public class Strlen {
 }
 ```
 
-Run it with `java Strlen.java`. Note the shape: `FunctionDescriptor.of(returnLayout, argLayouts...)` mirrors the C prototype, `downcallHandle` compiles that into a callable handle, and the `Arena` guarantees the string we passed by pointer outlives the call and is reclaimed the instant we leave the block. There's no explicit `free` and no way to touch `cString` after the arena closes.
+The program runs directly as `java Strlen.java`. Three pieces carry the semantics. `FunctionDescriptor.of(returnLayout, argLayouts...)` mirrors the C prototype in the same order; `downcallHandle` turns that description into a callable handle; and the arena guarantees that the pointed-to string **outlives the call and is reclaimed on leaving the block**. No explicit `free` appears, and `cString` is unreachable in a usable state after the arena closes.
 
-`getpid` is even shorter — no arguments, so `FunctionDescriptor.of(JAVA_INT)` and `getpid.invoke()` with an empty arena.
+A nullary function is shorter: `getpid` needs `FunctionDescriptor.of(JAVA_INT)` and an argument-free `invoke`.
 
-## Invoking it from Scala
+### Implementation sketch (Scala)
 
-The API is plain Java classes, so Scala calls it verbatim — the only wrinkle is `MethodHandle.invoke`, which is *signature-polymorphic*. Scala 3 supports these, but cast the erased return explicitly:
+The API consists of ordinary Java classes, so Scala calls it unchanged. The one wrinkle is that `MethodHandle.invoke` is **signature-polymorphic**: its declared return type is erased, so the result requires an explicit cast.
 
 ```scala
 import java.lang.foreign.*, java.lang.foreign.ValueLayout.*
@@ -86,14 +88,14 @@ val strlen: MethodHandle = linker.downcallHandle(
 
 Using.resource(Arena.ofConfined()) { arena =>
   val s   = arena.allocateFrom("panama")
-  val len = strlen.invoke(s).asInstanceOf[Long]
+  val len = strlen.invoke(s).asInstanceOf[Long]   // signature-polymorphic: erased return
   println(len)   // 6
 }
 ```
 
-`Using.resource` is the idiomatic stand-in for Java's try-with-resources, so the arena still closes deterministically. Everything else — descriptors, segments, layouts — is identical to the Java version.
+`Using.resource` stands in for try-with-resources and closes the arena deterministically on both the normal and the exceptional path. Descriptors, segments and layouts are identical to the Java form.
 
-## JNI vs. FFM, at a glance
+## JNI compared with FFM
 
 | | JNI | FFM (`java.lang.foreign`) |
 |---|---|---|
@@ -103,8 +105,15 @@ Using.resource(Arena.ofConfined()) { arena =>
 | Generating bindings | `javah`, boilerplate | `jextract` from C headers |
 | Status | Legacy, still supported | Final since JDK 22 (preview in 19–21) |
 
-## The one runtime gotcha: `--enable-native-access`
+## The restricted-operation gate
 
-FFM code compiles and runs on any JDK ≥ 22 with no preview flag. But *calling* native code is a restricted operation. Depending on the JDK and how your code is packaged, the runtime may print a warning — or, on newer JDKs tightening this down, refuse the call — unless you grant native access explicitly: `--enable-native-access=ALL-UNNAMED` for the classpath, or name your module. Pure off-heap `MemorySegment` allocation via `Arena` is unrestricted; it's the *downcalls* that are gated. Wire the flag into your launch scripts early so it doesn't surprise you in production.
+FFM code compiles and runs on any JDK 22 or later without a preview flag, but *calling* native code is a **restricted operation**. Depending on the JDK version and on how the code is packaged, the runtime either prints a warning or refuses the call unless native access is granted explicitly: `--enable-native-access=ALL-UNNAMED` for code on the class path, or the module name for modular code. **Allocation through an `Arena` is unrestricted; obtaining the linker and calling out through it are what is gated.** The distinction matters for deployment, because a program can pass every allocation-only test and then fail at its first downcall in a differently launched environment.
 
-**Try next:** save the `Strlen.java` snippet, run it with `java Strlen.java`, then change `strlen` to `getpid` — swap the descriptor to `FunctionDescriptor.of(JAVA_INT)`, drop the argument, and confirm the returned PID matches what your shell reports for that process.
+## Pitfalls
+
+- **A `FunctionDescriptor` that disagrees with the C header is not a compile error.** Nothing checks the descriptor against the real prototype; a mismatched layout produces a garbage return value or memory corruption at the native side rather than a diagnostic.
+- **Accessing a segment after its arena closes throws.** This is the designed behaviour, not a bug, and it appears when a segment escapes the try-with-resources or `Using.resource` block — for example when it is stored in a field or captured by a lambda that runs later.
+- **A confined arena rejects access from a thread other than its creator.** A segment allocated in `Arena.ofConfined()` and then touched from a thread pool worker fails on the liveness/ownership check.
+- **`MethodHandle.invoke` is signature-polymorphic, so the return type is erased.** In Scala, omitting `asInstanceOf` or casting to the wrong primitive width yields a `ClassCastException` or a wrong value rather than a compile error.
+- **A program that only allocates off-heap memory proves nothing about native-access permissions.** The `--enable-native-access` gate applies to the restricted methods that reach native code, not to allocation, so the failure surfaces on the first native call, potentially only in production launch scripts.
+- **JDK 21 requires `--enable-preview`.** Code compiled against the preview form of FFM on JDK 21 is not binary-compatible with a later JDK's final API and must be recompiled.

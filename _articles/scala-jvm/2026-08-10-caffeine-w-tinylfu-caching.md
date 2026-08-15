@@ -2,8 +2,8 @@
 title: "Caffeine and W-TinyLFU: Near-Optimal In-Process Caching on the JVM"
 date: 2026-08-10
 track: scala-jvm
-summary: "Caffeine is the caching library that replaced Guava Cache on the JVM. Here's why its W-TinyLFU eviction policy gets near-optimal hit rates, and concrete Scala/Java code for LoadingCache, AsyncLoadingCache, expireAfterWrite + refreshAfterWrite, and pairing it as an L1 in front of Redis."
-reading_time: 7
+summary: "How Caffeine's Window TinyLFU (W-TinyLFU) policy reaches near-optimal hit rates on the Java Virtual Machine (JVM): the 4-bit Count-Min Sketch, the admission comparison, the window/probation/protected state machine, and the configuration trade-offs of LoadingCache, AsyncLoadingCache, expireAfterWrite versus refreshAfterWrite, and a Caffeine level-one cache in front of Redis."
+reading_time: 9
 tags:
   - caching
   - caffeine
@@ -47,9 +47,9 @@ An entry occupies exactly one of three regions:
 
 Transitions: insertion places a key at the window's most-recently-used end. When the window overflows, its LRU victim becomes a *candidate*. The candidate is not admitted unconditionally; TinyLFU compares `frequency(candidate)` against `frequency(victim)`, where the victim is the probation entry that would be evicted, and **retains the entry with the higher estimated historic usage** — the loser is discarded outright. A hit on a probation entry promotes it to protected; when protected overflows, its LRU victim demotes to probation. The scan case now resolves correctly: a scan key reaches the window, is evicted from it with estimated frequency 1, loses the comparison against a hot probation entry, and is discarded without ever displacing the working set.
 
-Two refinements matter for adversarial and shifting workloads. The window/main ratio is **adaptive**: Caffeine hill-climbs the split, sampling the hit rate as the window grows or shrinks and following the gradient, so a recency-biased workload gets a larger window and a frequency-biased one a smaller one. And because CMS error is one-sided upward, a colliding or adversarially chosen key can appear permanently hot and block all candidates; Caffeine therefore admits **roughly 1% of rejected candidates at random** when their frequency is moderate, which bounds the damage a poisoned counter can do.
+Two refinements matter for adversarial and shifting workloads. The window/main ratio is **adaptive**: Caffeine hill-climbs the split, sampling the hit rate as the window grows or shrinks and following the gradient, so a recency-biased workload gets a larger window and a frequency-biased one a smaller one. And because CMS error is one-sided upward, a colliding or adversarially chosen key can appear permanently hot and block all candidates; Caffeine therefore admits **a small random fraction of rejected candidates** — those whose own estimate is at or above an internal threshold — which bounds how long a single inflated counter can hold the main space closed.
 
-Caffeine's Efficiency wiki reports simulations over Wikipedia, database, search and OLTP traces in which W-TinyLFU reaches a near-optimal hit rate, improves substantially on LRU, and is competitive with Adaptive Replacement Cache (ARC) and Low Inter-reference Recency Set (LIRS) — while, unlike those two, **retaining no metadata for evicted keys**, since the sketch supersedes a ghost list.
+Caffeine's Efficiency wiki reports simulations over Wikipedia, database, search and OLTP traces in which W-TinyLFU reaches a near-optimal hit rate, improves substantially on LRU, and is competitive with Adaptive Replacement Cache (ARC) and Low Inter-reference Recency Set (LIRS) — while, unlike those two, **keeping no per-key ghost entries for evicted keys**: the fixed-size sketch takes the place of a ghost list.
 
 ### Implementation sketch (Scala)
 
@@ -107,7 +107,7 @@ import com.github.benmanes.caffeine.cache.{Caffeine, LoadingCache}
 import java.time.Duration
 
 val users: LoadingCache[UserId, User] =
-  Caffeine.newBuilder()
+  Caffeine.newBuilder[UserId, User]()          // explicit type arguments: Scala infers Object otherwise
     .maximumSize(10_000)                       // W-TinyLFU governs eviction
     .expireAfterWrite(Duration.ofMinutes(5))
     .recordStats()
@@ -129,7 +129,7 @@ They compose, and a common configuration refreshes frequently while expiring on 
 
 ```scala
 val prices: LoadingCache[Sku, Price] =
-  Caffeine.newBuilder()
+  Caffeine.newBuilder[Sku, Price]()
     .maximumSize(50_000)
     .refreshAfterWrite(Duration.ofSeconds(30))
     .expireAfterWrite(Duration.ofMinutes(10))
@@ -147,7 +147,7 @@ val prices: LoadingCache[Sku, Price] =
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache
 
 val usersAsync: AsyncLoadingCache[UserId, User] =
-  Caffeine.newBuilder()
+  Caffeine.newBuilder[UserId, User]()
     .maximumSize(10_000)
     .expireAfterWrite(Duration.ofMinutes(5))
     .buildAsync((id, _) => db.loadUserAsync(id))   // (key, executor) => future
@@ -165,7 +165,7 @@ import io.lettuce.core.api.sync.RedisCommands
 val redis: RedisCommands[String, String] = connection.sync()
 
 val profiles: LoadingCache[UserId, Profile] =
-  Caffeine.newBuilder()
+  Caffeine.newBuilder[UserId, Profile]()
     .maximumSize(20_000)
     .expireAfterWrite(Duration.ofMinutes(2))   // bounds cross-node staleness
     .recordStats()

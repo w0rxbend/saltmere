@@ -1,8 +1,8 @@
 ---
-title: "Scala CLI + the Toolkit: One File to a Real Program, No SBT"
+title: "Scala CLI and the Toolkit: One File to a Packaged Program"
 date: 2026-08-10
 track: scala-jvm
-summary: "Since Scala 3.5 the `scala` command IS Scala CLI. Here's how to go from a single-file `.scala` script with `//> using` directives to a tested, packaged program using the Scala Toolkit — no build tool ceremony."
+summary: "Since Scala 3.5 the `scala` command is Scala CLI. This article traces the path from a single `.scala` file carrying `//> using` directives to a tested, packaged program built on the Scala Toolkit, without a separate build tool."
 reading_time: 6
 tags:
   - scala
@@ -23,13 +23,11 @@ sources:
     url: "https://scala-cli.virtuslab.org/docs/commands/package/"
 ---
 
-For years the first thing you learned about Scala was also the most discouraging: before you could run ten lines of code, you needed SBT, a `build.sbt`, a `project/` folder, and a plugin or two. That tax is gone. As of **Scala 3.5.0** (released 22 August 2024), the `scala` command you get from Homebrew, SDKMAN!, or Coursier *is* Scala CLI. Installing Scala now gives you one binary that compiles, runs, tests, and even publishes to Maven Central — no separate tool, no build file required to start.
+**Gist.** Running a small Scala program historically required an external build definition — an SBT project directory and a `build.sbt` — before a single line executed. As of **Scala 3.5.0, released 22 August 2024**, the `scala` command distributed by Homebrew, SDKMAN! and Coursier *is* Scala CLI, which reads its build configuration from **using directives** embedded in the source file itself (SIP-46). The cost is that configuration is now distributed across the sources it configures rather than centralised, and the escape hatches for larger builds — multi-module layouts, custom tasks — remain outside this model.
 
-This article walks the "understand by building" path: start with a single file, add real dependencies with one-line comments, pull in the Scala Toolkit for everyday work (files, JSON, HTTP), write a test, then produce a binary. Everything below is a real, runnable file.
+## Using directives: configuration inside the compilation unit
 
-## Hello, single file
-
-Create `hello.scala`:
+A using directive is a machine-readable comment beginning with `//>`. Scala CLI parses these before compilation and derives the build from them.
 
 ```scala
 //> using scala 3.5.0
@@ -38,19 +36,22 @@ Create `hello.scala`:
   println("Saltmere says hi from Scala 3")
 ```
 
-Run it:
-
 ```bash
 scala run hello.scala
 ```
 
-The first line is a **using directive** — a machine-readable comment starting with `//>`. It configures the build *inside the source file*, so there is no external config to keep in sync. `//> using scala 3.5.0` pins the language version (you can also write `//> using scala 3` for the latest 3.x). Scala CLI downloads the compiler on first use and caches it.
+`//> using scala 3.5.0` **pins the language version**; `//> using scala 3` selects the latest 3.x instead. The compiler for the requested version is downloaded on first use and cached, so subsequent runs reuse the cached compiler rather than downloading it again. The load-bearing property is that **the file describes its own environment**: transferred to another machine, `scala run hello.scala` resolves the same compiler and the same dependencies.
 
-That is the whole trick: the file describes its own environment. Copy it to a colleague, and `scala run hello.scala` does the same thing on their machine.
+Directives are merged across the whole compilation, not scoped per file. When a directory contains several sources, a directive stated in any one of them applies to the set. This is what makes growing past a single file a non-event: adding `.scala` files to the directory and pointing commands at the directory is the entire migration.
 
-## Adding a dependency in one line
+```bash
+scala run .
+scala test .
+```
 
-Need a library? Add another directive. `//> using dep` takes a standard Maven coordinate in Scala's `org::artifact::version` form (the `::` tells Scala CLI to append the Scala version suffix):
+## Dependencies as coordinates
+
+`//> using dep` takes a Maven coordinate. The **double colon** in `org::artifact:version` instructs Scala CLI to append the Scala binary-version suffix to the artifact name, which is the same convention SBT's `%%` operator encodes.
 
 ```scala
 //> using scala 3.5.0
@@ -63,28 +64,28 @@ Need a library? Add another directive. `//> using dep` takes a standard Maven co
     println(s"${f.last}: $n lines")
 ```
 
-No `build.sbt`, no `libraryDependencies +=`. `scala run` resolves the coordinate, compiles, and runs.
+`scala run` resolves the coordinate, compiles and executes in one invocation. No `libraryDependencies` entry and no build file participate.
 
-## The Scala Toolkit: batteries in one directive
+## The Scala Toolkit
 
-Wiring individual coordinates is fine, but for everyday scripting there is a curated bundle: the **Scala Toolkit**. One directive pulls in a compatible set of libraries maintained to work together:
+The **Scala Toolkit** is a curated bundle whose members are maintained to be mutually compatible, pulled in by a single directive:
 
 ```scala
 //> using toolkit latest
 ```
 
-The Toolkit bundles four libraries (you can also pin a version, e.g. `//> using toolkit 0.2.0`):
+A version may be pinned instead, for example `//> using toolkit 0.2.0`. The bundle comprises four libraries:
 
-- **OS-Lib** — files and processes (`os.read`, `os.write`, `os.list`, subprocess calls)
-- **uPickle / uJSON** — reading and writing JSON
+- **OS-Lib** — files and processes (`os.read`, `os.write`, `os.list`, subprocess invocation)
+- **uPickle / uJSON** — JSON reading and writing
 - **sttp** — an HTTP client
 - **MUnit** — a testing framework
 
-That covers a huge share of "I just need to get something done" tasks without hunting for coordinates.
+Selecting the bundle replaces four coordinate lookups and the compatibility question that accompanies them with one directive.
 
-## A real example: fetch, parse, save
+## A worked example: fetch, parse, persist
 
-Here is a single file that hits an HTTP endpoint, parses the JSON response with uPickle, and writes a summary to disk with OS-Lib. This is the kind of glue script people reach for Python for — and it is a legitimate, typed Scala program.
+The following single file issues an HTTP GET, decodes the JSON response into case classes, and writes a tab-separated summary to disk.
 
 ```scala
 //> using scala 3.5.0
@@ -96,15 +97,12 @@ import upickle.default.*
 case class Repo(name: String, stargazers_count: Int) derives ReadWriter
 
 @main def report(): Unit =
-  // 1. HTTP GET with sttp's quick API — no backend to set up
   val response = quickRequest
     .get(uri"https://api.github.com/users/scala/repos?per_page=5")
     .send()
 
-  // 2. Parse the JSON body into typed case classes with uPickle
   val repos: Seq[Repo] = read[Seq[Repo]](response.body)
 
-  // 3. Build a report and write it with OS-Lib
   val lines = repos.sortBy(-_.stargazers_count).map(r => s"${r.name}\t${r.stargazers_count}")
   val out = os.pwd / "stars.tsv"
   os.write.over(out, lines.mkString("\n"))
@@ -112,17 +110,11 @@ case class Repo(name: String, stargazers_count: Int) derives ReadWriter
   println(s"Wrote ${repos.size} rows to $out")
 ```
 
-Run it the same way:
+Three mechanisms carry the example. First, `sttp.client4.quick.*` supplies a **synchronous backend implicitly**, so `quickRequest.get(uri"…").send()` returns a `Response[String]` exposing `.code` and `.body` with no backend construction. Second, `derives ReadWriter` **generates the uPickle codec at compile time** from the case class shape, so no reflective codec construction or hand-written reader participates at run time. Third, `os.pwd / "stars.tsv"` builds a typed `os.Path` through the `/` operator, so paths are values rather than concatenated strings.
 
-```bash
-scala run report.scala
-```
+## Tests without additional configuration
 
-A few things worth noticing. `quickRequest.get(uri"...").send()` needs no explicit backend — the `quick` import wires a synchronous one for you, returning a `Response[String]` with `.code` and `.body`. `read[Seq[Repo]]` maps JSON straight onto case classes because `derives ReadWriter` generates the codec at compile time; a typo in a field name is a *compile error*, not a 2 a.m. production surprise. And `os.write.over` takes an `os.Path` built with the `/` operator, so paths are values, not fragile strings.
-
-## Writing a test
-
-The Toolkit ships MUnit, so tests need no extra setup. Put testable logic in a function and assert on it. Create `report.test.scala`:
+MUnit arrives with the Toolkit. Scala CLI classifies any file whose name ends in **`.test.scala`** into the test scope; no directive or directory convention is required.
 
 ```scala
 //> using scala 3.5.0
@@ -135,53 +127,48 @@ class ReportTests extends munit.FunSuite:
     assertEquals(sorted, Seq("b", "c", "a"))
 ```
 
-Scala CLI treats files ending in `.test.scala` as the test scope automatically. Run them:
-
 ```bash
 scala test .
 ```
 
-Passing `.` tells it to include every source file in the current directory, so your `report.scala` and its test compile together as one small project — still with zero build files.
+The `.` argument includes every source file in the current directory, so `report.scala` and `report.test.scala` compile as one unit and the test observes the production definitions directly.
 
-## Growing past one file
+## Packaging
 
-When one file gets crowded, just add more `.scala` files in the directory and point commands at the directory instead of a single file:
-
-```bash
-scala run .
-scala test .
-```
-
-Shared directives (like `//> using toolkit latest`) can live in any file; Scala CLI merges them across the whole compilation. There is no "convert to a project" step — you were already in one.
-
-## Packaging: from script to binary
-
-Running from source is great for iteration, but eventually you want an artifact you can hand off. Packaging lives behind Scala CLI's `--power` mode (a namespace for advanced commands). Enable it once, or pass `--power` per call:
+Packaging commands sit behind Scala CLI's **`--power` namespace**, which gates the advanced command set. The flag may be passed per invocation or enabled once:
 
 ```bash
 scala config power true
 ```
 
-Then choose your output:
+Four output shapes are available:
 
 ```bash
 # Default: a lightweight launcher JAR
 scala package report.scala -o report
 
-# Fat/assembly JAR — dependencies + your code in one runnable JAR
+# Assembly JAR — dependencies and application classes in one runnable archive
 scala package report.scala -o report.jar --assembly
 
-# GraalVM native image — a standalone native executable, fast startup
+# GraalVM native image — a standalone native executable
 scala package report.scala -o report --native-image
 
-# Scala Native binary (no JVM at all)
+# Scala Native binary — no JVM involved
 scala package --native report.scala -o report
 ```
 
-The assembly JAR runs anywhere with a JVM (`java -jar report.jar`). The `--native-image` and `--native` outputs give you a self-contained binary with near-instant startup — ideal for CLI tools you invoke often. Scala CLI downloads GraalVM or the Scala Native toolchain as needed, so you do not pre-install anything.
+The assembly JAR executes on any host with a JVM via `java -jar report.jar`, at the cost of JVM startup on every invocation. The `--native-image` and `--native` outputs are self-contained executables whose startup does not include JVM initialisation, which matters for commands invoked frequently and briefly. Scala CLI downloads the GraalVM or Scala Native toolchain on demand, so neither is a prerequisite of the host.
 
-## Why this matters
+## Scope of the model
 
-The point is not that build tools are bad — SBT and Mill earn their keep on large, multi-module systems. The point is that the *distance from idea to running, tested, typed code* just collapsed. A using directive is a build file you can read in one glance and that travels inside the code it configures. You learn Scala by writing Scala, not by learning a build DSL first. And because it is the *official* `scala` command now, this is not a side experiment — it is the front door.
+SBT and Mill remain the tools for large multi-module systems; using directives express a flat compilation, not a module graph. What the directive model removes is the fixed cost between an idea and running, tested, typed code, and it does so within the **official `scala` command** rather than an adjacent tool.
 
-**Try next:** Rewrite one of your throwaway shell or Python glue scripts as a single `.scala` file with `//> using toolkit latest`. Read a file with `os.read`, transform it, and write the result back with `os.write.over`. Then run `scala package --native-image` and drop the resulting binary in your `PATH`.
+## Pitfalls
+
+- **`//> using toolkit latest` is not reproducible.** Two builds separated in time can resolve different Toolkit versions and therefore different transitive dependencies; pin an explicit version (`//> using toolkit 0.2.0`) where reproducibility is required.
+- **A directive placed in one file silently governs the others.** Because directives merge across the compilation, deleting the file that happened to carry `//> using scala 3.5.0` changes the language version for the whole directory, with the failure surfacing as unrelated compile errors elsewhere.
+- **The `.test.scala` suffix is the only signal for test scope.** A test file named `ReportTest.scala` compiles into the main scope, where its MUnit dependency and its `munit.FunSuite` superclass are reported as missing or, worse, are packaged into the shipped artifact.
+- **`::` versus `:` in a coordinate resolves different artifacts.** `com.lihaoyi:os-lib:0.11.3` with a single colon asks for an artifact literally named `os-lib`, which for a Scala library does not exist and fails at resolution rather than at compile time.
+- **`os.write.over` truncates an existing file.** It is the overwrite variant; `os.write` on an existing path raises instead, so choosing the wrong one either destroys prior content or aborts a run that was expected to be idempotent.
+- **Packaging commands are refused until `--power` is passed or enabled.** The gate is a per-invocation flag or a persisted configuration value, so a command that works on one machine fails on another whose configuration differs.
+- **Compile-time codec derivation shifts failures, it does not remove them.** `derives ReadWriter` validates the case class against the declared type, not against the server's response; a JSON payload missing `stargazers_count` fails at `read` during execution.

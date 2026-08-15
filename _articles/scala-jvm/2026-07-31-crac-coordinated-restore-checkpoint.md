@@ -2,7 +2,7 @@
 title: "CRaC: Restoring a Warmed-Up JVM in Milliseconds"
 date: 2026-07-31
 track: scala-jvm
-summary: "Coordinated Restore at Checkpoint snapshots a running, JIT-warmed JVM to disk and restores it in tens of milliseconds — no cold-start ramp, no native-image rebuild. The catch: open files and sockets abort the checkpoint, so you close them in beforeCheckpoint() and reopen in afterRestore()."
+summary: "Coordinated Restore at Checkpoint snapshots a running, JIT-warmed JVM to disk and restores it in tens of milliseconds, avoiding both the cold-start ramp and an ahead-of-time rebuild. The cost: open files and sockets abort the checkpoint, so resources must be closed in beforeCheckpoint() and reopened in afterRestore()."
 reading_time: 6
 tags: [jvm, crac, startup, checkpoint-restore, spring-boot, criu]
 sources:
@@ -18,58 +18,88 @@ sources:
     url: "https://docs.aws.amazon.com/lambda/latest/dg/snapstart-runtime-hooks-java.html"
 ---
 
-The JVM's dirty secret is that it's slow exactly when you most need it to be fast. A freshly launched service spends its first seconds interpreting bytecode, then re-JIT-compiling hot paths it has compiled a thousand times before on other machines. Scale-to-zero and per-request billing turn that warmup into real money and real tail latency. **CRaC** — Coordinated Restore at Checkpoint, an OpenJDK project — attacks it directly: snapshot a running, already-warmed JVM to disk, then restore that exact process later in tens of milliseconds.
+**Gist.** A freshly launched Java Virtual Machine (JVM) interprets bytecode before the JIT compiler — which compiles methods to machine code at run time — recompiles the hot paths, so a service is slowest in its first seconds — precisely the window that scale-to-zero and per-request billing charge for. Coordinated Restore at Checkpoint (CRaC), an OpenJDK project, removes that window by snapshotting an already-warmed process to disk and restoring the same process later. The cost is that the snapshot is only valid if the process holds no live external state at checkpoint time: any disallowed open file descriptor or socket aborts the checkpoint, so applications must implement explicit teardown and re-establishment hooks.
 
-## Snapshot the whole process, warmth included
+## Snapshotting a process, warmth included
 
-On Linux, CRaC uses **CRIU** underneath to checkpoint the process — memory, threads, open file descriptors — to an image directory. What comes back on restore isn't a fresh JVM that has to warm up; it's the *same* HotSpot process with its heap and JIT-compiled code intact. That's the difference from GraalVM native image, which also starts fast but gives you an ahead-of-time-compiled binary with different peak-performance and compatibility characteristics. CRaC keeps a real, warmed JVM.
+On Linux, CRaC uses **CRIU** (Checkpoint/Restore In Userspace) to write the process — memory, threads, open file descriptors — into an image directory. Restore does not produce a fresh JVM that must warm up again; it produces **the same HotSpot process, with its heap contents and JIT-compiled code intact**. That is the structural difference from GraalVM native image, which also starts quickly but yields an ahead-of-time-compiled binary with different peak-performance and compatibility characteristics. CRaC keeps a conventional, warmed JVM.
 
-The numbers are the selling point. Azul reports a Spring Boot app going from roughly **4 seconds** to first operation on a normal start down to about **40 milliseconds** on CRaC restore — two orders of magnitude, because the warmup simply already happened and got frozen into the image.
+Azul reports a Spring Boot application reaching first operation in roughly **4 seconds** on a normal start and about **40 milliseconds** on CRaC restore — roughly two orders of magnitude, because the warmup happened before the checkpoint and was frozen into the image.
 
-The commands are three:
+Three commands cover the whole cycle:
 
 ```bash
 # 1. Run with checkpointing enabled (image dir must exist and be empty)
 java -XX:CRaCCheckpointTo=$HOME/crac-image -jar my_app.jar
 
-# 2. Once it's warmed up, trigger the checkpoint (the JVM exits after writing the image)
+# 2. Once warmed up, trigger the checkpoint (the JVM exits after writing the image)
 jcmd my_app.jar JDK.checkpoint
 
 # 3. Later, restore the warmed JVM
 java -XX:CRaCRestoreFrom=$HOME/crac-image
 ```
 
-You need a CRaC-enabled JDK to do this. Azul Zulu ships commercial CRaC builds (it was first to GA, back in 2023) and the OpenJDK project publishes reference builds for JDK 17 and 24; BellSoft Liberica ships them too. Your application compiles against the small portable `org.crac` shim (`org.crac:crac` on Maven), which delegates to the real API when present and is a harmless no-op on a stock JDK — so the same jar runs everywhere.
+A CRaC-enabled JDK is required: the OpenJDK project publishes reference builds, and Azul Zulu and BellSoft Liberica ship CRaC-enabled distributions. Application code compiles against the small portable `org.crac` shim (`io.github.crac:org-crac` on Maven Central), which delegates to the real implementation when one is present and **degrades to a no-op on a stock JDK** — so a single artifact runs on both.
 
-## The catch: open resources abort the checkpoint
+## The invariant: no live external state at checkpoint
 
-You cannot meaningfully freeze a live TCP socket or an open file and expect it to work in a different process, on a different host, minutes later. So CRaC refuses: if any disallowed file descriptors or sockets are open when you call `JDK.checkpoint`, the checkpoint **aborts** and prints the offending descriptors to the application's console. (Note `jcmd` itself always says "Command executed successfully" — the real error is in the app's own stdout.)
+A live TCP connection cannot be meaningfully frozen and resumed in a different process, on a different host, minutes later: the peer has its own view of the connection and no obligation to preserve it. CRaC therefore enforces the invariant rather than papering over it. **If any disallowed file descriptor or socket is open when `JDK.checkpoint` runs, the checkpoint aborts** and the offending descriptors are printed to the application's console.
 
-The fix is the **`Resource` lifecycle**. Implement `org.crac.Resource`, register it, and close your resources before the snapshot and reopen them after:
+The diagnostic detail that costs the most time: `jcmd` reports `Command executed successfully` regardless, because it only confirms the diagnostic command was delivered. **The actual abort message appears in the application's own stdout**, not in the `jcmd` output.
+
+The mechanism for satisfying the invariant is the **`Resource` lifecycle** in `org.crac`. An object implements `Resource`, registers itself with a `Context`, and receives two callbacks: `beforeCheckpoint`, which must release everything the checkpoint forbids, and `afterRestore`, which re-establishes it.
+
+The ordering is the part that matters for correctness. On the global context, **`beforeCheckpoint` callbacks run in reverse registration order and `afterRestore` in forward order** — the standard teardown/bring-up discipline, so a resource registered after its dependency is torn down before that dependency and restored after it.
+
+The second subtlety is reference strength. **The `Context` holds only a `WeakReference` to each registered `Resource`.** A `Resource` whose only reachability path was the registration itself can be collected, and its hooks are then silently skipped: the checkpoint aborts on a descriptor nobody closed, or, worse, restores with a connection object that was never refreshed. Registration must therefore be paired with a strong reference held by the application.
+
+`afterRestore` is also the only correct place to refresh anything whose validity is bound to wall-clock time or to process identity: pseudo-random number generator seeds duplicated across every restore of the same image, authentication tokens that may have expired while the image sat on disk, cached timestamps.
+
+### Implementation sketch (Scala)
 
 ```scala
 import org.crac.{Context, Core, Resource}
 
-class CacheConnection extends Resource:
-  // keep a strong reference — the Context holds only a WeakReference
+final class PooledClient(connect: () => Session) extends Resource:
+  @volatile private var session: Option[Session] = Some(connect())
+
+  // The Context holds only a WeakReference, so the caller must retain
+  // this instance for the hooks to fire at all.
   Core.getGlobalContext.register(this)
 
   def beforeCheckpoint(ctx: Context[? <: Resource]): Unit =
-    close()        // drain pools, close sockets/files — or the checkpoint aborts
+    session.foreach(_.close())   // any surviving socket aborts the checkpoint
+    session = None
 
   def afterRestore(ctx: Context[? <: Resource]): Unit =
-    reconnect()    // reopen connections; refresh clocks, tokens, RNG seeds
+    session = Some(connect())    // also re-seed RNGs and re-fetch expiring tokens here
 
-  private def close(): Unit = ???
-  private def reconnect(): Unit = ???
+  def current: Session =
+    session.getOrElse(throw IllegalStateException("checkpointed"))
+
+object App:
+  // Strong reference: a field, not a local that goes out of scope.
+  private val client = PooledClient(() => Session.open())
 ```
 
-`beforeCheckpoint` callbacks run in reverse registration order (tear down), `afterRestore` in forward order (bring back up). Two things to internalize. First, register a *strong* reference — the context only weakly references you, so a GC'd Resource silently skips its hooks. Second, `afterRestore` is where you refresh anything time- or secret-sensitive: reseed `Random`, re-fetch tokens that may have expired while the image sat on disk.
+The `IllegalStateException` branch is load-bearing rather than defensive: between `beforeCheckpoint` and `afterRestore` the process is still running, and **any thread that was not quiesced can observe the closed state**.
 
-Which leads to the security caveat: **the image is a raw memory dump.** Any credentials, keys, or connection state resident in the heap at checkpoint time are written verbatim into the file. Treat checkpoint images as sensitive artifacts — encrypt them, lock down access, and refresh secrets on restore.
+## The image is a raw memory dump
 
-## You may already have hooks for this
+Because the image is a byte-level dump of process memory, **every credential, key and session token resident in the heap at checkpoint time is written verbatim into the image files**. Checkpoint images are therefore artifacts with the same sensitivity as the secrets the process held: access to the image directory is equivalent to access to those secrets. Refreshing secrets in `afterRestore` limits how long a leaked image stays useful, but does not remove what was already serialised.
 
-**Spring Boot 3.2+** builds on the same API. It can checkpoint automatically once the context is refreshed (`-Dspring.context.checkpoint=onRefresh` together with `-XX:CRaCCheckpointTo=...`) or on demand via `jcmd <pid> JDK.checkpoint`, stopping and restarting lifecycle beans around the snapshot for you. And **AWS Lambda SnapStart**, though it snapshots a Firecracker microVM rather than using CRIU, exposes the *same* `org.crac` `Resource` contract for Java — so the `beforeCheckpoint`/`afterRestore` code you write for CRaC is exactly what tames Lambda cold starts.
+## Existing integrations
 
-**Try next:** Grab a Zulu CRaC JDK, take any Scala/Java HTTP service with a database pool, and run the three commands above without a `Resource` — watch the checkpoint abort and name your open socket. Then add the `Resource` that closes the pool in `beforeCheckpoint` and reopens it in `afterRestore`, checkpoint successfully, and time the restore against a normal start.
+**Spring Boot 3.2 and later** builds on the same API. It can checkpoint automatically once the application context is refreshed — `-Dspring.context.checkpoint=onRefresh` combined with `-XX:CRaCCheckpointTo=...` — or on demand via `jcmd <pid> JDK.checkpoint`, stopping and restarting lifecycle beans around the snapshot.
+
+**AWS Lambda SnapStart** snapshots a Firecracker microVM rather than using CRIU, but exposes the same `org.crac` `Resource` contract for Java. The `beforeCheckpoint`/`afterRestore` implementations written for CRaC are the same ones that apply to Lambda cold starts.
+
+## Pitfalls
+
+- **The checkpoint aborts and `jcmd` still reports success.** `jcmd` confirms only that the diagnostic command was delivered; the descriptor-level abort message is written to the application's stdout.
+- **A `Resource`'s hooks never fire.** The `Context` registration is weak, so an instance with no other strong reference is collected and skipped without any error.
+- **Restored processes produce identical "random" values.** A pseudo-random number generator seeded before the checkpoint has its state captured in the image and replays it on every restore unless reseeded in `afterRestore`.
+- **Requests fail immediately after restore with expired credentials.** Tokens fetched before the checkpoint keep their original expiry while the image sits on disk; only `afterRestore` can re-fetch them.
+- **Secrets leak through the image directory.** The image is a raw memory dump, so heap-resident keys are present in plaintext in the files.
+- **Dependent resources are torn down or restored in the wrong order.** Ordering follows registration order — reverse for `beforeCheckpoint`, forward for `afterRestore` — so a dependency registered after its dependent inverts the intended sequence.
+- **The checkpoint fails before it starts.** `-XX:CRaCCheckpointTo` requires the target directory to exist and to be empty.

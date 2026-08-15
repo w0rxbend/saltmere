@@ -2,7 +2,7 @@
 title: "Typeclass Derivation in Scala 3: the derives Clause and Mirror"
 date: 2026-08-07
 track: scala-jvm
-summary: "Scala 3 generates a compiler-native Mirror for every case class, enum, and sealed hierarchy. A single inline derived method plus scala.compiletime turns that Mirror into given instances at the use site — no Shapeless, no macro library. Here is how MirroredElemTypes, MirroredElemLabels, ProductOf, and SumOf fit together, with a working Show[A]."
+summary: "Scala 3 synthesises a compiler-native Mirror for every case class, enum, and sealed hierarchy. An inline derived method plus scala.compiletime turns that Mirror into given instances at the use site, without Shapeless and without a macro library. This article describes how MirroredElemTypes, MirroredElemLabels, ProductOf, and SumOf fit together, using a Show[A] derivation."
 reading_time: 7
 tags: [scala3, typeclasses, derivation, mirror, metaprogramming]
 sources:
@@ -18,23 +18,24 @@ sources:
     url: "https://blog.lunatech.com/posts/2025-03-07-typeclass-derivation"
 ---
 
-Writing a `Show`, an `Eq`, or a JSON `Encoder` by hand for every case class is the kind of boilerplate that Scala 2 offloaded to Shapeless — a macro-heavy library that reflected your types into `HList`s and `Coproduct`s. Scala 3 pulls that machinery into the compiler itself. Every case class, enum, and sealed hierarchy comes with a compiler-synthesised `scala.deriving.Mirror` that exposes its shape at the type level, and a one-line `derives` clause wires your typeclass to it. No external library, no macro, stable since 3.0 and refined across the 3.x line (this compiles on 3.8.4 and the 3.3.8 LTS).
+**Gist.** Writing a `Show`, an `Eq`, or a JSON `Encoder` by hand for every case class is boilerplate that Scala 2 offloaded to Shapeless, a macro-heavy library that reflected types into `HList`s and `Coproduct`s. Scala 3 moves that machinery into the compiler: every case class, enum, and sealed hierarchy carries a synthesised `scala.deriving.Mirror` exposing its shape at the type level, and a `derives` clause attaches the typeclass instance at the definition site. The cost is paid at compile time — the derivation is an `inline` expansion that unrolls once per derived type, and its scope is limited to shape and labels rather than a full generic-programming toolkit.
 
-## What the compiler hands you
+## The synthesised Mirror
 
-For any `T` that is a case class, singleton, enum, or sealed trait, the compiler can materialise a `Mirror.Of[T]`. It is a phantom-ish value whose interest lies entirely in its type members:
+For any `T` that is a case class, singleton, enum, or sealed trait, the compiler can materialise a `Mirror.Of[T]`. The value itself carries no data; its content is entirely in its type members:
 
 ```scala
 sealed trait Mirror:
-  type MirroredMonoType          // the type, with type params erased to their bounds
+  type MirroredMonoType          // the type with its type arguments replaced by wildcards
   type MirroredType              // the type, fully applied
   type MirroredLabel <: String   // the type's name, as a singleton string
-  type MirroredElemLabels <: Tuple  // field/case names, as a tuple of string singletons
 ```
 
-Two refinements specialise it. `Mirror.ProductOf[T]` describes a product (a case class or a single enum case) and adds `fromProduct(p: Product): MirroredMonoType` — a constructor that takes an untyped `Product` and rebuilds a `T`. `Mirror.SumOf[T]` describes a sum (an enum or sealed trait) and adds `ordinal(x: MirroredMonoType): Int` — the index of the case a value belongs to. The umbrella alias `Mirror.Of[T]` is the union you summon when you do not yet know which one you will get.
+The two members a derivation reads most — `MirroredElemTypes` and `MirroredElemLabels`, both `Tuple`s — are not declared on that trait. `Mirror.Of[T]`, `Mirror.ProductOf[T]` and `Mirror.SumOf[T]` are refinement aliases that pin `MirroredType` and `MirroredMonoType` to `T` and require `MirroredElemTypes <: Tuple`; the mirror value the compiler synthesises defines the element types and the element labels concretely.
 
-The load-bearing member is `MirroredElemTypes`, a `Tuple` of the constituent types. For a product it is the field types in order; for a sum it is the subtype of each case:
+Two subtraits specialise the base. **`Mirror.Product`, refined as `Mirror.ProductOf[T]`, describes a product** — a case class or a single enum case — and adds `fromProduct(p: Product): MirroredMonoType`, a constructor taking an untyped `Product` and rebuilding a `T`. **`Mirror.Sum`, refined as `Mirror.SumOf[T]`, describes a sum** — an enum or sealed trait — and adds `ordinal(x: MirroredMonoType): Int`, the index of the case a value belongs to. `Mirror.Of[T]` is the umbrella alias summoned when the shape is not known in advance.
+
+The load-bearing member is **`MirroredElemTypes`**, a `Tuple` of the constituent types. For a product these are the field types in declaration order; for a sum they are the types of its cases, in declaration order:
 
 ```scala
 case class Point(x: Int, y: Int)
@@ -53,21 +54,21 @@ enum Shape:
 //   MirroredElemLabels = ("Circle", "Rectangle")
 ```
 
-Note the asymmetry: for a product `MirroredElemTypes` are *fields*, for a sum they are *cases*. Your derivation code branches on `ProductOf` versus `SumOf` precisely because the two mean different things.
+The asymmetry is the invariant a derivation must respect: **for a product `MirroredElemTypes` are fields, for a sum they are cases**. Derivation code branches on `ProductOf` versus `SumOf` because the two members mean different things.
 
 ## From derives to given
 
-The `derives` clause is sugar. Writing `case class Point(x: Int, y: Int) derives Show` instructs the compiler to synthesise a given in `Point`'s companion:
+The `derives` clause is sugar. `case class Point(x: Int, y: Int) derives Show` instructs the compiler to synthesise a given in `Point`'s companion, equivalent to:
 
 ```scala
 given Show[Point] = Show.derived[Point]  // using the summoned Mirror.Of[Point]
 ```
 
-The only contract your typeclass must satisfy is that its companion object defines a `derived` method taking a `using Mirror.Of[T]`. When someone later writes `summon[Show[Point]]`, resolution finds that synthesised given, which calls `derived`, which is `inline` and therefore expands — Mirror and all — at the call site into straight-line code. There is no runtime reflection; the "generic" part is entirely a compile-time expansion.
+**The contract a typeclass must satisfy is that its companion object defines a member named `derived` whose result is an instance for the derived type.** Mirror-based derivations declare it as an `inline def` taking a `using Mirror.Of[T]`, but the compiler checks only that the call `Show.derived[Point]` typechecks, so other shapes of `derived` are admissible. Because this `derived` is `inline`, it expands — Mirror and all — where the synthesised given is defined, into straight-line code. No runtime reflection is involved; the generic part exists only during compilation.
 
-## A real typeclass, derived
+### Implementation sketch (Scala)
 
-Here is a complete `Show[A]` that renders products with their field labels and dispatches sums on ordinal. It compiles as written.
+A `Show[A]` that renders products with their field labels and dispatches sums on ordinal:
 
 ```scala
 import scala.deriving.Mirror
@@ -77,10 +78,8 @@ trait Show[A]:
   def show(a: A): String
 
 object Show:
-  // Base instances for the leaves.
-  given Show[Int]     = _.toString
-  given Show[String]  = s => s"\"$s\""
-  given Show[Boolean] = _.toString
+  given Show[Int]    = _.toString
+  given Show[String] = s => s"\"$s\""
 
   // Walk the element-type tuple, producing one Show per element, in order.
   inline def summonAll[T, Elems <: Tuple]: List[Show[?]] =
@@ -127,7 +126,7 @@ object Show:
         showSum(s, instances)
 ```
 
-And the use site — the whole point:
+The use site:
 
 ```scala
 case class Point(x: Int, y: Int) derives Show
@@ -145,22 +144,29 @@ enum Shape derives Show:
 
 ## Reading the mechanism
 
-Four `scala.compiletime` primitives do the work, and each is worth pinning down.
+Four `scala.compiletime` primitives carry the derivation.
 
-`erasedValue[T]` conjures a phantom value of type `T` that never runs — it exists only so an `inline match` can pattern-match on its *type*. That is how `summonAll` peels a tuple: `case _: (elem *: elems)` binds `elem` to the head type and `elems` to the tail, recursing until `EmptyTuple`. The match is resolved at compile time, so what looks like a list traversal unrolls into a fixed sequence of `summonInline` calls with no loop left at runtime.
+**`erasedValue[T]` produces a phantom value of type `T` that never executes.** It exists so an `inline match` can pattern-match on its *type*. That is how `summonAll` peels a tuple: `case _: (elem *: elems)` binds `elem` to the head type and `elems` to the tail, recursing until `EmptyTuple`. The match is resolved during compilation, so what reads as a list traversal unrolls into a fixed sequence of `summonInline` calls with no loop at runtime.
 
-`summonInline[Show[Elem]]` is `summon`, but deferred to the expansion site. Because `derived` is inline, `Elem` is concrete by the time the call is spliced in, so the compiler can find `Show[Int]`, `Show[String]`, and so on. Using `summonInline` rather than a plain `using` parameter is what lets the search happen per-element after inlining.
+**`summonInline[Show[Elem]]` is `summon` deferred to the expansion site.** Because `derived` is inline, `Elem` is concrete once the call is spliced in, so the compiler can locate `Show[Int]`, `Show[String]`, and the rest. A plain `using` parameter would force the search at the definition of `derived`, where the element types are still abstract; `summonInline` is what moves the search to a point where they are known.
 
-`constValue[p.MirroredLabel]` turns a singleton-string *type* (`"Point"`) into its *value* `"Point"`. `constValueTuple[p.MirroredElemLabels]` does the same across a whole tuple, giving `("x", "y")` — the runtime field names, recovered without reflection.
+**`constValue[p.MirroredLabel]` converts a singleton-string type (`"Point"`) into the value `"Point"`.** `constValueTuple[p.MirroredElemLabels]` does the same across a tuple, yielding `("x", "y")` — field names recovered without reflection.
 
-The recursive `deriveOrSummon`/`deriveChild` dance is the subtle part, and it is lifted almost verbatim from the reference. A sum's `MirroredElemTypes` are its cases, and those cases have no user-written `Show`. So when an element type is a subtype of the sum (`case _: T`), we derive it inline instead of summoning; the `deriveChild` guard rejects the degenerate `T <: Elem` case with a compile-time `error` to stop infinite recursion. For ordinary fields (an `Int` in `Point`) the element is not a subtype of `T`, so the other branch summons the given as usual.
+The recursive `deriveOrSummon`/`deriveChild` pair follows the pattern given in the Scala 3 reference. A sum's `MirroredElemTypes` are its cases, and those cases have no user-written `Show`, so when an element type is a subtype of the sum (`case _: T`) the instance is derived inline rather than summoned. **The `deriveChild` guard rejects the degenerate `T <: Elem` case with a compile-time `error`, terminating what would otherwise be unbounded inline recursion.** For ordinary fields — an `Int` in `Point` — the element is not a subtype of `T`, so the other branch summons the given.
 
 ## Contrast with Shapeless
 
-If you carried a Scala 2 codebase, this replaces a familiar stack. Shapeless converted a case class to a heterogeneous `HList` via a macro-materialised `Generic`, and `LabelledGeneric` tagged each element with its field name using `Witness`-encoded singleton types; sums became `Coproduct`s. Instances were then built by implicit resolution recursing over the `::` structure. It worked, but the cost was real: a third-party library on the classpath, macro expansions that inflated compile times, and error messages that surfaced deep inside `HList` machinery.
+The Scala 2 stack this replaces: Shapeless converted a case class to a heterogeneous list (`HList`) via a macro-materialised `Generic`; `LabelledGeneric` tagged each element with its field name using `Witness`-encoded singleton types; sums became `Coproduct`s. Instances were assembled by implicit resolution recursing over the `::` structure. The costs were a third-party library on the classpath, macro expansion added to compile time, and error messages surfacing inside `HList` machinery.
 
-Scala 3 collapses that. `Mirror` is compiler-native, so `Tuple` stands in for `HList`, `MirroredElemLabels` for the `Witness`-tagged labels, and `ordinal`/`fromProduct` for the `Coproduct`/`Generic` plumbing — with `derives` attaching the given at the definition site. There is nothing to add to your build. The trade-off is scope: `Mirror` gives you shape and labels, not the full generic-programming toolkit (polymorphic functions, record operations). When you genuinely need that, shapeless-3 still exists and builds its `K0`/`K1` derivation *on top of* these same Mirrors — the compiler primitive underneath is the one described here.
+Scala 3 maps each piece onto a compiler primitive: `Tuple` replaces `HList`, `MirroredElemLabels` replaces the `Witness`-tagged labels, and `ordinal`/`fromProduct` replace the `Coproduct`/`Generic` plumbing, with `derives` attaching the given at the definition site. Nothing is added to the build. **The trade-off is scope: `Mirror` exposes shape and labels only** — not polymorphic functions or record operations. shapeless-3 still provides those, and builds its `K0`/`K1` derivation on top of these same Mirrors.
 
-The mental model to keep: `derives` is a companion-method contract, `Mirror` is compile-time shape, `MirroredElemTypes` is a tuple you recurse over, and `inline` + `scala.compiletime` is what makes the recursion vanish before runtime.
+The model to retain: `derives` is a companion-method contract, `Mirror` is compile-time shape, `MirroredElemTypes` is a tuple to recurse over, and `inline` plus `scala.compiletime` is what removes the recursion before runtime.
 
-**Try next:** Swap `Show` for a `JsonEncoder[A]` that emits `{"x":1,"y":2}` for products and a tagged object for sums, reusing `labelsOf` for the keys — then add a `Mirror.Product`'s `fromProduct` to write the matching `JsonDecoder[A]` and watch the two derivations mirror each other.
+## Pitfalls
+
+- **Treating `MirroredElemTypes` uniformly.** For a sum the tuple holds case subtypes, not field types; code that assumes fields will summon instances for `Shape.Circle` and `Shape.Rectangle` and fail to find any user-written given.
+- **Using a `using` parameter where `summonInline` is required.** Resolution then happens at the definition of `derived`, where element types are abstract, and the compiler reports a missing implicit for a type variable rather than for the concrete field type.
+- **Omitting the `deriveChild` guard.** A type whose element set includes itself expands inline without a termination condition; the symptom is an inline-expansion limit error rather than a diagnostic naming the type.
+- **Assuming derivation reaches nested types automatically.** A field whose type is another case class requires either its own `derives` clause or a given in scope; without one, `summonInline` fails at the expansion site with an error pointing at the outer derivation.
+- **Relying on the `asInstanceOf[Show[Any]]` cast to keep instances aligned with fields.** The instance list is erased to `List[Show[?]]`, so pairing it with the wrong iterator order is a `ClassCastException` at render time, not a compile error.
+- **Inline expansion per derived type.** Each `derives` clause expands the whole derivation body at that site, so compile time grows with the number of derived types, not with a single shared generic implementation.

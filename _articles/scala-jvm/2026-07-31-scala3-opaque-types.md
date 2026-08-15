@@ -2,8 +2,8 @@
 title: "Opaque Types in Scala 3: Type Safety That Vanishes at Runtime"
 date: 2026-07-31
 track: scala-jvm
-summary: "Scala 3 opaque type aliases give you distinct domain types like UserId and Meters that the compiler enforces, then erases to the underlying primitive with zero allocation and zero boxing."
-reading_time: 5
+summary: "Scala 3 opaque type aliases produce distinct domain types such as UserId and Meters that the compiler enforces, then erase to the underlying primitive with no allocation and no boxing."
+reading_time: 6
 tags: [scala3, opaque-types, type-safety, zero-cost, domain-modeling, jvm]
 sources:
   - title: "Opaque Types — Scala 3 Book"
@@ -18,26 +18,34 @@ sources:
     url: "https://www.baeldung.com/scala/opaque-type-alias"
 ---
 
-Passing a bare `Int` around your domain is a bug waiting to happen. Every `UserId`, `OrderId`, and `accountBalance` is the same `Int` to the compiler, so nothing stops you from swapping the arguments to `transfer(fromId, toId)` or handing an order number to a function that wants a user. The usual fixes each cost something: raw primitives cost safety, and wrapper classes cost runtime allocation. Scala 3's **opaque type aliases** give you both — distinct types the compiler enforces, that erase to the underlying primitive at runtime.
+**Gist.** A domain that represents user identifiers, order identifiers and account balances all as `Int` or `Long` gives the compiler nothing to check: the arguments of `transfer(fromId, toId)` are mutually substitutable, and so are an order number and a user number. Scala 3's **opaque type aliases** make the equivalence between the new type and its underlying representation visible only inside the scope that declares it, so the type checker rejects the mixing while the erased bytecode still carries the raw primitive. The cost is that every operation the new type is allowed to support must be written out by hand — extension methods and constructors — because outside the defining scope the type has no inherited surface at all.
 
-## The syntax
+## The declaration and its scope rule
 
-You declare an opaque type inside an object or module:
+An opaque type alias is declared inside an enclosing object, class or trait, which supplies the scope the rule below refers to:
 
 ```scala
 object UserIds:
   opaque type UserId = Long
 ```
 
-Inside `UserIds`, `UserId` and `Long` are interchangeable. Everywhere else, `UserId` is a completely distinct, incompatible type. As the Scala documentation puts it: the fact that `UserId` is the same as `Long` "is only known in the scope where it is defined." That one-way transparency is the whole trick — the alias is *transparent inside* and *opaque outside*.
+Inside `UserIds`, `UserId` and `Long` are interchangeable in both directions: a `Long` is accepted where a `UserId` is expected and the reverse. Outside, they are unrelated. The Scala documentation states the rule directly — the fact that `UserId` is the same as `Long` "is only known in the scope where it is defined." The alias is therefore **transparent inside and opaque outside**, and that asymmetry is the entire mechanism.
 
-## Why the scope boundary matters
+The consequence for callers is mechanical rather than stylistic. Outside the defining scope, `UserId` behaves as an **abstract type**: there is no implicit widening to `Long`, no inherited arithmetic, and no `.value` accessor unless one is exported deliberately. Two opaque aliases declared over the same representation — `UserId` and `OrderId`, both `Long` — are distinct abstract types to the checker, so assigning one to the other is a compile error even though the runtime values are indistinguishable.
 
-Because the equivalence is invisible outside the defining object, callers cannot accidentally treat a `UserId` as a `Long` (or as an `OrderId`). There is no implicit widening, no `.value` escape hatch you didn't write yourself. You decide exactly how values are *lifted* into the type and *unlifted* back out, by choosing which constructors and extension methods to expose. Everything else stays sealed.
+## Bounds relax the boundary in one direction
 
-## Smart constructors and extension methods
+The reference documentation defines the general form with an upper bound:
 
-Since the type is opaque from the outside, you must provide the API deliberately. A companion gives you a smart constructor for validation, and extension methods give the type behavior without inheriting the underlying type's full (and often unsafe) surface:
+```scala
+opaque type UserId <: Long = Long
+```
+
+Outside the defining scope the alias is then abstract **with that bound**, which means a `UserId` is usable where a `Long` is expected, while a `Long` is still rejected where a `UserId` is expected. This is the one-way relaxation: lifting stays controlled, unlifting becomes free. Omitting the bound seals both directions. The choice is load-bearing, because a bounded alias silently permits `id + 1` to typecheck as `Long` arithmetic and lose the domain type from the result.
+
+## Constructors and extension methods define the whole API
+
+Because nothing leaks across the boundary, the visible interface consists of exactly what the defining scope exposes. The conventional shape is a companion object holding a validating constructor plus extension methods supplying behaviour:
 
 ```scala
 object Ids:
@@ -45,42 +53,80 @@ object Ids:
   opaque type OrderId = Long
 
   object UserId:
-    // smart constructor: validate before lifting
+    // validation happens before the value is lifted into the opaque type
     def from(raw: Long): Option[UserId] =
       Option.when(raw > 0)(raw)
 
-    // trusted, unchecked lift for internal use
     def unsafe(raw: Long): UserId = raw
 
   extension (id: UserId)
     def value: Long = id
     def next: UserId = id + 1
 
-// usage, outside the defining scope:
+// outside the defining scope:
 import Ids.*
 
 val maybeUser: Option[UserId] = UserId.from(42L)
 val order: OrderId = ???
 
 maybeUser.foreach { u =>
-  println(u.value)   // 42, via the extension method
+  println(u.value)   // 42, through the extension method
   // val bad: OrderId = u   // compile error: UserId is not OrderId
   // val n: Long = u        // compile error: UserId is not Long
 }
 ```
 
-The `from`/`unsafe` split is idiomatic: expose a validating constructor to the world, keep a raw lift for code you trust. Extension methods like `value` and `next` are resolved at compile time and, for a `Long`, compile down to plain field access and integer arithmetic.
+The split between `from` and `unsafe` separates the checked entry point offered to callers from the unchecked lift used by code inside the trust boundary. Both compile to identity: the body `raw` typechecks only because `UserId` and `Long` coincide inside `Ids`. Extension methods are resolved statically at compile time, and since the alias is erased to `Long`, `value` is the identity on a `Long` and `next` is integer addition — no wrapper object participates in either.
 
-## Why they beat raw primitives *and* wrapper classes
+## Cost relative to the two alternatives
 
-Against **raw primitives**, opaque types win on safety: `UserId` and `OrderId` are both `Long` underneath, yet mixing them is a compile error. You get self-documenting signatures for free.
+Against **raw primitives**, the gain is the compile error shown above and signatures that name the domain concept rather than its representation. Against **wrapper classes**, the gain is the allocation avoided. A `case class UserId(value: Long)` allocates a heap object per identifier that the runtime must then keep or collect. An `AnyVal` value class, `class UserId(val value: Long) extends AnyVal`, avoids that allocation only in the cases where the compiler can keep the underlying value unwrapped. Wherever the value has to be treated as a reference — used as a type argument to a generic signature, stored in an array of the value-class type, or assigned to `Any` — the wrapper is instantiated after all, so the allocation reappears in the positions that are hardest to spot by reading a call site.
 
-Against **wrapper classes**, they win on cost. A `case class UserId(value: Long)` allocates a heap object per id. An `AnyVal` value class (`class UserId(val value: Long) extends AnyVal`) *tries* to avoid that, but the SIP is blunt about its failure modes: boxing happens "anywhere in the program where the type signatures are generic and require the runtime to pass a `java.lang.Object`" — arrays, generic collections, pattern matches, `equals`/`hashCode`, and functions all reintroduce allocation. Opaque types have no such cliff. Because there is only one implementation and it is fully erased, the Scala documentation states there is "no boxing overhead for primitive types" — a `UserId` *is* a `Long` in the bytecode. The stated design goal of SIP-35 is exactly this: "operations on these wrapper types must not create any extra overhead at runtime while still providing a type safe use at compile time."
+Opaque types have no equivalent cliff, because there is no second implementation to fall back to: the alias is erased to its representation. SIP-35 sets exactly this as the goal, that operations on such wrapper types should not add runtime overhead while still being type-safe at compile time; the Scala 3 documentation describes opaque types as providing the abstraction without runtime overhead.
 
-The one caveat worth knowing: erasure is guaranteed for the opaque type itself, but if you back an opaque type with a reference type and add methods that construct intermediate objects, those objects still exist. The *wrapper* is free; whatever you build inside your extension methods is not.
+Erasure covers the alias, not the code written around it. An opaque type backed by a reference type whose extension methods build intermediate objects still allocates those objects. The wrapper is free; the contents of the extension methods are not.
 
-## When to reach for them
+### Implementation sketch (Scala)
 
-Use opaque types for identifiers, units of measure (`Meters`, `Seconds`, `Celsius`), validated strings (`Email`, `NonEmptyString`), and any place a primitive is standing in for a domain concept. They are the default choice in Scala 3 for the "make illegal states unrepresentable" habit, precisely because the safety is free.
+Units of measure exercise the same mechanism with a second failure the identifier case does not show — arithmetic that must not silently mix dimensions:
 
-**Try next:** Define `opaque type Meters = Double` and `opaque type Seconds = Double` in one object, give each a smart constructor, then write an extension method `def speed(m: Meters, s: Seconds): Double`. Compile with `-Xprint:erasure` (or `scalac -Vprint:erasure`) and confirm both types have collapsed to `double` in the erased tree — no boxes, no wrappers.
+```scala
+object Units:
+  opaque type Meters  = Double
+  opaque type Seconds = Double
+
+  object Meters:
+    def from(d: Double): Option[Meters] = Option.when(d >= 0.0)(d)
+
+  object Seconds:
+    def from(d: Double): Option[Seconds] = Option.when(d > 0.0)(d)
+
+  extension (m: Meters)
+    def toDouble: Double = m
+    def +(other: Meters): Meters = m + other   // resolves inside the scope
+    // no `+ (s: Seconds)` overload exists, so mixing units cannot compile
+
+  extension (s: Seconds)
+    def toDouble: Double = s
+
+  // dimensional result stays a plain Double: no MetersPerSecond alias declared
+  def speed(m: Meters, s: Seconds): Double = m.toDouble / s.toDouble
+
+import Units.*
+
+val d = Meters.from(120.0)
+val t = Seconds.from(9.6)
+for { m <- d; s <- t } yield speed(m, s)   // Some(12.5)
+// val wrong = d.map(_ + t.get)        // compile error: Seconds is not Meters
+```
+
+The `+` extension is recursive-looking but is not: inside `Units`, `m` and `other` are `Double`, so the body selects primitive addition rather than the extension method.
+
+## Pitfalls
+
+- **A runtime type test cannot recover the opaque type.** After erasure only the representation survives, so any check performed at runtime sees a `Long` and cannot distinguish a `UserId` from an `OrderId` declared over the same representation.
+- **An upper bound removes the seal in one direction for every caller.** Declaring `opaque type UserId <: Long = Long` makes every `Long`-accepting method applicable to a `UserId`, including arithmetic whose result is typed `Long` and has lost the domain type.
+- **Exposing an unchecked lift alongside the validating one defeats the validation.** A public `unsafe` constructor is a hole through which unvalidated values enter the type; the invariant holds only if that entry point stays inside the trust boundary.
+- **The defining scope is the trust boundary, so a large one weakens the type.** Every declaration sharing the enclosing object, class or trait sees `UserId` and `Long` as interchangeable; putting unrelated code in that scope hands it the unchecked lift for free.
+- **Erasure applies to the alias, not to what the extension methods construct.** An opaque type over a reference type whose methods allocate intermediate structures allocates once per call, and the absence of wrapper allocation says nothing about that.
+- **Two aliases over the same representation are interchangeable across a serialization boundary.** Distinctness is a compile-time property; a payload written as a `Long` carries no evidence of which alias produced it.

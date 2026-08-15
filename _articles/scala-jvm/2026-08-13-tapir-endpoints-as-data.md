@@ -2,7 +2,7 @@
 title: "Tapir: HTTP endpoints as data, and everything derived from them"
 date: 2026-08-13
 track: scala-jvm
-summary: "Tapir describes an HTTP endpoint as an immutable Scala value, then interprets that one value into a Netty or http4s server, an sttp client, and OpenAPI docs — no annotations, no reflection. A complete Scala 3 example with a Netty server and live Swagger UI, runnable with scala-cli."
+summary: "Tapir describes an HTTP endpoint as an immutable Scala value, then interprets that one value into a Netty or http4s server, an sttp client, and OpenAPI documentation — no annotations, no reflection. A Scala 3 example with a Netty server and live Swagger UI, runnable with scala-cli."
 reading_time: 6
 tags: [tapir, openapi, netty, scala-3, http]
 sources:
@@ -16,11 +16,11 @@ sources:
     url: "https://softwaremill.com/tapir-tech-update/"
 ---
 
-Most HTTP frameworks make you describe an endpoint twice: once in code (the handler) and once in metadata (annotations, YAML, a hand-written OpenAPI file) — and the two drift apart the week after launch. **Tapir** (SoftwareMill; 1.13.31 as of August 2026) takes the position that an endpoint description is just data: an immutable Scala value listing inputs, outputs, and errors, with *no* logic attached. From that one value it derives the server route, a type-safe client, and OpenAPI documentation. They cannot drift, because they are the same object.
+**Gist.** Most Hypertext Transfer Protocol (HTTP) frameworks require an endpoint to be described twice — once as handler code and once as metadata (annotations, YAML, a hand-written OpenAPI file) — and the two descriptions drift apart independently. **Tapir** (SoftwareMill) represents an endpoint description as data: an immutable Scala value listing inputs, outputs and errors, carrying **no logic**, from which the server route, a type-safe client and the OpenAPI document are all derived. The cost is that the description must be expressible in Tapir's combinator vocabulary and its types: anything the endpoint type cannot express has to be pushed into the server logic, where the docs and client interpreters can no longer see it.
 
 ## An endpoint is a value
 
-The core type is `Endpoint[SECURITY, INPUT, ERROR, OUTPUT, R]`. You build one by chaining combinators, each returning a new immutable value:
+The core type is `Endpoint[SECURITY, INPUT, ERROR, OUTPUT, R]`. Its five parameters record, in order, the security input, the ordinary input, the error output, the success output, and the capabilities the endpoint requires (streaming, WebSockets). An endpoint is built by chaining combinators, each returning a **new immutable value** rather than mutating a builder:
 
 ```scala
 val getPet: PublicEndpoint[Long, String, Pet, Any] =
@@ -30,21 +30,27 @@ val getPet: PublicEndpoint[Long, String, Pet, Any] =
     .errorOut(statusCode(StatusCode.NotFound).and(stringBody))
 ```
 
-Read it like a sentence: GET `/pets/{id}`, where `{id}` parses as `Long`; success is a JSON `Pet`; failure is a 404 with a plain-text body. The compiler tracks all of it in the type. Because it's a value, everything you already do with values works: put shared prefixes in a `val` and reuse them (`baseEndpoint.in("admin")`), keep endpoints in a module the client team depends on without pulling in server code, write unit tests that inspect them, generate them programmatically.
+The value reads as a sentence: GET `/pets/{id}`, where `{id}` parses as `Long`; success is a JavaScript Object Notation (JSON) `Pet`; failure is a 404 with a plain-text body. `PublicEndpoint` is the alias for an endpoint whose security input is `Unit`. Each combinator refines the type parameters, so **the input and output types are visible to the compiler at the definition site**, not discovered at request time.
 
-## One definition, three interpreters
+Because the description is an ordinary value, ordinary value operations apply. A shared prefix can live in a `val` and be extended (`baseEndpoint.in("admin")`). Endpoint definitions can be published in a module that the client team depends on **without pulling in any server dependency**, since the server route is produced later by a separate interpreter. Endpoints can be inspected in unit tests, held in collections, and generated programmatically.
 
-Logic attaches separately — `getPet.serverLogic(...)` pairs the description with a function whose signature the endpoint dictates (`Long => F[Either[String, Pet]]` here). Then interpreters consume the result: server interpreters for Netty, http4s, Vert.x, Play, ZIO HTTP, Armeria, and more; client interpreters for sttp; docs interpreters for OpenAPI and AsyncAPI. Same value, three artifacts.
+## One definition, several interpreters
 
-Here is a complete service — endpoint, Netty server, live Swagger UI — as one file. It uses the Loom-based synchronous Netty backend (direct style, no effect wrapper; needs JDK 21):
+Logic attaches separately. `getPet.serverLogic(...)` pairs the description with a function **whose signature the endpoint dictates** — here `Long => F[Either[String, Pet]]`, with the `Long` from the input, the `String` from the error output and the `Pet` from the success output. A mismatch is a compile error, not a runtime 500.
+
+Interpreters then consume the resulting value: server interpreters for Netty, http4s, Vert.x, Play, ZIO HTTP and Armeria among others; client interpreters for sttp; documentation interpreters for OpenAPI and AsyncAPI. **The same value produces all three artefacts, so they cannot disagree**; a change to the path segment or a widening of the error type either propagates to server, client and documentation together or fails to compile.
+
+### Implementation sketch (Scala)
+
+A complete service — endpoint, Netty server, live Swagger user interface (UI) — as one file. It uses the Loom-based synchronous Netty backend, which is direct style with no effect wrapper and requires Java Development Kit (JDK) 21:
 
 ```scala
-//> using scala 3.8.4
+//> using scala 3.3.4
 //> using jvm 21
-//> using dep com.softwaremill.sttp.tapir::tapir-core:1.13.31
-//> using dep com.softwaremill.sttp.tapir::tapir-netty-server-sync:1.13.31
-//> using dep com.softwaremill.sttp.tapir::tapir-json-circe:1.13.31
-//> using dep com.softwaremill.sttp.tapir::tapir-swagger-ui-bundle:1.13.31
+//> using dep com.softwaremill.sttp.tapir::tapir-core:1.11.10
+//> using dep com.softwaremill.sttp.tapir::tapir-netty-server-sync:1.11.10
+//> using dep com.softwaremill.sttp.tapir::tapir-json-circe:1.11.10
+//> using dep com.softwaremill.sttp.tapir::tapir-swagger-ui-bundle:1.11.10
 
 import io.circe.generic.auto.*
 import sttp.model.StatusCode
@@ -66,6 +72,7 @@ val getPet =
 @main def serve(): Unit =
   val pets = Map(1L -> Pet(1, "Otis", Some("dog")))
 
+  // Identity: the effect type of the synchronous backend — no wrapper
   val getPetServer = getPet.serverLogic[Identity] { id =>
     pets.get(id).toRight(s"no pet with id $id")
   }
@@ -78,7 +85,7 @@ val getPet =
     .startAndWait()
 ```
 
-Run and poke it:
+Exercising it:
 
 ```sh
 scala-cli run PetApi.scala
@@ -87,13 +94,13 @@ curl -si localhost:8080/pets/9    # HTTP/1.1 404 ... no pet with id 9
 # http://localhost:8080/docs      -> live Swagger UI
 ```
 
-Notice what you didn't write: no route table, no JSON-error-to-404 mapping, no OpenAPI YAML. `SwaggerInterpreter` walked the same endpoint values and produced a complete, accurate spec — path parameter types, response schemas, error codes — plus the UI to browse it.
+No route table, no mapping from JSON error to 404, and no OpenAPI YAML appears in the source. `SwaggerInterpreter` traverses the same endpoint values and emits the specification — path parameter types, response schemas, error codes — together with the UI that renders it.
 
-## JSON and clients from the same value
+## Codecs, clients and security
 
-`jsonBody[Pet]` is where two derivations meet: a JSON codec (circe above, via `io.circe.generic.auto.*`) and tapir's own `Schema` (via `sttp.tapir.generic.auto.*`), which feeds the OpenAPI output. To swap circe for **jsoniter-scala** — significantly faster, all codegen at compile time, no runtime reflection — replace the dependency with `tapir-jsoniter-scala`, add jsoniter's macros, and derive a `JsonValueCodec[Pet]`; the endpoint definition doesn't change. That's the interpreter pattern working: serialization is a detail the description doesn't know about.
+`jsonBody[Pet]` is the point where two derivations meet: a JSON codec (circe above, via `io.circe.generic.auto.*`) and Tapir's own `Schema` (via `sttp.tapir.generic.auto.*`), the latter feeding the OpenAPI output. **Both are required**: the codec moves bytes, the schema describes them. Substituting jsoniter-scala, which generates codecs by macro from an explicitly summoned `JsonValueCodec` rather than from an automatic import, means replacing the dependency with `tapir-jsoniter-scala`, adding jsoniter's macros and deriving a `JsonValueCodec[Pet]`; **the endpoint definition is unchanged**, because serialisation is a concern of the interpreter rather than of the description.
 
-A client comes from the same value too. From any module that sees `getPet` (server code not required):
+A client is derived from the same value, in any module that can see `getPet` and without server code on the classpath:
 
 ```scala
 val fetch = SttpClientInterpreter()
@@ -101,10 +108,17 @@ val fetch = SttpClientInterpreter()
 val pet: Either[String, Pet] = fetch(1L)
 ```
 
-The value-ness pays off again for cross-cutting concerns. Authentication lives in the description too — `endpoint.securityIn(auth.bearer[String]())` — so a `secureBase` val can carry the auth input plus its checking logic, and every endpoint built from it inherits both the behavior and the `securitySchemes` section of the OpenAPI spec. And because interpreters are pluggable, tests don't need a running server: interpret the same endpoints with the `tapir-sttp-stub-server` backend and exercise your logic through an in-memory client.
+Authentication also lives in the description. `endpoint.securityIn(auth.bearer[String]())` populates the `SECURITY` type parameter, so a `secureBase` value can carry both the authentication input and the function that checks it; every endpoint derived from that base inherits the check **and** contributes the corresponding `securitySchemes` entry to the OpenAPI document. Because interpretation is pluggable, tests need no listening socket: the same endpoints interpreted with the `tapir-sttp-stub-server` backend are exercised through an in-memory client.
 
-Change the endpoint — rename the path segment, widen the error type — and server, client, and docs all update or fail to compile. Annotation-based stacks (Spring, JAX-RS) can't give you that: annotations aren't first-class values, so you can't abstract over them, compose them, or ask the compiler whether client and server still agree. They're strings checked at runtime, if at all. Endpoints-as-data moves that entire class of drift into the type checker.
+The contrast with annotation-based stacks such as Spring or JAX-RS is structural rather than a matter of degree. Annotations are not first-class values, so they cannot be abstracted over, composed, or passed to a function; agreement between client and server is checked at runtime if at all. Endpoints-as-data relocates that class of drift into the type checker.
 
-Tapir 1.x has been the stable line since late 2022, with the 1.13 series current and releases landing near-weekly — check [GitHub releases](https://github.com/softwaremill/tapir/releases) before pinning. If you're on cats-effect or ZIO rather than direct style, the same endpoints interpret into http4s (`Http4sServerInterpreter`) or ZIO HTTP with `serverLogic` returning your effect type — the definitions are portable across all of them.
+Tapir 1.x has been the stable line since 2022, and patch releases are frequent; the [GitHub releases](https://github.com/softwaremill/tapir/releases) page is the reference before pinning a version, and the versions in the sketch below should be checked against it. On cats-effect or ZIO rather than direct style, the same endpoint values interpret into http4s (`Http4sServerInterpreter`) or ZIO HTTP with `serverLogic` returning the corresponding effect type — the definitions are portable across all of them.
 
-**Try next:** add a `POST /pets` endpoint with `.in(jsonBody[Pet])` and an in-memory `TrieMap`, restart, and watch it appear in Swagger UI with a full request schema you never wrote — then call it via `SttpClientInterpreter` from a scala-cli test script.
+## Pitfalls
+
+- **Omitting `sttp.tapir.generic.auto.*` while keeping the circe auto-derivation import** compiles the codec but leaves no `Schema`, so the OpenAPI document lacks the response schema even though requests are served correctly.
+- **Deriving both codec and schema automatically for a large case-class graph** moves the cost to compile time; the derivation is per-use-site unless the instances are cached in explicit `given` values.
+- **Attaching a shared prefix by copying an endpoint definition rather than extending a base value** removes the compile-time link: renaming the segment in one copy leaves the others serving the old path, which is the drift the design exists to prevent.
+- **Encoding a distinction in the server logic that the endpoint type does not express** — for example returning different status codes from a single `String` error output — makes the OpenAPI document and the derived client wrong, because neither interpreter can observe logic.
+- **Ordering endpoints so that a broader path matches first** causes the later, more specific endpoint never to be reached; the server interpreter tries the list in the order given.
+- **Running the synchronous Netty backend on a JDK older than 21** is unsupported: that module depends on the Loom virtual-thread facilities finalised in JDK 21.

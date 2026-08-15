@@ -2,8 +2,8 @@
 title: "JDK 26 in Practice: HTTP/3, Primitive Patterns, and the Road Through 27 to Valhalla"
 date: 2026-08-13
 track: scala-jvm
-summary: "A calendar correction first: JDK 26 shipped on 17 March 2026 — the September slot belongs to JDK 27, now in rampdown. Here's what JDK 26 actually delivered that's worth adopting on a telemetry backend: HTTP/3 in HttpClient (JEP 517), primitive types in patterns (JEP 530), and the final-field mutation warnings (JEP 500) you should audit for now."
-reading_time: 5
+summary: "JDK 26 shipped on 17 March 2026 with ten JEPs; the September 2026 slot belongs to JDK 27, now in rampdown. This article examines the three changes with the largest effect on a telemetry backend: HTTP/3 in HttpClient (JEP 517), primitive types in patterns (JEP 530), and the final-field mutation warnings of JEP 500."
+reading_time: 6
 tags: [java, jdk-26, http3, pattern-matching, valhalla]
 sources:
   - title: "JDK 26 — OpenJDK project page"
@@ -18,17 +18,17 @@ sources:
     url: "https://www.infoq.com/news/2026/08/jep401-value-objects-preview/"
 ---
 
-Quick calendar check, because I got this wrong myself when planning upgrades: **JDK 26 is not "coming in September" — it shipped on 17 March 2026** with ten JEPs. The September 2026 slot belongs to **JDK 27**, which entered rampdown phase one on 4 June and is targeted for GA in mid-September. So as of August 2026, JDK 26 is the current release, five months into production use, and it's a good moment to sort what's actually worth adopting from what's preview noise.
+**Gist.** JDK 26 is the current release as of August 2026 — it shipped on **17 March 2026** with ten JDK Enhancement Proposals (JEPs), and the September 2026 slot belongs to JDK 27, which entered rampdown in June. Three of the ten change how a service is written or run: HTTP/3 in the standard `HttpClient` (JEP 517), primitive types in patterns (JEP 530), and warnings for reflective mutation of `final` fields (JEP 500). Each carries a cost: HTTP/3 introduces a negotiation-dependent transport whose behaviour differs per peer, primitive patterns remain a preview feature that requires `--enable-preview` and can change, and JEP 500 places a deprecation clock on every library that rewrites final fields.
 
 ## The JDK 26 scorecard
 
-The ten JEPs: 500 (final-field mutation warnings), 504 (Applet API removed — finally), 516 (AOT object caching with any GC), 517 (HTTP/3 for HttpClient), 522 (G1 throughput via reduced synchronization), 524 (PEM encodings, second preview), 525 (structured concurrency, sixth preview), 526 (lazy constants, second preview), 529 (Vector API, eleventh incubation), and 530 (primitive types in patterns, fourth preview).
+The ten JEPs are: **500** (final-field mutation warnings), **504** (Applet API removed), **516** (ahead-of-time object caching with any garbage collector), **517** (HTTP/3 for `HttpClient`), **522** (G1 throughput via reduced synchronization), **524** (PEM encodings, second preview), **525** (structured concurrency, sixth preview), **526** (lazy constants, second preview), **529** (Vector API, eleventh incubation), and **530** (primitive types in patterns, fourth preview).
 
-I've covered the earlier incarnations of structured concurrency, stable-values-now-lazy-constants, and the Vector API in the JDK 25 write-ups, and none changed enough in 26 to revisit (525 got an `onTimeout()` joiner and list-based return types; 529 is unchanged). The three below are the ones that changed how I write and run the sensor-fleet backend.
+Structured concurrency, lazy constants (formerly stable values) and the Vector API were covered in the JDK 25 write-ups and re-preview or re-incubate in 26 rather than changing shape. The three sections below cover the remainder that alter production code.
 
-## HTTP/3 lands in HttpClient (JEP 517)
+## HTTP/3 in HttpClient (JEP 517)
 
-The standard `HttpClient` can now speak HTTP/3 over QUIC. Opting in is one builder call:
+The standard `HttpClient` can negotiate HTTP/3, which runs over QUIC rather than TCP. Opting in is a builder call on the client, the request, or both:
 
 ```java
 HttpClient client = HttpClient.newBuilder()
@@ -43,11 +43,13 @@ HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString(
 System.out.println(resp.version());   // HTTP_3 if negotiated
 ```
 
-If the server doesn't offer HTTP/3, the client falls back to HTTP/2 — so this is safe to enable and observe. Why I care: the ingest tier talks to object storage and internal services over links where TCP head-of-line blocking is measurable under packet loss. QUIC moves the multiplexing into UDP streams, so one lost packet stalls one stream, not the whole connection. For fleet backends doing many small concurrent requests, that's the difference that shows up in p99, not p50. Bonus from the same release: `HttpRequest.BodyPublishers.ofFileChannel()` for streaming large bodies without loading them onto the heap.
+The version request is a preference, not a guarantee. **When the server does not offer HTTP/3, the exchange can complete over an earlier protocol version**, so enabling it is observable rather than fatal — the actual protocol used is reported by `resp.version()`, and that is the only reliable way to confirm negotiation succeeded.
+
+The mechanism that matters is where multiplexing lives. HTTP/2 multiplexes concurrent streams over a single TCP connection, and TCP delivers bytes in order: **a single lost segment stalls delivery for every stream sharing that connection until retransmission completes**, the failure mode known as transport-level head-of-line blocking. QUIC carries streams over UDP and tracks per-stream delivery, so **a lost packet stalls only the stream whose data it carried**. The consequence is distributional: a workload of many small concurrent requests sees the difference in tail latency, not in the median, because head-of-line stalls are a loss-triggered event rather than a steady-state cost.
 
 ## Primitive types in patterns (JEP 530, fourth preview)
 
-Pattern matching finally treats `int`, `long`, `float` and friends as first-class in `instanceof` and `switch`. The killer semantic: a primitive type pattern matches only when the conversion is **lossless**, which turns a whole class of silent-truncation bugs into non-matches.
+Pattern matching now admits `int`, `long`, `float` and the remaining primitive types in `instanceof` and `switch`. The load-bearing semantic is the match condition: **a primitive type pattern matches only when the conversion is lossless**. A value that would be truncated does not match; it falls through to the next case.
 
 ```java
 // --enable-preview
@@ -66,29 +68,68 @@ if (epochMillis instanceof int seconds) {
 }
 ```
 
-Decoding packed telemetry payloads is exactly this shape of code — a tag byte, then values of varying widths — and `switch` over primitives with guards is tidier and safer than the cast-and-check dance. Fourth preview means the design is stable (26 mostly improved dominance checking for `switch`); it re-runs as fifth preview in JDK 27, so I'd guess finalization lands in 28. Use it behind `--enable-preview` in tools, not in the deployable backend yet.
+This converts a class of silent-truncation defects into non-matches, which are visible as an unexpected branch rather than as a corrupted value. Decoding a packed telemetry payload — a tag byte followed by fields of varying width — has exactly this shape, and a guarded `switch` over primitive patterns replaces a sequence of casts with range checks written by hand.
 
-## Final means final — eventually (JEP 500)
+The feature remains preview. **JDK 26 is its fourth preview.** It therefore belongs behind `--enable-preview` in tooling, not in a deployable service, because preview semantics may change between releases and preview class files are rejected by a runtime of a different version.
 
-JDK 26 starts warning when code uses deep reflection to mutate `final` fields. This is the integrity-by-default campaign continuing, and it will eventually break serialization frameworks, mocking libraries, and that one dependency you forgot about. The migration knobs:
+### Implementation sketch (Scala)
+
+Scala 3 has no primitive type patterns, but the lossless-conversion test that JEP 530 performs can be written explicitly. The sketch below shows the invariant — **narrow, widen back, and require the round trip to be the identity** — which is what makes the match total with respect to value preservation.
+
+```scala
+enum Reading:
+  case Co2(ppm: Int)
+  case Pm25(value: Float)
+  case Raw(bits: Long)
+
+/** True when `v` survives Long -> Int -> Long unchanged. */
+def fitsInt(v: Long): Boolean = v.toInt.toLong == v
+
+/** True when `d` survives Double -> Float -> Double unchanged.
+  * NaN is special-cased because NaN == NaN is false. */
+def fitsFloat(d: Double): Boolean =
+  d.isNaN || d.toFloat.toDouble == d
+
+def classify(reading: Reading): String = reading match
+  case Reading.Co2(ppm) if ppm > 1500 => "co2-ventilate"
+  case Reading.Co2(ppm)               => s"co2:$ppm"
+  case Reading.Pm25(v)                => s"pm25:$v"
+  case Reading.Raw(bits) if fitsInt(bits) => s"seconds:${bits.toInt}"
+  case Reading.Raw(bits)                  => s"wide:$bits"
+```
+
+The guard placement is the point: the wide case must come **after** the narrowing case, because pattern alternatives are tried in source order and an unguarded `Raw` would shadow the narrowed one.
+
+## Final-field mutation warnings (JEP 500)
+
+JDK 26 emits a warning when code uses deep reflection to mutate a `final` field. The behaviour is selected by command-line flag:
 
 ```bash
-# see what breaks today, without breaking it
+# report occurrences without changing behaviour
 java --illegal-final-field-mutation=warn -jar backend.jar
 
-# test tomorrow's behavior
+# reject the mutation
 java --illegal-final-field-mutation=deny -jar backend.jar
 
-# explicitly grant it while a library catches up
+# grant the capability while a dependency is updated
 java --enable-final-field-mutation=ALL-UNNAMED -jar backend.jar
 ```
 
-Run your test suite under `deny` now. The JDK 27 quality-outreach mail explicitly flags this as the thing to check before September. On my stack the offender was an older Jackson afterburner module; upgrading cleared it.
+The affected population is libraries that rewrite fields after construction: serialization frameworks, mocking libraries, and transitive dependencies not visible in a direct dependency list. **Running a test suite under `deny` converts a future runtime failure into a present test failure**, which is the only way to find the offending library before a later release tightens the default.
 
-## Quick hits and what's next
+## Remaining changes and what follows
 
-**JEP 522** gives G1 dual card tables — 5–15% throughput improvement claimed, and it's on by default, so you get it for free. **JEP 516** makes the Leyden AOT cache GC-agnostic — the JDK 25 restriction where the cache only worked with certain collectors is gone, so ZGC users get fast starts too. Also gone: the Applet API (JEP 504) and `Thread.stop()`.
+**JEP 522** improves G1 throughput by reducing the synchronization its write barrier and refinement work require; no configuration change is needed to obtain it. **JEP 516** lifts the JDK 25 restriction that confined the ahead-of-time object cache to particular collectors, so the cache now applies under any garbage collector. The Applet API is removed outright (JEP 504).
 
-Looking ahead, **JDK 27** (GA mid-September 2026) finalizes compact object headers as the default (JEP 534), makes G1 the default GC everywhere (JEP 523), and ships post-quantum hybrid key exchange for TLS 1.3 (JEP 527). And the decade-long wait is over on Valhalla: **JEP 401, value classes, has been integrated as a preview into mainline for JDK 28** (announced this month). A `value class` gives up identity; `==` compares field values recursively, and the JVM is free to flatten and scalarize. That's the biggest object-model change since generics, and it will eventually matter enormously for Scala case classes on the JVM — a topic for its own article once the JDK 28 EA builds stabilize.
+JDK 27 is targeted for general availability in September 2026; its JEP list is fixed at rampdown but its contents are outside the scope of this article.
 
-**Try next:** run your test suite on a JDK 27 EA build from jdk.java.net/27 with `--illegal-final-field-mutation=deny` and fix whatever it flags before September's GA forces the issue.
+Separately, **JEP 401 (value classes) reached its first preview**, reported in August 2026. A `value class` gives up identity; `==` compares field values rather than references, and the virtual machine is permitted to flatten and scalarize instances. That is the largest change to the Java object model since generics, and its interaction with Scala case classes warrants its own treatment once early-access builds carrying it stabilise.
+
+## Pitfalls
+
+- **Setting `Version.HTTP_3` and assuming HTTP/3 is in use.** The version is a preference; a peer without HTTP/3 support silently yields an exchange over an earlier protocol version. Only `HttpResponse.version()` reports what was negotiated.
+- **Expecting HTTP/3 to improve median latency.** Removing transport-level head-of-line blocking changes behaviour when packets are lost; on a loss-free path there is nothing to remove, and the median is unaffected.
+- **Compiling primitive patterns with `--enable-preview` and shipping the class files.** Preview class files carry the minor version of the JDK that produced them and are rejected by any other runtime version, so an artifact built on JDK 26 preview fails to load on JDK 27.
+- **Ordering a narrowing pattern after the wide fallback.** Alternatives are tried in source order; an unguarded wide case placed first shadows the narrowed case and the lossless check never runs.
+- **Reading a JEP 500 warning as harmless because the process still runs.** Under the default `warn` mode the mutation succeeds; the same code fails under `deny`, which is the behaviour a later release moves toward.
+- **Testing only direct dependencies for final-field mutation.** The mutation typically originates in a transitive dependency, so the warning appears at runtime under production workloads rather than during a dependency audit.

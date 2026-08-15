@@ -2,8 +2,8 @@
 title: "Iron: Compile-Time Refinement Types for Scala 3"
 date: 2026-08-11
 track: scala-jvm
-summary: "Iron attaches a predicate to a base type so an Int :| Positive is an Int the compiler knows is greater than zero — proven at compile time for literals, validated at runtime for external input via refineEither."
-reading_time: 6
+summary: "Iron attaches a predicate to a base type so that an Int :| Positive is an Int the compiler knows is greater than zero — proven at compile time for statically known values, validated at runtime for external input via refineEither."
+reading_time: 7
 tags: [scala3, iron, refinement-types, domain-modeling, type-safety, validation]
 sources:
   - title: "Iltotore/iron — Strong type constraints for Scala (GitHub)"
@@ -18,13 +18,13 @@ sources:
     url: "https://index.scala-lang.org/iltotore/iron"
 ---
 
-An [opaque type](/articles/scala-jvm/2026-07-31-scala3-opaque-types) gives you a distinct `Temperature` that the compiler refuses to confuse with a bare `Double`. What it does not give you is a guarantee about the *value*: a `Temperature` opaque type still admits `-40.0` unless you hand-write a smart constructor and remember to route every construction through it. **Refinement types** close that gap. They attach a *predicate* to a base type, so the type itself carries the invariant. Iron is the Scala 3 library that makes this practical, and — crucially — proves the predicate at compile time whenever the value is known statically.
+**Gist.** An [opaque type](/articles/scala-jvm/2026-07-31-scala3-opaque-types) makes `Temperature` distinct from a bare `Double` but says nothing about the *value*: `-40.0` remains admissible unless every construction site is routed through a hand-written smart constructor. **Refinement types** attach a predicate to the base type, so the type itself carries the invariant, and Iron discharges that predicate **at compile time whenever the value is statically known**. The cost is that compile-time proof covers only statically known values; everything arriving from outside the program must still be refined at runtime through an explicit error channel, and the constraint machinery runs in the compiler, so it is paid in compilation time rather than at execution.
 
-Iron is Scala 3 only by design; the whole mechanism rests on `inline`, match types, and compile-time macros that do not exist in Scala 2. The current release is the 3.3.x line (v3.3.1, April 2026), published for Scala 3 across JVM, Scala.js, and Native.
+Iron targets Scala 3 exclusively. The mechanism rests on `inline` definitions and compile-time macros, which have no Scala 2 equivalent. Scaladex lists the artifacts as published for Scala 3 across the Java Virtual Machine (JVM), Scala.js, and Scala Native.
 
-## The core idea: a type plus a predicate
+## The core operator: a type plus a predicate
 
-The central operator is `:|` (read "such that"). `Int :| Positive` is a subtype of `Int` refined by the `Positive` constraint — an `Int` the type system knows is greater than zero. Because it is a genuine subtype of `Int`, you can pass it anywhere an `Int` is expected without unwrapping.
+The central operator is `:|`, read "such that". `Int :| Positive` denotes an `Int` refined by the `Positive` constraint. **The refined type is a genuine subtype of the base type**, so a value of `Int :| Positive` is accepted anywhere an `Int` is expected, with no unwrapping step and no wrapper allocation.
 
 ```scala
 import io.github.iltotore.iron.*
@@ -36,11 +36,11 @@ val ok: Int :| Greater[0] = 5    // compiles: 5 > 0 is provable at compile time
 def log(x: Double :| Positive): Double = Math.log(x) // no runtime check needed
 ```
 
-The second line does not fail at runtime — it fails to *compile*. Iron's automatic refinement inspects the literal `-1` at compile time, finds it cannot satisfy `Greater[0]`, and rejects the program. That is the payoff: illegal literals never reach a running JVM. `Positive` is just a friendlier alias; `Greater[0]` and `Positive` describe the same set.
+The commented line fails to *compile* rather than failing at runtime. Iron's automatic refinement inspects the literal `-1` during compilation, determines that it cannot satisfy `Greater[0]`, and rejects the program. **A literal that violates a constraint therefore never reaches a running JVM.** `Positive` is an alias: `Greater[0]` and `Positive` describe the same set of values.
 
-## Constraints you actually use
+## Constraint families
 
-Constraints live in packages you import by domain. A representative slice:
+Constraints are grouped into packages imported by domain. A representative slice:
 
 | Import | Constraint | Meaning |
 |---|---|---|
@@ -49,13 +49,13 @@ Constraints live in packages you import by domain. A representative slice:
 | `constraint.numeric.*` | `Interval.Closed[1, 150]` | `>= 1 && <= 150` |
 | `constraint.string.*` | `Alphanumeric` | letters and digits only |
 | `constraint.string.*` | `Match["^[a-z]+$"]` | matches a regex literal |
-| `constraint.string.*` | `ValidEmail`, `ValidUUID` | canned patterns |
+| `constraint.string.*` | `ValidUUID` | a well-formed UUID string |
 
-Constraints compose with `&`, so `Int :| (Greater[0] & Less[100])` is a percentage-like value, and `Interval.Closed[V1, V2]` is itself defined as `GreaterEqual[V1] & LessEqual[V2]` with a human-readable description attached. `Match` takes a string *literal* as a type argument and validates the regex at compile time — the pattern is checked when your code compiles, not on first use.
+Constraints compose with `&`: `Int :| (Greater[0] & Less[100])` describes a percentage-like value. `Interval.Closed[V1, V2]` is itself defined as `GreaterEqual[V1] & LessEqual[V2]` with a human-readable description attached. **`Match` takes a string *literal* as its type argument**, which is what allows a statically known string to be checked against the pattern during compilation rather than at execution.
 
-## Opaque newtypes for domain modeling
+## Named refined types for domain modelling
 
-Refined aliases are useful, but for domain modeling you usually want a *named* type with its own companion — a value object. Iron's `RefinedType` builds exactly that on top of an opaque type:
+Refined aliases suffice for local signatures, but a domain value object needs a *named* type with its own companion. Iron's `RefinedType` constructs one on top of an opaque type:
 
 ```scala
 import io.github.iltotore.iron.*
@@ -72,11 +72,11 @@ val maybe: Option[Temperature]               = Temperature.option(readSensor())
 val trusted: Temperature                     = Temperature.applyUnsafe(15.0) // throws if invalid
 ```
 
-`Temperature` is a zero-overhead opaque type: at runtime it *is* a `Double`, no wrapper allocation. But the only way to obtain one is through the companion, and the companion enforces `Positive`. The `apply` method is compile-time checked for literals; `either`, `option`, and `applyUnsafe` handle values that are only known at runtime. This is the "make illegal states unrepresentable" habit, upgraded from "distinct type" to "distinct type that cannot hold an illegal value."
+`Temperature` erases to `Double` at runtime, so no wrapper object is allocated. **The companion is the sole construction path, and it enforces `Positive` on every path through it.** The four entry points differ only in how they report failure: `apply` is compile-time checked and admits statically known values; `either` yields `Either[String, Temperature]`; `option` discards the message; `applyUnsafe` throws. The result upgrades the "make illegal states unrepresentable" discipline from a distinct type to a distinct type that cannot hold an illegal value.
 
 ## Validating external input
 
-Compile-time proof works only when the value is a literal or otherwise statically known. Anything crossing a boundary — a JSON field, a query param, a config value — is dynamic, so you *refine* it at runtime and get an error channel back:
+Compile-time proof applies only where the value is a literal or otherwise statically known. Any value crossing a boundary — a JSON field, a query parameter, a configuration entry — is dynamic and must be refined at runtime, which returns an error channel:
 
 ```scala
 import io.github.iltotore.iron.*
@@ -91,16 +91,55 @@ def parse(rawName: String, rawAge: Int): Either[String, (String :| Alphanumeric,
   yield (name, age)
 ```
 
-`refineEither[C]` returns `Either[String, A :| C]`, with the constraint's description as the `Left`. `refineOption[C]` returns `Option`, and `refineUnsafe` throws — use the latter only when a failure is genuinely a bug. Because the result is a real refined type, everything downstream can *demand* `String :| Alphanumeric` in its signature and never re-check. Validation happens once, at the edge; the invariant then rides the type for the rest of the program.
+`refineEither[C]` returns `Either[String, A :| C]`, using **the constraint's description as the `Left` value**. `refineOption[C]` returns an `Option`, discarding the description; `refineUnsafe` throws, and is appropriate only where a violation is a program defect rather than bad input. Because the success case is a real refined type, every downstream signature can demand `String :| Alphanumeric` and perform no further check. **The check occurs once, at the boundary; the invariant then travels in the type.**
+
+Note the sequencing above: the `for` comprehension over `Either` is fail-fast, so a bad `rawName` short-circuits and the `rawAge` violation is never reported.
+
+### Implementation sketch (Scala)
+
+The load-bearing idea is that the refined type is the base type plus evidence, and that the boundary is the only place evidence is manufactured. The sketch below shows a parser whose internal stages cannot re-admit an invalid value, and accumulates both field errors instead of stopping at the first.
+
+```scala
+import io.github.iltotore.iron.*
+import io.github.iltotore.iron.constraint.all.*
+
+type Port = Port.T
+object Port extends RefinedType[Int, Interval.Closed[1, 65535]]
+
+type Host = Host.T
+object Host extends RefinedType[String, Not[Empty]]
+
+final case class Endpoint(host: Host, port: Port)
+
+// Boundary: untyped input in, evidence out. Errors accumulate rather than short-circuit.
+def parseEndpoint(rawHost: String, rawPort: Int): Either[List[String], Endpoint] =
+  (Host.either(rawHost), Port.either(rawPort)) match
+    case (Right(h), Right(p)) => Right(Endpoint(h, p))
+    case (h, p)               => Left(List(h, p).collect { case Left(msg) => msg })
+
+// Interior: no validation, because the types already carry it.
+def render(e: Endpoint): String = s"${e.host}:${e.port}"
+
+val configured: Endpoint = Endpoint(Host("localhost"), Port(8080)) // both proven at compile time
+```
+
+Two properties matter. `render` takes an `Endpoint` and performs no bounds check, because `Port` cannot exist outside `[1, 65535]`. The literal construction on the last line compiles without a runtime branch; replacing `8080` with `70000` turns it into a compilation error rather than a defect discovered in production.
 
 ## Ecosystem integrations
 
-Iron ships thin modules so refined types flow through common libraries without glue. `iron-cats` adds `Validated` accumulation and `NonEmptyList` error reporting; `iron-circe` derives JSON codecs that reject out-of-range values during decoding; `iron-doobie` and `iron-skunk` let refined types map directly to SQL columns; there are also modules for ZIO, jsoniter, pureconfig, ciris, and decline. The pattern is consistent: decode or read into the refined type and the library performs the check at the boundary for you.
+Iron ships thin modules so that refined types pass through common libraries without adapter code. `iron-cats` supplies `Validated` accumulation and `NonEmptyList` error reporting; `iron-circe` derives JSON codecs that reject out-of-range values during decoding; `iron-doobie` and `iron-skunk` map refined types onto SQL columns; further modules exist for ZIO, jsoniter, pureconfig, ciris, and decline. The pattern is uniform: decoding or reading into the refined type causes the library to perform the constraint check at the boundary.
 
-## Iron versus refined versus plain opaque types
+## Iron, refined, and plain opaque types
 
-The older [`refined`](https://github.com/fthomas/refined) library pioneered this style, but it is a Scala 2 project (Shapeless-era machinery) with a Scala 3 port that never became idiomatic. Iron was written for Scala 3 from scratch: it leans on native `inline`/macros, produces clearer compile errors, and integrates with opaque types rather than fighting them. If you are on Scala 3, Iron is the natural choice.
+The older [`refined`](https://github.com/fthomas/refined) library established this style on Scala 2, where the encoding depends on Scala 2's implicit and macro machinery. Iron was written for Scala 3 from the outset on `inline` and Scala 3 macros, and builds its named types on opaque types. No published benchmark separates the compile-time cost of the two.
 
-Against plain opaque types, the trade is explicit. Opaque types give you a distinct name and zero-cost erasure but leave *value* validation entirely to your hand-written constructors. Iron keeps the zero-cost erasure, then layers a checkable predicate on top — and proves it at compile time whenever it can. Reach for a bare opaque type when the invariant is "this is a distinct concept"; reach for Iron when the invariant is "and its value must satisfy P."
+Against plain opaque types the trade is explicit. An opaque type supplies a distinct name and erases at zero cost, but leaves *value* validation to hand-written constructors. Iron retains the erasure and adds a checkable predicate, discharged statically where the value permits. A bare opaque type suits an invariant of the form "this is a distinct concept"; Iron suits "and its value must satisfy P".
 
-**Try next:** Define `type Port = Port.T` with `object Port extends RefinedType[Int, Interval.Closed[1, 65535]]`, then try `Port(0)` and `Port(8080)` in a worksheet and confirm only the first is a compile error. Then add `iron-circe`, decode `{"port": 70000}`, and watch the constraint's description surface as a decoding failure instead of a silently accepted bad value.
+## Pitfalls
+
+- **`refineUnsafe` and `applyUnsafe` throw at runtime.** Applied to values decoded from external input, they convert a recoverable validation failure into an exception on the request path.
+- **A `for` comprehension over `Either` is fail-fast.** Chaining several `refineEither` calls reports only the first violated field; accumulating every field error requires `Validated` from `iron-cats` or an explicit match on the results.
+- **Compile-time proof requires a statically known value.** Passing a `val` whose type is a plain `Int` where `Int :| Positive` is expected fails to compile even when the runtime value is positive, because the evidence is absent; refinement must be applied where the value enters the program.
+- **`Match` requires a literal type argument.** A pattern held in a runtime `String` cannot be supplied as the type parameter, so patterns loaded from configuration fall outside compile-time checking entirely.
+- **Refined types erase to their base type.** A `Temperature` is a `Double` at runtime, so a pattern match on `Any` or a reflective check cannot distinguish it from any other `Double`, and the invariant does not survive erasure-dependent code paths.
+- **The constraint is on the value, not on the arithmetic.** `Int :| Positive` values added together produce a plain `Int`; the result must be refined again if the positivity is to be carried forward, and overflow is not excluded by the constraint.

@@ -1,9 +1,9 @@
 ---
-title: "async-profiler: Honest JVM Flame Graphs Without Safepoint Bias"
+title: "async-profiler: JVM Flame Graphs Without Safepoint Bias"
 date: 2026-08-15
 track: scala-jvm
-summary: "Most JVM samplers can only see stacks at safepoints, so they systematically lie about where CPU time goes. async-profiler samples via perf_events and walks Java stacks asynchronously, giving mixed Java+native flame graphs from a one-line attach. Commands for CPU, alloc, lock, and wall profiling — plus JFR output and the 4.x heatmaps."
-reading_time: 5
+summary: "Most JVM samplers can only observe stacks at safepoints, so they systematically misattribute CPU time. async-profiler samples via perf_events and walks Java stacks asynchronously, producing mixed Java and native flame graphs from a one-line attach. Commands for CPU, alloc, lock and wall profiling, plus JFR output and the 4.x heatmaps."
+reading_time: 6
 tags: [async-profiler, jvm, profiling, flame-graphs, performance, perf]
 sources:
   - title: "async-profiler — GitHub repository and docs"
@@ -18,56 +18,94 @@ sources:
     url: "https://www.baeldung.com/java-async-profiler"
 ---
 
-We have built flame graphs from `perf` output (see the perf-flame-graphs article) and shipped them continuously with Pyroscope (see the pyroscope article). On the JVM, the engine underneath both workflows is usually the same tool: **async-profiler**, currently at **v4.5** (July 2026). It exists because the obvious way to sample a JVM produces graphs that are not just noisy but *systematically wrong*.
+**Gist.** A sampling profiler that collects Java stacks through the JVM Tool Interface (JVMTI) can only observe a thread when that thread has reached a **safepoint**, so time spent in regions containing no safepoint poll is attributed to whichever frame follows the region — an error that is systematic rather than random. async-profiler removes that constraint by taking samples from a signal handler driven by the Linux `perf_events` subsystem and unwinding the Java stack asynchronously, which places each sample at the instruction the processor was executing and yields mixed Java-plus-native stacks. The cost is that asynchronous unwinding runs outside the JVM's own consistency guarantees and depends on kernel permissions, so it needs its own stack walker and degrades to timer-based modes when `perf_events` access is denied.
 
-## The safepoint lie
+The tool underlies both of the flame-graph workflows described elsewhere in this track: graphs built from `perf` output (see the perf-flame-graphs article) and continuous profiling with Pyroscope (see the pyroscope article). The current release line is **v4.5** (July 2026).
 
-A classic Java sampler (VisualVM, old JProfiler modes) ticks a timer and calls JVMTI `GetAllStackTraces`. That call can only run when every thread is at a **safepoint** — one of the polling points the JIT emits at method returns and uncounted-loop back-edges. Two distortions follow. First, your sample doesn't capture where the thread *was* when the timer fired, but where it *next reached a safepoint* — hot counted loops and aggressively inlined code contain no polls, so their time gets billed to whatever safepoint comes after them. Second, stopping the world to sample costs enough that you sample rarely. Nitsan Wakart's write-up shows profilers confidently naming the wrong hottest method on trivial benchmarks. This is *safepoint bias*: the profiler can only see the places the JVM lets it look.
+## Safepoint bias
 
-async-profiler sidesteps JVMTI entirely. It asks Linux **perf_events** to interrupt the process every N cycles of *actual CPU time*, and from the signal handler walks the Java stack asynchronously — historically via HotSpot's internal `AsyncGetCallTrace` call, and in the 4.x line via its own VMStructs-based stack walker that fixes AGCT's unwinding failure modes. No safepoint required, so samples land exactly where the CPU was. Because perf_events also provides the native and kernel stack, you get **mixed-mode** graphs: your Scala code, the JVM's C++ (GC, JIT threads), libc, and kernel frames in one picture.
+A classic Java sampler — VisualVM, older JProfiler modes — ticks a timer and calls the JVMTI function `GetAllStackTraces`. That call executes only when every thread has stopped at a safepoint: one of the polling points the JIT compiler — which translates bytecode to machine code at runtime — emits at method returns and at back-edges of uncounted loops. Two distortions follow.
 
-## Attach in one line
+The first is misattribution. The sample does not record where a thread was when the timer fired; it records where the thread **next reached a safepoint**. Counted loops and aggressively inlined code contain no polls, so the time they consume is billed to the frame holding the next poll. The second is rate. Bringing all threads to a safepoint is expensive enough that the sampling frequency has to stay low, which widens the confidence interval on every measurement. Wakart's write-up demonstrates profilers naming the wrong hottest method on small benchmarks. The name for the combined effect is **safepoint bias**: the profiler observes only the places where the JVM permits observation, and those places are correlated with the code being measured.
 
-Since 3.0 the tool ships a launcher binary, `asprof`, that attaches to a running JVM by PID — no restart, no agent flags:
+async-profiler does not use JVMTI for sampling. It requests that `perf_events` interrupt the process every N cycles of consumed CPU time and, from inside the resulting signal handler, walks the Java stack asynchronously — historically through HotSpot's internal `AsyncGetCallTrace` entry point, and in the 4.x line through the project's own stack walker built on VMStructs, which replaces the dependency on `AsyncGetCallTrace`. **No safepoint is required, so each sample lands at the instruction the processor was executing.** Because `perf_events` also supplies the native and kernel portion of the stack, the resulting graph is **mixed-mode**: Scala frames, JVM C++ frames such as garbage-collection and JIT threads, libc frames and kernel frames appear in one picture.
+
+### Implementation sketch (Scala)
+
+The shape of code that safepoint-biased sampling mishandles is a counted loop whose body is inlined, containing no poll from entry to exit:
+
+```scala
+object HotLoop:
+  // A counted loop over Int: HotSpot may emit no safepoint poll on the back-edge,
+  // so a JVMTI sampler is unlikely to observe a thread while it is inside this method.
+  def mix(data: Array[Long]): Long =
+    var acc = 0L
+    var i = 0
+    while i < data.length do
+      acc = acc * 6364136223846793005L + data(i)
+      i += 1
+    acc
+
+  def report(data: Array[Long], rounds: Int): Long =
+    var total = 0L
+    var r = 0
+    while r < rounds do
+      total += mix(data)          // time spent here is billed to the next poll
+      r += 1
+    total
+```
+
+A JVMTI-based sampler tends to attribute the cycles of `mix` to a frame reached after the loop ends. A `perf_events` sample interrupts inside `mix` itself.
+
+## Attaching
+
+Since 3.0 the distribution includes a launcher binary, `asprof`, which attaches to a running JVM by process identifier, requiring neither a restart nor agent flags:
 
 ```bash
 # 30 seconds of CPU profiling -> interactive flame graph
 asprof -d 30 -f /tmp/cpu.html 8983
 
-# or by name via jps, and start/stop by hand
+# or by name via jps, starting and stopping explicitly
 asprof start MyApp
 asprof stop -f /tmp/cpu.html MyApp
 ```
 
-Default is CPU sampling at 100 Hz per core (`-i` changes the interval). The `.html` extension selects the built-in d3-free flame graph — a standalone file with search, zoom, and (since 4.x) a dark-mode toggle. The one prerequisite worth knowing: kernel symbol access for perf_events may need `sysctl kernel.perf_event_paranoid=1` and `kernel.kptr_restrict=0`, otherwise async-profiler falls back to `ctimer`/`itimer` modes that still avoid safepoint bias but lose kernel frames.
+The default is CPU sampling at a **10 ms interval**; `-i` changes it. An `.html` output extension selects the built-in flame graph, a standalone file with search, zoom and, since 4.x, a dark-mode toggle. Kernel symbol access for `perf_events` may require `sysctl kernel.perf_event_paranoid=1` and `kernel.kptr_restrict=0`; without them async-profiler falls back to the `ctimer` and `itimer` modes, which remain free of safepoint bias but lose kernel frames.
 
-## Four questions, four events
+## Four events, four questions
 
-The `-e` flag switches what a sample *means*, and each mode answers a different production question:
+The `-e` flag determines what a sample denotes.
 
 ```bash
 asprof -d 30 -e cpu   -f cpu.html   8983   # where do cycles go?
-asprof -d 30 -e wall  -f wall.html  8983   # where does time go, incl. blocking?
-asprof -d 30 -e alloc -f alloc.html 8983   # who allocates?
-asprof -d 30 -e lock  -f lock.html  8983   # who contends?
+asprof -d 30 -e wall  -f wall.html  8983   # where does elapsed time go, blocking included?
+asprof -d 30 -e alloc -f alloc.html 8983   # which stacks allocate?
+asprof -d 30 -e lock  -f lock.html  8983   # which stacks contend?
 ```
 
-**cpu** samples only threads that are on-CPU. **wall** samples every thread regardless of state, so a request stuck in `epoll_wait` or a JDBC call finally shows up — this is the mode for latency work, and it pairs with `-t` to split the graph per thread. **alloc** doesn't sample time at all: it instruments TLAB slow paths, so each sample is a stack that allocated, weighted by bytes — cheap enough for production and the fastest way to find the code feeding your GC. **lock** records stacks that waited on contended monitors and `ReentrantLock`s, weighted by wait time. Add `--total` to weight alloc graphs by total bytes, and note that 4.0 also added a **nativemem** leak profiler for `malloc` paths outside the heap.
+**cpu** samples only threads that are on-CPU. **wall** samples every thread regardless of state, so a request blocked in `epoll_wait` or inside a JDBC call becomes visible; this is the mode for latency work, and `-t` splits the graph per thread. **alloc** does not sample time: it instruments thread-local allocation buffer (TLAB) slow paths, so each sample is a stack that allocated, weighted by bytes. **lock** records stacks that waited on contended monitors and on `ReentrantLock`, weighted by wait time. `--total` weights allocation graphs by total bytes. Release 4.0 added a **nativemem** profiler covering `malloc` paths outside the Java heap.
 
 ## JFR recordings and heatmaps
 
-Flame graph HTML is an aggregate — it throws away *when*. For anything intermittent, record JFR instead, and capture several event types in one pass:
+Flame-graph HTML is an aggregate and discards the time axis. For intermittent behaviour, record JDK Flight Recorder (JFR) output instead and capture several event types in one pass:
 
 ```bash
 asprof -d 300 -e cpu --alloc 2m --lock 10ms -o jfr -f app.jfr 8983
 jfrconv --cpu  app.jfr cpu.html        # slice back out per event type
-jfrconv --cpu -o heatmap app.jfr heat.html
+jfrconv -o heatmap app.jfr heat.html
 ```
 
-The output is a standard JFR file, readable by JDK Mission Control, and the bundled `jfrconv` converts it to flame graphs or collapsed stacks. The **heatmap** converter (new in 4.0) is the reason to prefer this route: a two-dimensional timeline of colored blocks, one per ~20 ms slice, with intensity as the third dimension — the docs quote handling 24-hour recordings at that granularity in a single self-contained HTML file. Select a hot band and you get the flame graph for exactly that interval, which turns "p99 spikes every few minutes" from a mystery into a click. The rest of the 4.x line has pushed the same production angle: 4.3 added native lock profiling, latency filtering, and Prometheus/JMX remote control; 4.4 added differential flame graphs; 4.5 added a span API for latency profiling and compatibility with the OpenTelemetry Profiles alpha.
+The result is a standard JFR file readable by JDK Mission Control, and the bundled `jfrconv` converts it into flame graphs or collapsed stacks. The **heatmap** converter, added in 4.0, is the reason to prefer this route: a two-dimensional timeline of coloured blocks, one block per short time slice, with intensity as a third dimension. The documentation describes long recordings remaining a single self-contained HTML file. Selecting a band produces the flame graph for that interval alone, which converts a periodic p99 spike into a locatable event.
 
 ## Reading a JVM graph
 
-Flame graph mechanics are covered in the perf article; what is JVM-specific is the coloring and the usual suspects. Green frames are Java/Scala, yellow are JVM C++, red are other native code. A wide yellow tower under `Compile::Compile` is the JIT still warming up — profile later or check code cache pressure. GC worker towers that dominate a *cpu* profile mean the fix is in your *alloc* profile, not your algorithm. Wide `ThreadPark`/`epoll` plateaus in a *wall* profile with a flat *cpu* profile mean you are waiting, not computing — go look at the lock graph or the downstream service. The tool's job is to make the JVM stop hiding; the reading is the same skepticism you would apply to any perf data.
+Flame-graph mechanics are covered in the perf article; what is JVM-specific is the colouring and the recurring shapes. Green frames are Java or Scala, yellow are JVM C++, red are other native code. A wide yellow tower rooted in the compiler-thread frames indicates the JIT compiler still working, which suggests profiling later or examining code-cache pressure. Garbage-collection worker towers dominating a *cpu* profile point at the *alloc* profile rather than at the algorithm. Wide park or `epoll` plateaus in a *wall* profile combined with a flat *cpu* profile indicate waiting rather than computing, which directs attention to the lock graph or to the downstream service.
 
-**Try next:** attach `asprof -d 60 -e wall -t -o jfr` to a service under load, convert the same recording with `jfrconv --cpu` and `--wall`, and diff the two graphs — every frame that grows in wall mode is blocking you can go hunt.
+## Pitfalls
+
+- A profile taken with `-e cpu` on a service that is mostly blocked shows a nearly empty graph, because threads off-CPU are never sampled; the elapsed time lives in the *wall* profile.
+- Kernel frames vanish and native symbols degrade when `perf_event_paranoid` or `kptr_restrict` deny access, because the tool silently falls back to `ctimer` or `itimer` sampling rather than failing.
+- An *alloc* profile weighted by sample count over-represents frequent small allocations relative to few large ones; `--total` re-weights by bytes.
+- Flame-graph HTML aggregates the entire recording, so a spike confined to a few seconds of a 300-second run is diluted below visibility; the JFR plus heatmap route preserves the time axis.
+- A profile started immediately after deployment is dominated by JIT compilation and by interpreted frames, and does not describe steady-state behaviour.
+- The *lock* event records contended monitor and `ReentrantLock` waits, so contention expressed through other mechanisms does not appear in that graph at all.

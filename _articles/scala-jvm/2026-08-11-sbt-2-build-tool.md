@@ -1,8 +1,8 @@
 ---
-title: "sbt 2.0 Is Here: What Actually Changed, and How to Try It Safely"
+title: "sbt 2.0: What Changed, and How to Evaluate It Safely"
 date: 2026-08-11
 track: scala-jvm
-summary: "sbt 2.0 shipped GA on 29 June 2026 — build definitions now compile with Scala 3, tasks are cached by default, and there's a Bazel-compatible remote cache. Here's what's new, the migration friction, and how to test it without breaking your 1.x build."
+summary: "sbt 2.0 shipped GA on 29 June 2026 — build definitions compile with Scala 3, tasks are cached by default, and the remote cache speaks a Bazel-compatible gRPC protocol. This covers the source-incompatible changes, the migration friction, and how to test a 2.x build without disturbing a working 1.x one."
 reading_time: 6
 tags:
   - scala
@@ -23,58 +23,63 @@ sources:
     url: "https://eed3si9n.com/sbt-remote-cache-with-bazel-compat/"
 ---
 
-After a long milestone-and-RC road, **sbt 2.0.0 shipped as a stable GA release on 29 June 2026**. This is not a marketing "2.0" — it is a genuine major version with source-incompatible changes. As of this writing the line has already moved fast: **2.0.6 landed on 7 August 2026**, roughly every two weeks, and the **sbt 1.x line continues in parallel** (1.12.x is still maintained). So there is no forced march. You can adopt sbt 2 deliberately, project by project.
+**Gist.** A build definition in sbt is itself a compiled Scala program, so changing the language it compiles against is a source-incompatible change to every build file and every plugin in the ecosystem. **sbt 2.0, announced as generally available (GA) on 29 June 2026 with the 2.0.1 release**, moves that compilation to Scala 3, makes task-result caching the default rather than an opt-in, and adds a remote cache that speaks a Bazel-compatible protocol. The cost is paid in the plugin ecosystem: plugins are compiled artifacts, so each one must be republished for the new line before a build that depends on it can move.
 
-This article covers what changed, where the friction is, and how to kick the tires without wrecking a working 1.x build.
+The 2.x line has released frequently — **2.0.6 landed on 7 August 2026** — and **the 1.x line continues in parallel** (1.12.15 shipped the same day as 2.0.6). Migration is therefore per-project and reversible rather than forced.
 
-## Build definitions now compile with Scala 3
+## Build definitions compile with Scala 3
 
-The headline change: **your `build.sbt`, `project/*.scala`, and plugins are now compiled with Scala 3** (sbt 2.0.x uses the Scala 3.8.x compiler), and the minimum runtime is **JDK 17**. For simple builds you will barely notice, but any custom task logic or plugin code has to be Scala 3-clean.
+In sbt 2, **`build.sbt`, the files under `project/`, and all plugins are compiled by the Scala 3 compiler** (the GA announcement names Scala 3.8.4 for build definitions and plugins), and **the minimum runtime is Java Development Kit (JDK) 17**. A build with no custom task logic may compile unchanged; anything that defines its own tasks or settings must be Scala 3-clean.
 
-Two syntax changes bite immediately:
+Two source incompatibilities surface first because they appear in ordinary dependency declarations:
 
-- **Postfix method calls are gone.** `... withSources() withJavadoc()` must become `(...).withSources().withJavadoc()`.
-- **Typeclass imports changed.** Where you imported codecs with a wildcard, you now write `import sbt.librarymanagement.LibraryManagementCodec.{ given, * }` to bring `given` instances into scope.
+- **Postfix method call syntax is removed.** `... withSources() withJavadoc()` must be written `(...).withSources().withJavadoc()`.
+- **Typeclass instance imports changed shape.** Scala 3 does not import `given` instances under a plain wildcard, so codec imports become `import sbt.librarymanagement.LibraryManagementCodec.{ given, * }`.
 
-Also worth knowing: **bare settings in `build.sbt` are now injected into every subproject**, not the root. If you really mean "root only," scope it: `LocalRootProject / name := "root"`. And **slash syntax is now mandatory** — the old `test:compile` axis notation is fully removed in favor of `Test / compile`. If you already migrated to slash syntax on 1.x (available since 1.1), you're ahead.
+Two scoping changes alter the meaning of existing files rather than rejecting them, which makes them the more dangerous class of change:
 
-## Caching is the real story
+- **Bare settings in `build.sbt` are injected into every subproject** rather than applying to the root project. A setting intended for the root alone must name it: `LocalRootProject / name := "root"`.
+- **Slash syntax is mandatory.** The older axis notation `test:compile` is removed entirely; only `Test / compile` is accepted. Builds already converted on 1.x — slash syntax has been available since sbt 1.1 — need no work here.
 
-sbt 2 makes caching a first-class, default behavior rather than a bolt-on.
+## Caching is the default execution model
 
-- **All tasks are cached by default.** Task results are serialized and reused when inputs are unchanged. If a task returns something non-serializable, wrap it: `Def.uncached(...)`.
-- **`test` runs incrementally by default** — only affected tests re-run.
-- **A remote build cache** shares those results across machines and CI. The backend speaks **gRPC and is compatible with Bazel remote-cache servers** (BuildBuddy, bazel-remote, etc.), so `compile` and `test` outputs can be pulled instead of recomputed.
+sbt 2 treats caching as a property of task execution rather than a feature layered over it.
 
-Wiring up a remote cache is two steps. Add the plugin in `project/plugins.sbt`:
+- **Task results are cached by default.** A task's result is serialized and reused when its inputs are unchanged. The invariant this requires is that **a cached task's result type must have a `JsonFormat` given instance**; a task whose result cannot be encoded that way has to be wrapped in `Def.uncached { ... }`.
+- **Unchanged tests are skipped by default,** the behaviour sbt 1.x offered only through the separate `testQuick` command.
+- **A remote cache** extends reuse across machines and continuous-integration (CI) agents. **The backend protocol is gRPC and is compatible with Bazel remote-cache servers** — bazel-remote, BuildBuddy, EngFlow and NativeLink are the servers named in the design write-up — so `compile` and `test` outputs can be fetched instead of recomputed.
+
+Enabling the remote cache is two edits. First, the plugin in `project/plugins.sbt`:
 
 ```scala
 addRemoteCachePlugin
 ```
 
-Then point it at a backend in `build.sbt`:
+Then a backend in `build.sbt`:
 
 ```scala
 // Unauthenticated local gRPC cache
 Global / remoteCache := Some(uri("grpc://localhost:2024"))
 
-// Or a hosted cache over mTLS
-Global / remoteCache := Some(uri("grpcs://cache.example.io"))
-Global / remoteCacheTlsCertificate := Some(file("/tmp/ssl/ca.crt"))
-Global / remoteCacheTlsClientCertificate := Some(file("/tmp/ssl/client.crt"))
-Global / remoteCacheTlsClientKey := Some(file("/tmp/ssl/client.pem"))
+// Or a hosted cache over mutual TLS
+Global / remoteCache := Some(uri("grpcs://localhost:2024"))
+Global / remoteCacheTlsCertificate := Some(file("/tmp/sslcert/ca.crt"))
+Global / remoteCacheTlsClientCertificate := Some(file("/tmp/sslcert/client.crt"))
+Global / remoteCacheTlsClientKey := Some(file("/tmp/sslcert/client.pem"))
 ```
 
-There's also **sbtn**, the native-image client that keeps a warm server process around so start-up feels near-instant. The `sbt` runner detects the build version and launches sbtn automatically for 2.x builds.
+The `grpc` scheme is unencrypted; `grpcs` is the TLS scheme, and the documented configuration for it sets all three certificate settings above. Caches that authenticate with an API key take it through `remoteCacheHeaders` instead.
 
-## Cross-building and dependency management
+**sbtn**, a native client, talks to a resident sbt server, so Java virtual machine (JVM) start-up is not paid on every invocation.
 
-Two more consolidations:
+## Cross-building and dependency resolution
 
-- **Project matrix is built in.** Cross-building across JVM / Scala.js / Scala Native no longer needs `sbt-projectmatrix` as a separate plugin — the machinery is native to sbt 2. A knock-on effect: platform-cross-published libraries use the ordinary `%%` operator; the old `%%%` operator from Scala.js/Native is gone.
-- **Coursier is the resolver.** Coursier (the default since 1.3) is now the standard library-management path in sbt 2, so parallel, cached artifact resolution is just how dependencies work.
+Two capabilities previously supplied by separate components are now part of sbt itself:
 
-Here is a minimal `build.sbt` that is valid under sbt 2:
+- **Project matrix is built in.** Cross-building a project across the JVM, Scala.js and Scala Native no longer requires the `sbt-projectmatrix` plugin. A consequence for dependency declarations: **`%%` now encodes both the Scala version and the platform suffix, so the `%%%` operator that Scala.js and Scala Native plugins added to work around its absence is no longer needed.**
+- **Coursier is the standard resolver.** Coursier has been the default since sbt 1.3 and is the library-management path in 2.x, so resolution is parallel and locally cached by default.
+
+A minimal build definition valid under sbt 2:
 
 ```scala
 ThisBuild / scalaVersion := "3.8.4"
@@ -83,24 +88,32 @@ ThisBuild / organization := "com.saltmere"
 lazy val root = (project in file("."))
   .settings(
     name := "hello-sbt2",
-    libraryDependencies += "org.scalameta" %% "munit" % "1.0.4" % Test
+    libraryDependencies += "org.scalameta" %% "munit" % "1.3.5" % Test
   )
 ```
 
-## Setting the version — and trying it without breaking 1.x
+## Version pinning makes evaluation reversible
 
-sbt's version is pinned per project in `project/build.properties`. The `sbt` launcher reads that file and downloads the matching sbt, so switching versions is a one-line change that doesn't touch your global install:
+The sbt version is declared per repository in `project/build.properties`. The launcher reads that file and downloads the matching sbt distribution, so **the version in use is a property of the checkout, not of the machine's global installation**:
 
 ```properties
 sbt.version=2.0.6
 ```
 
-The safe way to experiment: **do it on a branch.** Bump `build.properties` to `2.0.6`, run `sbt compile`, and see what breaks — your `main` branch (still on, say, `1.12.15`) is untouched because the version lives in the repo. Because the two lines coexist, `git switch main` restores your 1.x world instantly. You can also copy a project to a scratch directory and migrate there first.
+This is what makes an evaluation cheap. Bumping `build.properties` to `2.0.6` on a branch and running `sbt compile` exercises the migration; because the 1.x and 2.x lines coexist and the version is tracked in the repository, `git switch` back to a branch pinned at, for example, `1.12.15` restores the previous toolchain without any uninstall step. Copying the project into a scratch directory achieves the same isolation.
 
-## The honest part: plugin friction
+## Plugin availability is the binding constraint
 
-The biggest migration cost is **plugins, because they are compiled code and must be rebuilt for sbt 2 / Scala 3**. Many core plugins are ready — Scala.js 1.22.0, Scala Native 0.5.11, and sbt-assembly 2.3.1 all support sbt 2 — but plenty of community plugins are not yet cross-published. The Scala Center's **`sbt2-compat`** plugin helps plugin authors cross-build sources for both lines, which is smoothing adoption, but you should **audit your `plugins.sbt` before committing to a migration**. If a critical plugin has no sbt 2 release, wait.
+The dominant migration cost is **plugins, because a plugin is compiled code and must be republished against sbt 2 and Scala 3 before a 2.x build can load it**. Several widely used plugins support sbt 2 — **Scala.js 1.22.0, Scala Native 0.5.11, and sbt-assembly 2.3.1** — but many community plugins have not been cross-published. The Scala Center's **`sbt2-compat`** plugin exists to let plugin authors cross-build a single source tree for both lines. The practical consequence is that `plugins.sbt` should be audited before a migration is committed to: a build whose critical plugin has no sbt 2 release cannot migrate, regardless of how clean its own sources are.
 
-For quick scripts and one-file tools, none of this ceremony is warranted — reach for Scala CLI instead (see the *Scala CLI + the Toolkit* article). sbt 2 is for real multi-module builds where caching and cross-building earn their keep.
+For single-file scripts and small tools, this machinery is not warranted; Scala CLI covers that case (see the *Scala CLI + the Toolkit* article). sbt 2 targets multi-module builds where caching and cross-building are load-bearing.
 
-**Try next:** On a throwaway branch, set `sbt.version=2.0.6` in `project/build.properties`, run `sbt compile test`, and grep the output for `Def.uncached` and postfix-syntax errors to gauge your migration surface.
+## Pitfalls
+
+- **A setting written bare at the top of `build.sbt` now applies to every subproject.** A build that previously set `name` once at the root silently renames all subprojects; the fix is `LocalRootProject / name`.
+- **A task whose result type has no `JsonFormat` instance fails once caching is on.** The default caching path encodes results as JSON, so such a task must be wrapped in `Def.uncached { ... }`.
+- **`%%%` is no longer the cross-platform operator.** With project matrix built in and `%%` carrying the platform suffix, cross-platform dependencies are declared with `%%`; whether a leftover `%%%` still compiles depends on the platform plugin version in use.
+- **`test:compile`-style axis notation is rejected outright.** Only slash syntax (`Test / compile`) is parsed in 2.x, so scripts and CI invocations carrying the old form break before any compilation starts.
+- **A wildcard import of a codec object no longer brings its instances into scope.** Scala 3 requires `{ given, * }`, and the symptom is a missing-implicit error rather than an unresolved-name error.
+- **Running on a JDK older than 17 fails at launch.** The 2.x minimum runtime is JDK 17, so a CI image pinned to an earlier JDK fails before the build definition is read.
+- **A plugin without an sbt 2 release blocks the whole migration.** The failure occurs when `project/` is compiled, so it appears before any project source is touched.

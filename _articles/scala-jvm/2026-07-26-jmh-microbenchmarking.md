@@ -1,9 +1,9 @@
 ---
-title: "JMH: Stop Benchmarking Your Optimizer, Not Your Code"
+title: "JMH: Measuring the Code Rather Than the Optimizer"
 date: 2026-07-26
 track: scala-jvm
-summary: "Naive System.nanoTime() loops measure the JIT's cleverness, not your algorithm. JMH's @State, forks, and Blackhole fix that — here's the model and how to read its output honestly."
-reading_time: 6
+summary: "Naive System.nanoTime() loops measure the JIT compiler's cleverness rather than the algorithm. JMH's @State, forks and Blackhole constrain the optimizer; this is the model and how to read its output honestly."
+reading_time: 7
 tags: [jmh, benchmarking, jvm, jit, performance, scala, sbt-jmh]
 sources:
   - title: "openjdk/jmh (official repository)"
@@ -18,9 +18,11 @@ sources:
     url: "https://github.com/sbt/sbt-jmh"
 ---
 
-## The loop that lied
+**Gist.** A hand-written timing loop on the Java Virtual Machine (JVM) measures what the JIT compiler — HotSpot's dynamic, run-time compiler — decided to do with that loop, not what the code under test costs at a real call site: warmup, dead-code elimination and constant folding all apply to the benchmark and not to production. The Java Microbenchmark Harness (JMH) constrains the optimizer by separating warmup from measurement, running fresh forked JVM processes, holding inputs in objects the compiler cannot fold away, and sinking results into a `Blackhole`. The cost is that each measurement becomes far more expensive — multiple forks, each with discarded warmup iterations — and the reported score arrives with a confidence interval that frequently refuses to separate two candidates.
 
-Every JVM developer eventually writes this:
+## The loop that lies
+
+The canonical naive form:
 
 ```scala
 val start = System.nanoTime()
@@ -32,48 +34,46 @@ while (i < 100000000) {
 println((System.nanoTime() - start) / 1e6 + " ms")
 ```
 
-It compiles, it runs, it prints a number. The number is close to meaningless. The JVM is not a simple interpreter that does exactly what the bytecode says — it's an adaptive runtime that watches what you do and rewrites it. A "benchmark" like this one is really measuring the optimizer, not the code.
+It compiles, runs, and prints a number close to meaningless. The JVM is an adaptive runtime that observes execution and rewrites it. Four distinct mechanisms, documented by the JMH project and by Oracle's benchmarking-pitfalls article, corrupt the measurement:
 
-Four things go wrong, all documented by Aleksey Shipilëv and the JMH project itself:
+- **JIT warmup.** Early invocations run interpreted or through the C1 (client) compiler. C2, the optimizing compiler, engages only once a method is judged hot. **A loop that finishes before C2 compilation measures the interpreter and C1, not the steady state a long-running server would exhibit.**
+- **Dead-code elimination (DCE).** When the result of `compute(x)` is never observed, the compiler may prove the call has no observable effect and remove it. JMH's `JMHSample_08_DeadCode` demonstrates exactly this: a `measureWrong()` benchmark that discards its result reports an impossibly small time, **because no code remains to execute**.
+- **Constant folding.** If the input provably never changes across iterations, the computation can be evaluated once and the result reused. **The benchmark then measures the cost of reading a constant.**
+- **Loop optimizations and on-stack replacement (OSR).** Long-running loops are compiled while still executing (OSR); the compiler unrolls them, hoists loop-invariant expressions and merges iterations. **A tight microbenchmark loop exposes invariants that a method invoked from many unrelated call sites never presents.**
 
-- **JIT warmup.** The first thousands of calls run interpreted or through C1 (client) compilation. C2 (the optimizing compiler) only kicks in once a method is hot. If your loop finishes before that happens, you measured the interpreter, not the compiled steady state.
-- **Dead-code elimination (DCE).** If `compute(x)`'s result is never used, the compiler is free to prove the call has no observable effect and delete it. JMH's own `JMHSample_08_DeadCode` demonstrates exactly this: a `measureWrong()` benchmark that discards its result runs suspiciously, impossibly fast, because there's no code left to run.
-- **Constant folding.** If the compiler can prove an input never changes across the loop, it can precompute the result once and reuse it — you're now benchmarking a constant, not a computation.
-- **Loop optimizations and on-stack replacement (OSR).** Long-running loops get compiled *while still executing* (OSR), and the compiler unrolls, hoists invariants, and merges iterations. A tight microbenchmark loop invites the compiler to notice invariants that a real call site, invoked from many places, never would.
-
-None of this is a bug — it's the JIT doing its job. The bug is in the benchmark, which lets the compiler see conditions ("this input is constant," "this result is unused") that don't hold in production.
+None of these is a defect in the JVM. The defect is in the benchmark, which shows the compiler conditions — this input is constant, this result is unused — that do not hold at the production call site.
 
 ## The JMH model
 
-JMH (Java Microbenchmark Harness) is the OpenJDK project — the same team that builds `javac` and HotSpot ships this tool specifically to fight the above. It runs each benchmark method in its own controlled harness: separate warmup and measurement phases, optional process forks, and explicit mechanisms to defeat DCE and constant folding.
-
-The building blocks:
+JMH is developed under OpenJDK, in the same repository family as the other OpenJDK code tools. Each benchmark method runs inside a generated harness with distinct warmup and measurement phases, optional process forks, and explicit mechanisms against DCE and constant folding.
 
 | Annotation / type | Purpose |
 |---|---|
 | `@Benchmark` | Marks a method as a measured workload |
-| `@State(Scope.Thread\|Benchmark\|Group)` | Holds mutable fields the JIT can't treat as compile-time constants; scope controls sharing across threads |
+| `@State(Scope.Thread\|Benchmark\|Group)` | Holds mutable fields; scope controls sharing across threads |
 | `@Setup` / `@TearDown` | Lifecycle hooks on a `@State` object, run outside the measured region |
-| `@Warmup(iterations = n, time = t)` | Iterations discarded from results, run until the JIT stabilizes |
-| `@Measurement(iterations = n, time = t)` | Iterations that count toward the reported score |
-| `@Fork(n)` | Runs the benchmark in `n` fresh JVM processes, each with its own warmup, to cancel out JIT-profile and GC-history bias from one run |
-| `@BenchmarkMode(Mode.Throughput\|AverageTime\|SampleTime\|SingleShotTime)` | What's measured: ops/time, time/op, latency distribution, or one-shot cost |
-| `@Param({"1","10","100"})` | Sweeps a field over multiple values, generating one benchmark run per combination |
-| `Blackhole` | An injected sink object whose `consume(...)` methods give the JIT a real, unpredictable side effect so it can't eliminate the computation |
+| `@Warmup(iterations = n, time = t)` | Iterations discarded from the reported result |
+| `@Measurement(iterations = n, time = t)` | Iterations that contribute to the score |
+| `@Fork(n)` | Runs the benchmark in `n` fresh JVM processes, each with its own warmup |
+| `@BenchmarkMode(Mode.Throughput\|AverageTime\|SampleTime\|SingleShotTime)` | Operations per unit time, time per operation, a latency distribution, or one-shot cost |
+| `@Param({"1","10","100"})` | Sweeps a field over several values, producing one run per combination |
+| `Blackhole` | An injected sink whose `consume(...)` methods give the computation a consumer the compiler cannot prove is dead |
 
-`@State` matters as much as `Blackhole`. If your "input" is a `final` local or a literal, the compiler can constant-fold through it. Put it in a `@State`-annotated object instead — JMH allocates it in a way the compiler can't see across compilation units, which keeps it real.
+Two of these carry most of the weight. **`Blackhole.consume` defeats DCE** by making the produced value observable. **`@State` defeats constant folding**: a value held in a field of a state object is not a compile-time constant of the benchmark method, whereas a literal or an effectively final local can be folded through.
 
-## Naive vs. correct, side by side
+**`@Fork` addresses a different failure mode entirely.** A single JVM accumulates a profile — branch statistics, receiver-type profiles for virtual calls, class-loading order, garbage-collector history — and that profile is shaped by everything the process ran earlier, including other benchmarks in the same suite. Running the same benchmark in several fresh processes exposes whether the score depends on one process's particular set of compilation decisions. When per-fork scores disagree widely, the reported error widens accordingly, which is the intended signal.
 
-Naive — looks reasonable, measures nothing useful:
+### Naive versus harnessed
+
+Naive, and measuring nothing useful:
 
 ```java
 public class NaiveBenchmark {
     public static void main(String[] args) {
-        long x = 41;
+        long x = 20;
         long start = System.nanoTime();
-        for (int i = 0; i < 1_000_000_000; i++) {
-            fib(x); // result discarded -> DCE eats the whole loop
+        for (int i = 0; i < 1_000_000; i++) {
+            fib(x); // result discarded -> DCE removes the loop body
         }
         System.out.println((System.nanoTime() - start) / 1_000_000 + " ms");
     }
@@ -81,38 +81,39 @@ public class NaiveBenchmark {
 }
 ```
 
-Correct, in JMH's model:
+Under JMH's model, `n` lives in a `@State` object so it is not a compile-time constant; the result reaches `Blackhole.consume` so it cannot be eliminated; warmup iterations are discarded before measurement starts; and multiple forks prevent the number from being an artifact of one JVM's compilation history.
 
-```java
-@BenchmarkMode(Mode.AverageTime)
+### Implementation sketch (Scala)
+
+sbt-jmh compiles Scala benchmark classes and generates the JMH harness at compile time through JMH's annotation processor, the same route JMH takes for Java sources. The state class must be a public, non-final class with a public no-argument constructor and non-private mutable fields: the generated harness subclasses it and assigns those fields directly.
+
+```scala
+@BenchmarkMode(Array(Mode.AverageTime))
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @State(Scope.Thread)
 @Fork(value = 2, warmups = 1)
 @Warmup(iterations = 5, time = 1)
 @Measurement(iterations = 10, time = 1)
-public class FibBenchmark {
+class FibBenchmark:
 
-    @Param({"10", "20", "30"})
-    public long n;
+  // var, not val: the generated harness assigns this field per @Param combination
+  @Param(Array("10", "20", "30"))
+  var n: Long = 0L
 
-    @Benchmark
-    public void fib(Blackhole bh) {
-        bh.consume(fib(n));
-    }
+  @Benchmark
+  def fib(bh: Blackhole): Unit =
+    bh.consume(FibBenchmark.fib(n))
 
-    private static long fib(long n) {
-        return n <= 1 ? n : fib(n - 1) + fib(n - 2);
-    }
-}
+object FibBenchmark:
+  def fib(n: Long): Long =
+    if n <= 1 then n else fib(n - 1) + fib(n - 2)
 ```
 
-Here `n` lives in `@State`, so it isn't a compile-time constant; the result is fed to `Blackhole.consume`, so it can't be dead-code-eliminated; warmup iterations are discarded before measurement begins; and two forks mean the reported number isn't an artifact of one JVM's particular JIT decisions.
-
-The same class works unchanged under **sbt-jmh** for Scala: add `addSbtPlugin("pl.project13.scala" % "sbt-jmh" % "<version>")` to `project/plugins.sbt`, `enablePlugins(JmhPlugin)` in `build.sbt`, put benchmark classes (Java or Scala) under the project, and run `Jmh/run -i 10 -wi 10 -f 2 -t 1 .*FibBenchmark.*`. sbt-jmh is a thin wrapper that generates the JMH harness classes at compile time via annotation processing, exactly like the Maven/Gradle plugins do for Java.
+Note that Scala annotation arguments that are arrays require `Array(...)` where Java uses brace syntax. Enabling the plugin requires `addSbtPlugin("pl.project13.scala" % "sbt-jmh" % "<version>")` in `project/plugins.sbt` and `enablePlugins(JmhPlugin)` in `build.sbt`; a run is invoked as `Jmh/run -i 10 -wi 10 -f 2 -t 1 .*FibBenchmark.*`.
 
 ## Reading the output
 
-A run reports something like:
+A run reports rows of the following shape; the scores below are illustrative placeholders, not a published measurement:
 
 ```
 Benchmark              (n)  Mode  Cnt   Score   Error  Units
@@ -121,12 +122,20 @@ FibBenchmark.fib        20  avgt   20  11.204 ± 0.415  us/op
 FibBenchmark.fib        30  avgt   20  1382.7 ± 48.9   us/op
 ```
 
-`Score` is the mean over all measurement iterations across all forks; `Error` is the half-width of the confidence interval (99.9% by default) — read it as "the true value is very likely `Score ± Error`," not as noise to ignore. If `Error` is a large fraction of `Score`, don't trust the ranking against a competing implementation until you add iterations or forks to tighten it. Two results whose `Score ± Error` ranges overlap are statistically indistinguishable — resist the urge to declare a winner anyway.
+`Score` is the mean over all measurement iterations across all forks. **`Error` is the half-width of the confidence interval — 99.9% by default — so the row asserts that the true value very likely lies in `Score ± Error`.** It is not noise to be discarded. **Two results whose `Score ± Error` intervals overlap are not distinguished by the experiment**, and no ranking between them is supported until iterations or forks are added to narrow the intervals.
 
-`Cnt` is the total number of measurement samples (iterations × forks). If someone hands you a benchmark with `Cnt: 1`, be suspicious — that's a single-shot run with no variance information at all.
+`Cnt` is the number of measurement data points behind the score; in the averaging modes that is measurement iterations multiplied by forks. **A row with `Cnt: 1` carries no variance information at all** and cannot support a comparison.
 
-## What JMH does not fix
+## What the harness does not control
 
-JMH controls warmup and DCE; it does not control your algorithm's cache behavior, your machine's thermal throttling, background processes, or NUMA effects. Pin CPU affinity, disable turbo boost variance where possible, and treat a benchmark run on a laptop with a browser open as a rough estimate, not a verdict. And always sanity-check a suspiciously fast result against `JMHSample_08_DeadCode` and `JMHSample_09_Blackholes` in the official samples — if your number looks too good, it probably got eliminated, not executed.
+JMH governs warmup, DCE and constant folding within the process. It does not govern cache behaviour of the algorithm, thermal throttling of the host, competing processes, or non-uniform memory access (NUMA) effects on multi-socket machines. A run performed on a laptop with other applications active is an estimate rather than a verdict. A result that appears implausibly fast should be checked against `JMHSample_08_DeadCode` and `JMHSample_09_Blackholes` in the official samples before it is believed.
 
-**Try next:** write a two-benchmark JMH suite comparing `List.contains` vs. a `Set` lookup at three `@Param` sizes, and check whether your conclusion survives when you triple the fork count.
+## Pitfalls
+
+- **A benchmark that discards its result reports a time far below any plausible cost of the computation.** The optimizer removed the call; the fix is `Blackhole.consume`, not more iterations.
+- **A benchmark whose input is a literal or an effectively final local reports a constant-time score independent of input size.** The value was folded at compile time; the input belongs in a `@State` field.
+- **Scores that shift between runs of the same code at a single fork leave fork-dependent compilation decisions unmeasured.** A single fork bakes in one JVM's accumulated profile; raising `@Fork` exposes the spread instead of hiding it.
+- **Declaring a winner from two rows whose `Score ± Error` intervals overlap is unsupported by the data**, regardless of how far apart the means are.
+- **Benchmarking with `Cnt: 1`** yields a number with no error estimate, since a single sample admits no variance calculation.
+- **In Scala, declaring a `@Param` or state field as `val`, or making the benchmark class `final` or an `object`,** conflicts with the generated harness, which requires an instantiable class with assignable fields.
+- **Reporting only the steady-state score for code that runs briefly in production** answers a question the deployment never asks; warmup is discarded by design, so short-lived workloads need `SingleShotTime` rather than `AverageTime`.

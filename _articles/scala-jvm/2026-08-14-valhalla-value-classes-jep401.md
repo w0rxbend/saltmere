@@ -2,8 +2,8 @@
 title: "Project Valhalla: Value Classes Land in Preview (JEP 401)"
 date: 2026-08-14
 track: scala-jvm
-summary: "After a decade of design, Project Valhalla's first language feature is real: JEP 401 value classes are integrated for preview in JDK 28. Here's what 'codes like a class, works like an int' actually means, why == changes for value objects, and how it maps onto Scala's value and opaque types."
-reading_time: 5
+summary: "JEP 401 value classes are integrated as a preview feature in JDK 28. This note examines what 'codes like a class, works like an int' denotes, how == is redefined for value objects, and how the model relates to Scala's AnyVal value classes and opaque types."
+reading_time: 6
 tags: [valhalla, jep-401, jvm, value-classes, scala, performance]
 sources:
   - title: "JEP 401: Value Classes and Objects (Preview) — OpenJDK"
@@ -18,50 +18,85 @@ sources:
     url: "https://www.infoq.com/news/2026/08/jep401-value-objects-preview/"
 ---
 
-Project Valhalla has been the JVM's longest-running "any year now" for so long that it became a running joke. That changes with **JEP 401, Value Classes and Objects**, which was integrated into the JDK 28 mainline in July 2026 as a **preview** feature. It is the first piece of Valhalla to reach developers' hands as an actual language construct — and it is deliberately modest, so it's worth being precise about what has and hasn't shipped.
+**Gist.** Every non-primitive Java object carries an *identity* fixed at construction, which normally forces the Java Virtual Machine (JVM) to place it on the heap and reach it through a pointer — escape analysis removes that cost only where the compiler can prove the object never escapes — even for aggregates such as `Point` or `Complex` where identity is never consulted. **JEP 401, Value Classes and Objects**, integrated for JDK 28 as a **preview** feature, adds a `value` class modifier whose instances are distinguished solely by field state, permitting the JVM to scalarize or flatten them. The cost of discarding identity is that the operations identity supported disappear with it: value objects cannot be synchronized on, their fields are implicitly final, and `==` changes meaning.
 
-## The goal: "codes like a class, works like an int"
+## Identity as an obligation
 
-Valhalla's slogan, from Brian Goetz's *State of Valhalla* notes, is that you should be able to write an abstraction that **codes like a class but works like an int**. Today every non-primitive in Java is an *identity object*: it has a unique identity assigned at construction, which forces the JVM to allocate it on the heap and dereference a pointer on every access. That identity buys you `==`-by-reference and locking, but for a `Point`, a `Complex`, or a `LocalDate`, you never wanted it — it's pure overhead: an object header, a pointer indirection, cache misses.
+An *identity object* is one whose distinctness is independent of its contents: two instances with byte-identical fields remain different objects. That distinctness is what makes reference equality and monitor-based locking meaningful, and it constrains the runtime. An identity object must have a stable address a reference can name, which implies an **object header** and an **indirection on every field access**, with the attendant cache miss when the referent is not resident.
 
-**Value classes** let you opt out of identity. Declare a class with the `value` modifier and its instances are distinguished *solely by their field values*. Fields become implicitly final; instances have no identity, cannot be synchronized on, and the JVM is free to **scalarize** them (break them into their fields in registers) or **flatten** them inline into arrays and enclosing objects — removing the header and the indirection.
+A value class waives that guarantee. Declaring a class with the `value` modifier states that its instances are **equivalent whenever their fields are equivalent**, so the runtime may duplicate, discard or re-create an instance freely. Two representational optimizations follow. **Scalarization** decomposes an instance into its constituent fields held in registers or on the stack, eliminating the allocation entirely. **Flattening** embeds the fields inline in an enclosing object or array element, removing both the header and the pointer hop.
 
-## What actually changes: `==`
+Waiving identity is not free. JEP 401 makes the fields of a value class **implicitly final**, and value objects **cannot be used as monitors** — the operations that depended on a unique address are withdrawn rather than emulated.
 
-The most visible language change is that `==` is redefined for value objects. For an identity class it's unchanged (reference equality). For a **value object**, `a == b` succeeds when both are the same value class with equal fields, comparing reference-typed fields recursively with `==`. In other words, `==` becomes *statewise* equality — which is exactly what you always wanted for a value.
+## The redefinition of `==`
+
+The visible language change is the semantics of `==`. For identity classes the operator is unchanged and compares references. For a **value object**, `a == b` holds when both operands are instances of the same value class and their corresponding fields are equal, with reference-typed fields compared recursively by `==`. The operator therefore becomes **statewise equality** for value objects.
 
 ```java
-// JDK 28, compiled/run with --enable-preview
+// JDK 28, compiled and run with --enable-preview
 value record Complex(double re, double im) {
     Complex plus(Complex o) { return new Complex(re + o.re, im + o.im); }
 }
 
 Complex a = new Complex(1, 2);
 Complex b = new Complex(1, 2);
-System.out.println(a == b);   // true  -> statewise, no identity
+System.out.println(a == b);   // true -> statewise, no identity
 ```
 
-The `value` modifier works on plain classes and on records. Fields must all be assigned before the instance is observable; JEP 539 adds the bytecode verification for that stricter construction.
+The consequence for existing code is that `==` no longer answers a single question uniformly: its meaning now depends on whether the static type in question is a value class. Code that relied on `==` returning `false` for separately constructed instances — identity-keyed caches, instance-counting, sentinel objects compared by reference — changes behaviour if the class it operates on is converted to a value class.
 
-## Be precise about status
+The `value` modifier applies to plain classes and to records. **All fields must be assigned before an instance becomes observable**: JEP 401 builds on strict field semantics, under which the fields of a value class are assigned before the superclass constructor runs and bytecode verification enforces that ordering. A partially initialized value object would otherwise be observable, since a scalarized or flattened representation has no single reference publication to fence.
 
-As of August 2026, JEP 401 is a **preview** feature integrated for **JDK 28** (which reaches GA in March 2027). It is disabled by default and requires `--enable-preview` at both compile and run time; you can also grab early-access builds from `jdk.java.net/valhalla`. Crucially, the *performance* payoff — heap flattening, null-restricted layouts — is largely **not** in this preview. JEP 401 delivers the object *model* and the `==` semantics; the layout optimizations arrive with follow-on JEPs for **null-restricted and nullable value types**, **enhanced primitive boxing**, and eventually primitive value classes and JVM specialization. Don't expect `int`-density from value classes yet.
+## What has and has not shipped
 
-## The Scala connection
+JEP 401 is a **preview** feature targeted at **JDK 28**, which reaches general availability in March 2027. Preview features are **disabled by default and require `--enable-preview` at both compile time and run time**; early-access builds are published at `jdk.java.net/valhalla`.
 
-Scala developers have been reaching for this idea for years, with two workarounds:
+The distinction worth holding is between the *object model* and the *layout optimizations*. JEP 401 delivers the model — the `value` modifier, the loss of identity, the redefined `==` — and leaves the density work to follow-on proposals covering **null-restricted and nullable value types**, **enhanced primitive boxing**, and, later, primitive value classes and JVM specialization. Heap flattening in particular is largely absent from this preview, because a value type that admits `null` still needs a representation for the null case. Code compiled against JEP 401 today acquires the semantics without the guarantee of `int`-like density.
+
+## Relation to Scala's existing constructs
+
+Scala has approximated the same goal from the language side with two mechanisms, both of which are erased rather than represented natively by the JVM.
+
+An `AnyVal` value class is compiled to its single underlying field where the compiler can prove the wrapper is unnecessary, and **boxes wherever the erased type is insufficient**: generic positions, arrays, and other contexts where an `Object` reference is required. An `opaque type` is a compile-time alias that carries **no runtime representation at all**; it provides type distinctness with zero overhead but is confined to a single underlying type and offers no multi-field aggregate.
+
+Neither construct extends to a multi-field aggregate flattened by the runtime. JEP 401 places the notion of a value below both, in the JVM object model, where a multi-field aggregate can in principle be scalarized without the language compiler proving anything about it. Until the follow-on layout JEPs arrive, JEP 401 is best treated as the **semantic foundation** that Scala's abstractions have been simulating from above.
+
+### Implementation sketch (Scala)
+
+The boxing boundary of `AnyVal` is the load-bearing difference, and it is observable without any Valhalla build:
 
 ```scala
-// Scala 3 value class: one field, boxing avoided in many (not all) cases
-final case class UserId(value: Long) extends AnyVal
+final case class UserId(value: Long) extends AnyVal:
+  def next: UserId = UserId(value + 1L)
 
-// Scala 3 opaque type: zero-overhead wrapper, erased to Long at runtime
 opaque type Meters = Double
 object Meters:
   def apply(d: Double): Meters = d
   extension (m: Meters) def toDouble: Double = m
+
+// Monomorphic call: the parameter is erased to a primitive long,
+// so no UserId instance is materialised.
+def bumpDirect(id: UserId): UserId = id.next
+
+// Generic position: T erases to Object, so the argument must be
+// boxed into a real UserId instance at the call site.
+def firstOf[T](xs: Seq[T]): T = xs.head
+
+// Array of a value class is an array of references, not of longs.
+val ids: Array[UserId] = Array(UserId(1L), UserId(2L))
+
+// Opaque types have no wrapper to box: Meters *is* Double after
+// erasure, which also means Array[Meters] is Array[Double].
+val distances: Array[Meters] = Array(Meters(1.5), Meters(2.5))
 ```
 
-`AnyVal` value classes and `opaque type` both try to give you a distinct type without paying for a wrapper object — but they're limited: `AnyVal` classes still box in generic contexts, arrays, and pattern matches, and opaque types are erased single-field aliases with no multi-field flattening. Valhalla pushes this guarantee down into the JVM itself, for arbitrary multi-field values, in a way both Scala features could eventually target. For now, treat JEP 401 as the *semantic* foundation Scala's abstractions have been simulating from above.
+`bumpDirect` operates on an unboxed `long`; `firstOf(ids.toSeq)` returns a boxed `UserId`. The rule that produces both outcomes is erasure, not a runtime decision, which is why the guarantee cannot be extended to a two-field aggregate without support from the JVM.
 
-**Try next:** download a JDK 28 Valhalla early-access build, compile a `value record` with `javap -v` and compare its constant pool and flags to the identity version — then check whether `==` on two equal instances returns `true` and reason about where the JVM could scalarize it.
+## Pitfalls
+
+- **Assuming performance parity with `int` today.** JEP 401 ships the object model; heap flattening and null-restricted layouts belong to later JEPs, so a `value record` benchmarked on a JDK 28 preview build may allocate exactly as its identity counterpart does.
+- **Converting an identity class relied on for reference equality.** Adding `value` to a class silently changes `==` from reference to statewise comparison, so an identity-keyed cache or a sentinel instance compared with `==` starts matching unrelated equal-valued instances.
+- **Synchronizing on a value object.** Value objects have no monitor; a `synchronized` block over one fails rather than degrading to a silent no-op, so lock-bearing types cannot be converted.
+- **Mutating fields after conversion.** Fields of a value class are implicitly final, so any class with an assignable field fails to compile with the modifier applied.
+- **Omitting `--enable-preview` at run time.** Preview features require the flag at both compile and run time; supplying it only at compilation yields a failure when the class is loaded, not when it is built.
+- **Expecting Scala `AnyVal` to avoid boxing uniformly.** An `AnyVal` value class is erased to its field only in monomorphic positions; in generic contexts, arrays and other reference positions it boxes, so `Array[UserId]` stores references rather than `long` values.

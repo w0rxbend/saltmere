@@ -1,9 +1,9 @@
 ---
-title: "Scoped Values: ThreadLocal's replacement finally ships in JDK 25"
+title: "Scoped Values: ThreadLocal's replacement ships in JDK 25"
 date: 2026-07-26
 track: scala-jvm
-summary: "JEP 506 finalized Scoped Values in JDK 25 after five preview rounds. Immutable, bounded, and cheaply inheritable to child threads — everything ThreadLocal isn't when you're running a million virtual threads."
-reading_time: 5
+summary: "JEP 506 finalized Scoped Values in JDK 25 after an incubator round and four previews. Immutable, lexically bounded, and inherited by forked children without a per-child copy — the properties ThreadLocal lacks under virtual threads."
+reading_time: 6
 tags: [jvm, scoped-values, virtual-threads, loom, concurrency, java25]
 sources:
   - title: "JEP 506: Scoped Values"
@@ -18,19 +18,21 @@ sources:
     url: "https://www.happycoders.eu/java/scoped-values/"
 ---
 
-`ThreadLocal` has been Java's answer to "how do I pass context without threading it through every method signature" since JDK 1.2. It worked because threads were expensive and few. Virtual threads broke that assumption — you can now spawn a million of them for a single request tree — and `ThreadLocal` doesn't degrade gracefully at that scale. **Scoped Values**, finalized as [JEP 506](https://openjdk.org/jeps/506) in JDK 25 (September 2025), are the direct replacement. This is a companion piece to [our structured concurrency article](/2026-07-24-virtual-threads-structured-concurrency) — that one covers the task-lifecycle problem, this one covers the context-propagation problem.
+**Gist.** Passing request context — a trace identifier, a tenant, a security principal — through every intermediate method signature is impractical, and the mechanism Java has offered since JDK 1.2, `ThreadLocal`, ties that context to a thread's whole lifetime, while its inheritable variant copies the parent's map entries into each child thread. **Scoped Values**, finalized as [JEP 506](https://openjdk.org/jeps/506) in JDK 25, bind an immutable value for the *dynamic extent* of a single call, so the binding is released when that call returns and forked children observe the parent's binding without a copy. The cost is loss of mutability and of ambient reach: a value cannot be reassigned in place, and code outside the bound extent cannot read it at all, so context must be established at a point that dominates every reader.
 
-## Why ThreadLocal doesn't fit virtual threads
+This article is the companion to [the structured concurrency article](/2026-07-24-virtual-threads-structured-concurrency), which covers task lifecycle; the subject here is context propagation.
 
-Three properties of `ThreadLocal` that were fine for a pool of 200 platform threads become liabilities at a million virtual threads:
+## Why ThreadLocal does not fit virtual threads
 
-- **Unbounded mutable state.** Any code with a reference to the `ThreadLocal` can call `.set()` at any point in the thread's life. There's no lexical scope — the value lives until someone calls `.remove()` or the thread dies. Forget the cleanup and you leak.
-- **Memory cost per thread.** Every thread carries its own `ThreadLocalMap`. That's negligible for 200 threads; it's real overhead multiplied by a million virtual threads, especially when several libraries in a request path each stash their own contextual value.
-- **Expensive, shallow inheritance.** `InheritableThreadLocal` copies the parent's value into every child thread at creation time. Fork ten thousand child tasks from a `StructuredTaskScope` and you've made ten thousand copies of a value that never changes. It also only copies at creation — mutate the parent's value afterward and children don't see it, which is its own source of bugs.
+Three properties of `ThreadLocal` that are tolerable for a pool of a few hundred platform threads become liabilities when a request tree spawns virtual threads by the thousand or million.
 
-## What Scoped Values do instead
+- **Unbounded mutable state.** Any code holding a reference to the `ThreadLocal` may call `set` at any point in the thread's life. There is **no lexical bound**: the value survives until `remove` is called or the thread terminates. On a pooled platform thread, which is never terminated, a missed `remove` leaves the value visible to the *next unrelated task* that the pool schedules on that thread.
+- **Per-thread memory.** Every thread carries its own `ThreadLocalMap`. The per-thread constant is negligible at a few hundred threads; it multiplies by the number of live virtual threads, and by the number of libraries in the request path that each stash a value.
+- **Copying, one-shot inheritance.** `InheritableThreadLocal` copies the parent's map entries into each child **at child-creation time**; the default `childValue` hands the child the same object reference, so what is duplicated is the map, not the object. Forking ten thousand children therefore builds ten thousand maps holding the same reference. Because the copy happens once, a later reassignment in the parent is not observed by children already created — a divergence between parent and child state that no API call reports.
 
-A `ScopedValue` is immutable for the duration it's bound, and the binding has a hard, lexical extent instead of a thread's entire lifetime:
+## The binding, and what bounds it
+
+A `ScopedValue` has no setter. The value is supplied to a call, not to a thread:
 
 ```java
 public class RequestContext {
@@ -38,22 +40,24 @@ public class RequestContext {
 
     void handle(String traceId, Request req) {
         ScopedValue.where(TRACE_ID, traceId)
-                    .run(() -> processRequest(req));
-        // TRACE_ID.get() is unreachable here — the binding is gone
+                   .run(() -> processRequest(req));
+        // the binding has ended here; TRACE_ID.get() would throw
     }
 
     void processRequest(Request req) {
         logger.info("[{}] handling {}", TRACE_ID.get(), req.path());
-        downstreamCall(req);            // TRACE_ID is still bound in callees
+        downstreamCall(req);            // still inside the extent
     }
 }
 ```
 
-`where(...).run(...)` binds `TRACE_ID` only for the dynamic extent of the lambda — every method called from inside it sees the value, and the instant `run` returns, the binding is gone and eligible for collection. There's no `.set()`, no `.remove()`, no way for a callee to mutate the value out from under its caller. If you need to nest or rebind, `ScopedValue.where(A, a).where(B, b).call(() -> ...)` composes bindings, and `.call()` is the value-returning sibling of `.run()` for a `Callable`-like operation.
+The invariant is that **a binding is visible exactly on the call stack rooted at the `run` or `call` invocation that created it**, and nowhere else. Every method reachable from the lambda observes the value regardless of how deep it sits; the moment the operation returns — normally or by throwing — the binding is removed and the referenced object is again eligible for collection. `get` outside any binding fails rather than returning `null`, so an unestablished context surfaces as an error at the read site instead of a null propagating downstream.
 
-## Composing with StructuredTaskScope
+Bindings compose and nest. `ScopedValue.where(A, a).where(B, b).call(() -> ...)` establishes two at once, and `call` is the value-returning sibling of `run`. Rebinding the same `ScopedValue` in an inner extent **shadows** the outer binding for the duration of the inner operation and **restores** it on exit; it does not overwrite it, so the outer frames are unaffected by what inner frames did.
 
-The real payoff shows up with structured concurrency. Fork children from inside a bound scope and they inherit the value without a copy — the runtime just makes the parent's binding visible along the call stack that includes the child, rather than duplicating any state:
+## Composition with StructuredTaskScope
+
+The property that matters at scale appears when children are forked from inside a bound extent. The child's execution is treated as a continuation of the stack that includes the binding, so **the parent's binding is made visible to the child rather than duplicated into it**:
 
 ```java
 static final ScopedValue<String> TRACE_ID = ScopedValue.newInstance();
@@ -71,35 +75,72 @@ Response handle(Request req) throws Exception {
 }
 ```
 
-Both forked tasks can call `TRACE_ID.get()` and see the parent's value, with no copy made per child and no way for one child's work to leak a mutated value to its sibling. When the outer `call` returns, the binding is gone for good — which lines up exactly with the "children can't outlive the scope" guarantee that `StructuredTaskScope` already enforces. Note that `StructuredTaskScope` itself is still a preview API as of JDK 26 — [JEP 525](https://openjdk.org/jeps/525) is its sixth preview round — while Scoped Values, the piece this article covers, are final and require no `--enable-preview` flag from JDK 25 onward.
+Both forked tasks read the parent's value, no per-child copy is made, and because the value is immutable one sibling cannot expose a modified value to another. The lifetime rule aligns with the one `StructuredTaskScope` already enforces: children cannot outlive the scope, and the scope cannot outlive the binding that encloses it.
 
-## ThreadLocal vs. ScopedValue
+`StructuredTaskScope` remains a preview application programming interface (API) as of JDK 26 — [JEP 525](https://openjdk.org/jeps/525) is its sixth preview round — whereas Scoped Values are final from JDK 25 and require no `--enable-preview` flag.
+
+## ThreadLocal compared with ScopedValue
 
 | | `ThreadLocal` | `ScopedValue` |
 |---|---|---|
-| Mutability | Mutable via `.set()` anywhere | Immutable once bound |
-| Lifetime | Thread's full lifetime, or until `.remove()` | Bound only for the dynamic extent of `run`/`call` |
-| Cleanup | Manual (`.remove()`), easy to forget | Automatic — binding ends when the block returns |
-| Child-thread inheritance | `InheritableThreadLocal` copies value per child | Shared by reference to forked children, no copy |
-| Cost at scale (millions of virtual threads) | Per-thread map plus per-child copy | Bounded, stack-based, GC'd on scope exit |
-| Reentrancy / nesting | New `.set()` silently overwrites | New `.where()` binding shadows, then restores |
-| API shape | `get()`/`set()`/`remove()` | `ScopedValue.where(...).run(...)`/`.call(...)`/`.get()` |
+| Mutability | Mutable via `set` from anywhere | Immutable once bound |
+| Lifetime | Thread's full lifetime, or until `remove` | Dynamic extent of `run`/`call` |
+| Cleanup | Manual `remove` | Ends when the operation returns |
+| Child inheritance | `InheritableThreadLocal` copies per child | Parent binding visible, no copy |
+| Cost across many virtual threads | Per-thread map plus a map copy per child | One binding shared by the children, released on extent exit |
+| Nesting | A later `set` overwrites | Inner `where` shadows, then restores |
+| Read with no value | Returns `null` (or the initial value) | Fails at the call site |
 
-## The JEP trail, since people always ask
+## The standardization trail
 
-Scoped Values took five rounds to reach final status — worth knowing so you don't cite a stale preview flag in production code:
+Scoped Values reached final status after an incubator round and four previews:
 
 - JDK 20 — [JEP 429](https://openjdk.org/jeps/429), Incubator
 - JDK 21 — JEP 446, Preview
 - JDK 22 — JEP 464, Second Preview
 - JDK 23 — JEP 481, Third Preview
 - JDK 24 — JEP 487, Fourth Preview
-- **JDK 25 — [JEP 506](https://openjdk.org/jeps/506), final** — no preview flags needed
+- **JDK 25 — [JEP 506](https://openjdk.org/jeps/506), final** — no preview flag required
 
-That's the same incubate-then-preview-repeatedly pattern virtual threads and structured concurrency followed, and it's worth remembering the two features finalize on different schedules: Scoped Values landed first, structured concurrency is still iterating.
+Virtual threads and structured concurrency followed the same incubate-then-preview sequence, but the three features finalize on independent schedules: Scoped Values are final while structured concurrency is still in preview.
+
+### Implementation sketch (Scala)
+
+Scala 3 calls the Java API directly. The load-bearing detail is that the binding is a *parameter of a call*, so a helper that wraps `where(...).call(...)` is the only place a value is ever supplied:
+
+```scala
+object RequestContext:
+  val TraceId: ScopedValue[String] = ScopedValue.newInstance()
+
+  /** Establishes the binding for exactly the extent of `body`. */
+  def withTrace[A](id: String)(body: => A): A =
+    ScopedValue.where(TraceId, id).call(() => body)
+
+  /** Fails if called outside any binding — no null to propagate. */
+  def currentTrace: String = TraceId.get()
+
+def handle(req: Request): Response =
+  RequestContext.withTrace(newTraceId()):
+    val scope = StructuredTaskScope.open[Any]()
+    try
+      val user   = scope.fork(() => fetchUser(req.userId))    // observes the binding, no copy
+      val orders = scope.fork(() => fetchOrders(req.userId))
+      scope.join()
+      Response(user.get(), orders.get())
+    finally scope.close()
+```
+
+A by-name parameter is used deliberately: evaluating `body` eagerly would run it **before** the binding exists, and `currentTrace` inside it would then fail.
 
 ## Migrating in practice
 
-You don't need to rip out every `ThreadLocal` today. The sweet spot for `ScopedValue` is exactly the case `ThreadLocal` handles worst: request-scoped context (trace IDs, tenant IDs, security principals) that's set once near the top of a call tree, read by many layers below, and should never survive past that tree — especially once that tree is a `StructuredTaskScope` fanning out across virtual threads. Long-lived, frequently-reassigned per-thread caches are still a reasonable `ThreadLocal` use case; `ScopedValue` isn't a general-purpose replacement, it's the fix for the specific pattern that breaks under Loom.
+The pattern `ScopedValue` fits is the one `ThreadLocal` handles worst: context established once at the top of a call tree, read by many layers below, and required not to survive that tree — in particular when the tree fans out through a `StructuredTaskScope`. A long-lived, frequently reassigned per-thread cache is not that pattern, and `ThreadLocal` remains applicable there. `ScopedValue` is not a general replacement for `ThreadLocal`; it addresses the subset of uses whose cost and correctness degrade under virtual threads.
 
-**Try next:** find a `ThreadLocal` in your codebase that's set once per request and read downstream — convert it to a `ScopedValue` bound with `where(...).run(...)` at the entry point, then delete whatever cleanup code was calling `.remove()`.
+## Pitfalls
+
+- **Calling `get` outside any binding throws rather than returning a default.** Code moved out of the request path — a background refresh, a shutdown hook, a retry scheduled onto an unrelated executor — leaves the extent and fails at the read.
+- **Escaping the extent with a captured lambda.** Submitting work to an executor that outlives the `run`/`call` invocation means the task executes after the binding was removed; the value it needs is gone even though the closure was created inside the extent.
+- **Expecting an inner rebinding to be seen by outer frames.** An inner `where` shadows only for its own operation; on return the outer binding is restored, and any value computed inside is not observable through the `ScopedValue` afterwards.
+- **Eager evaluation in a Scala wrapper.** A helper taking `body: A` instead of `body: => A` evaluates the operation before `call` is entered, so reads inside it occur outside the binding.
+- **Leaving `--enable-preview` in the build because of `StructuredTaskScope`.** Scoped Values need no flag from JDK 25; the flag is required only by the preview APIs used alongside them, and it opts the entire compilation into preview, not the one class that needs it.
+- **Migrating a pooled-thread `ThreadLocal` incrementally.** Until the last `set` is removed, a stale value can still be observed by a subsequent task on the same pooled platform thread, and the `ScopedValue` read path will not report the discrepancy.

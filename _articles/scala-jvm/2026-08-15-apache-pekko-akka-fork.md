@@ -2,7 +2,7 @@
 title: "Apache Pekko: The Akka Fork, and Porting an Actor System Off the BSL"
 date: 2026-08-15
 track: scala-jvm
-summary: "In September 2022 Lightbend relicensed Akka under the Business Source License, so the community forked the last Apache-2.0 Akka 2.6.x into Apache Pekko. This walks the fork's story, what Pekko ships (actors, streams, HTTP, cluster), and the mechanical migration — dependency, import, and config renames — with a Scala 3 typed actor and current versions as of August 2026 (Pekko core 1.6.0)."
+summary: "In September 2022 Lightbend relicensed Akka under the Business Source License, and the community forked the last Apache-2.0 Akka 2.6.x into Apache Pekko. This article covers the fork's provenance, the modules Pekko ships (actors, streams, HTTP, cluster), and the mechanical migration — dependency, import, config and wire-identifier renames — with a Scala 3 typed actor and current versions as of August 2026 (Pekko core 1.6.0)."
 reading_time: 6
 tags: [pekko, akka, actors, scala-3, migration, apache]
 sources:
@@ -18,23 +18,25 @@ sources:
     url: "https://www.infoq.com/news/2022/09/akka-no-longer-open-source/"
 ---
 
-On 7 September 2022, Lightbend announced that Akka — the actor toolkit half of the Scala ecosystem had built distributed systems on for a decade — would move from Apache-2.0 to the **Business Source License (BSL) 1.1**. The BSL is source-available, not open source: production use above a revenue threshold requires a commercial license, and each release converts to Apache-2.0 only after a three-year delay. The change applied going forward, from Akka 2.7 onward. The last Apache-2.0 release, **Akka 2.6.20**, stayed exactly where it was — freely licensed, and frozen.
+**Gist.** From Akka 2.7 onward the actor toolkit ships under the Business Source License (BSL) 1.1, which is source-available rather than open source: production use above a revenue threshold requires a commercial license, and each release converts to Apache-2.0 only after a three-year delay. Apache Pekko resolves this for existing deployments by forking the last Apache-2.0 release, **Akka 2.6.20**, and renaming every namespace, configuration key and wire identifier under Apache Software Foundation governance. The cost of the rename is that it reaches the network layer: **an Akka node and a Pekko node cannot join the same cluster**, so a distributed migration is a cutover rather than a rolling upgrade.
 
-That frozen artifact became the seed. Volunteers donated it to the Apache Software Foundation, and **Apache Pekko** is the hard fork of Akka 2.6.x, carrying the Apache-2.0 license forward. If your service was on Akka 2.6 and you did not want a per-core commercial bill or a rewrite onto a different concurrency model, Pekko is the drop-in path: same design, same behavior, different namespace.
+## Provenance of the fork
 
-## What Pekko is, and what it ships
+Lightbend announced the license change on 7 September 2022. It applied going forward only; Akka 2.6.20 remained where it was, freely licensed and frozen at that point in its history. That frozen artifact is the seed of the fork. Volunteers donated it to the Apache Software Foundation, and **Apache Pekko is a hard fork of Akka 2.6.x** carrying Apache-2.0 forward, maintained independently since.
 
-Pekko is not a reimplementation — it is Akka 2.6.x with everything renamed and then maintained independently under Apache governance. The full module set carried over:
+Pekko is not a reimplementation. Its behaviour is Akka 2.6.x behaviour, because it is that code with identifiers substituted. The module set carried over intact:
 
-- **pekko-actor** / **pekko-actor-typed** — the classic and typed actor runtimes.
-- **pekko-stream** — Reactive Streams with back-pressure.
-- **pekko-http** — the HTTP server/client stack (formerly akka-http).
-- **pekko-cluster**, **pekko-cluster-sharding**, **pekko-persistence**, **pekko-projection** — the distributed and event-sourcing pieces.
-- **pekko-connectors** — the integration library formerly known as Alpakka.
+- **pekko-actor** and **pekko-actor-typed** — the classic and typed actor runtimes.
+- **pekko-stream** — a Reactive Streams implementation with back-pressure.
+- **pekko-http** — the HTTP server and client stack, formerly akka-http.
+- **pekko-cluster**, **pekko-cluster-sharding**, **pekko-persistence**, **pekko-projection** — the distributed and event-sourcing components.
+- **pekko-connectors** — the integration library formerly named Alpakka.
 
-As of August 2026 the current line is **Pekko core 1.6.0** (released 17 April 2026), with **pekko-http 1.4.0** (13 July 2026) versioned separately as it always was. Pekko builds cross-publish for **Scala 2.12, 2.13, and 3** (3.3 LTS and newer). A 1.x release is the production recommendation; a 2.0.0 line exists only as milestones for library maintainers. Because Pekko started from a stable, battle-tested codebase rather than a green field, the 1.x releases have been mostly dependency refreshes, JDK-compatibility work, and bug fixes — dull in the best way.
+As of August 2026 the current line is **Pekko core 1.6.0**, with **pekko-http 1.4.0** versioned separately as it was under Akka. Releases cross-publish for **Scala 2.12, 2.13 and 3** (the 3.3 long-term-support line). The 1.x line is the release recommended for production; a 2.0.0 line exists only as milestones aimed at library maintainers. Because the fork began from a mature codebase rather than a green field, 1.x releases have consisted largely of dependency refreshes, Java Development Kit (JDK) compatibility work, and bug fixes.
 
-A minimal Scala 3 typed actor looks like ordinary Akka Typed, only the imports moved:
+### Implementation sketch (Scala)
+
+A minimal typed actor under Pekko is indistinguishable from Akka Typed apart from the package prefix. State is carried in the returned `Behavior` rather than in a mutable field, the protocol is an explicit sealed trait, and the `ActorSystem` is itself a typed `ActorRef` addressing the guardian behaviour.
 
 ```scala
 //> using scala 3.3.6
@@ -45,7 +47,7 @@ import org.apache.pekko.actor.typed.scaladsl.Behaviors
 
 object Counter:
   sealed trait Command
-  case object Increment                         extends Command
+  case object Increment                             extends Command
   final case class GetValue(replyTo: ActorRef[Int]) extends Command
 
   def apply(n: Int = 0): Behavior[Command] =
@@ -60,16 +62,16 @@ object Counter:
   system ! Counter.Increment
 ```
 
-State lives in the returned `Behavior` rather than a mutable field, messages are an explicit sealed protocol, and the `ActorSystem` is itself a typed `ActorRef` to the guardian. None of that is Pekko-specific — it is Akka Typed, which is the point.
+Nothing in that listing is Pekko-specific: source written against Akka Typed compiles against Pekko once its imports are rewritten.
 
-## The migration is a rename, not a rewrite
+## The migration is a rename
 
-Because Pekko is a fork of the exact code you were running, porting an Akka 2.6.x project is mechanical. Four substitutions cover almost everything.
+Porting an Akka 2.6.x project is mechanical because the target is the same code under different names. Four substitutions cover most of a codebase.
 
-**1. Dependencies** — change the groupId `com.typesafe.akka` to `org.apache.pekko`, and the `akka-` artifact prefix to `pekko-`:
+**1. Dependencies.** The group identifier changes from `com.typesafe.akka` to `org.apache.pekko`, and the artifact prefix from `akka-` to `pekko-`. Versions are renumbered from the Akka 2.6.x series into Pekko's own 1.x series.
 
 ```scala
-// before (Akka 2.6.20, Apache-2.0 but frozen)
+// before (Akka 2.6.20 — Apache-2.0, frozen)
 libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-actor-typed" % "2.6.20",
   "com.typesafe.akka" %% "akka-stream"      % "2.6.20"
@@ -82,7 +84,7 @@ libraryDependencies ++= Seq(
 )
 ```
 
-**2. Imports** — the whole package tree moved from `akka.*` to `org.apache.pekko.*`:
+**2. Imports.** The package tree moved wholesale from `akka.*` to `org.apache.pekko.*`.
 
 ```scala
 - import akka.actor.typed.*
@@ -91,18 +93,27 @@ libraryDependencies ++= Seq(
 + import org.apache.pekko.stream.scaladsl.*
 ```
 
-**3. Configuration** — the HOCON prefix changes from `akka` to `pekko`:
+**3. Configuration.** The Human-Optimized Config Object Notation (HOCON) root key changes from `akka` to `pekko`. Keys nested beneath it keep their paths.
 
 ```hocon
 # application.conf
 pekko {
   actor.provider = cluster
-  remote.artery.canonical.port = 25520
+  remote.artery.canonical.hostname = "127.0.0.1"
 }
 ```
 
-**4. Wire identifiers** — anything that appears on the network or in a URL: the address scheme becomes `pekko://` (and `pekko.tcp://`), and classes with `Akka` in the name become `Pekko` (`AkkaException` → `PekkoException`). Default remoting ports also differ, which matters most for rolling upgrades.
+**4. Wire and type identifiers.** Anything appearing on the network or in an actor URL is renamed: the address scheme becomes `pekko://` (and `pekko.tcp://`), and types carrying `Akka` in their name become `Pekko` — `AkkaException` becomes `PekkoException`. Default remoting ports also differ between the two projects.
 
-That last point is the real caveat, so end on it honestly: the rename touches the **wire protocol and cluster membership identifiers**, so an Akka node and a Pekko node cannot form or join the same cluster, and their remoting is not interoperable. A live cluster migration is therefore not a rolling in-place swap — you either take a full-cluster restart window, or run a bridge. For a single-node service or a stream/HTTP app the swap is trivial; for a running distributed cluster, plan the cutover. Most of steps 1–3 can be automated with a scripted find-and-replace across the source tree, but review the diff — a blind `akka`→`pekko` substitution will happily mangle comments, string literals, and unrelated identifiers.
+The fourth substitution is the one with operational consequences. Because the rename reaches **the wire protocol and the cluster membership identifiers**, remoting between an Akka node and a Pekko node is not interoperable and the two cannot form or join a single cluster. A single-node service, a stream pipeline, or an HTTP application can therefore be swapped in place; **a running cluster requires either a full-cluster restart window or a bridge between the two systems**. Steps 1 through 3 are amenable to a scripted textual substitution across the source tree, provided the resulting diff is reviewed: an unqualified `akka` → `pekko` replacement rewrites comments, string literals and unrelated identifiers with the same enthusiasm as it rewrites imports.
 
-**Try next:** In a scratch copy of an Akka 2.6.x service, run `find . \( -name '*.scala' -o -name '*.conf' \) -exec sed -i 's/com.typesafe.akka/org.apache.pekko/g; s/akka-actor/pekko-actor/g; s/\bakka\./org.apache.pekko./g' {} +`, then compile and eyeball the diff to see exactly which references were code versus incidental text before you trust it on the real repo.
+A safe rehearsal is to apply the substitution to a scratch copy first — for example `find . \( -name '*.scala' -o -name '*.conf' \) -exec sed -i 's/com.typesafe.akka/org.apache.pekko/g; s/akka-actor/pekko-actor/g; s/\bakka\./org.apache.pekko./g' {} +` — then compile and inspect which references were code and which were incidental text before the same script touches the real repository.
+
+## Pitfalls
+
+- **A rolling upgrade of a cluster silently fails to converge.** The renamed address scheme and membership identifiers make Akka and Pekko remoting mutually unintelligible, so a half-migrated cluster forms two disjoint clusters rather than one.
+- **Remoting ports differ by default.** Firewall rules, service definitions and health checks pinned to the Akka default reject or miss the Pekko listener until they are updated alongside the configuration.
+- **Configuration silently reverts to defaults.** HOCON does not reject unknown keys, so an `akka { ... }` block left in `application.conf` after the library swap is parsed and ignored, and the actor system starts with default settings instead of the intended ones.
+- **Blind textual substitution corrupts non-code text.** A global `akka` → `pekko` replacement rewrites log messages, documentation strings, package names of unrelated third-party libraries, and any persisted data referencing Akka class names.
+- **pekko-http is versioned independently of Pekko core.** Pinning both modules to the same version number does not resolve; core 1.6.0 and pekko-http 1.4.0 are the concurrent releases as of August 2026.
+- **The 2.0.0 line is not a production upgrade.** It is published as milestones aimed at library maintainers; the 1.x line is the release recommended for deployment.

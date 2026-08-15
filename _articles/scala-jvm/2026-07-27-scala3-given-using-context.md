@@ -2,7 +2,7 @@
 title: "given/using: Scala 3's Principled Take on Implicits"
 date: 2026-07-27
 track: scala-jvm
-summary: "How Scala 3 replaces the overloaded `implicit` keyword with `given`, `using`, `summon`, and extension methods — and how to build a real type class with them."
+summary: "How Scala 3 replaces the overloaded `implicit` keyword with `given`, `using`, `summon`, and extension methods, and how a type class is built from them."
 reading_time: 6
 tags: [scala-3, given-using, type-classes, context-bounds, extension-methods]
 sources:
@@ -18,11 +18,11 @@ sources:
     url: "https://endoflife.date/scala"
 ---
 
-Scala 2's `implicit` keyword did too many jobs. The same word marked implicit parameters, implicit conversions, implicit classes, and type-class evidence — four unrelated features sharing one syntax and one reputation for being hard to reason about. Scala 3 splits that overloaded keyword into intent-revealing pieces: `given` to *define* contextual values, `using` to *consume* them, `extension` for methods you bolt onto existing types, and `summon` to fetch an instance by hand. This is verified against Scala 3.8.4 (released June 5, 2026), with 3.3.8 as the current LTS line.
+**Gist.** Scala 2 spelled four unrelated features — implicit parameters, implicit conversions, implicit classes, and type-class evidence — with the single keyword `implicit`, so the role of a definition could not be read off its syntax. Scala 3 replaces that one keyword with distinct constructs: `given` defines a contextual value, `using` declares a parameter section the compiler fills in, `extension` attaches methods to an existing type, and `summon` retrieves an instance as a value. The cost is that argument selection remains a compile-time search over the terms in scope: the search is now stricter about ambiguity, so code that previously compiled by silently picking one candidate may fail to compile instead. The syntax below is the Scala 3 contextual-abstraction syntax described in the Scala 3 Book; the 3.3.x series is the long-term support (LTS) line.
 
-## using: declaring context you need
+## using: declaring the context a definition requires
 
-A `using` clause is a parameter section the caller doesn't have to fill in explicitly — the compiler finds a matching value in scope.
+A `using` clause is **a parameter section the caller may omit**; the compiler supplies an argument by searching for a term of the required type in the implicit scope.
 
 ```scala
 case class Config(port: Int, host: String)
@@ -31,28 +31,30 @@ def renderPage(path: String)(using cfg: Config): String =
   s"http://${cfg.host}:${cfg.port}$path"
 ```
 
-You can even drop the parameter name if you only pass it downstream:
+The parameter name may be dropped when the value is only forwarded to another `using` clause rather than named in the body:
 
 ```scala
 def renderWidget(items: List[String])(using Config): String = ???
 ```
 
-## given: providing it
+## given: providing the value
 
-A `given` defines the canonical value the compiler injects:
+A `given` introduces the value the compiler injects for a matching `using` clause.
 
 ```scala
 given Config = Config(8080, "saltmere.dev")
 
 renderPage("/home")            // Config supplied automatically
-renderPage("/home")(using Config(80, "prod")) // or pass it explicitly
+renderPage("/home")(using Config(80, "prod")) // or passed explicitly
 ```
 
-This is how you thread cross-cutting context — an `ExecutionContext`, a DB transaction, a request-scoped config — without wiring it through every signature by hand. Standard library APIs like `Future` already take `(using ExecutionContext)`.
+Two properties are load-bearing. **The argument is resolved by type, not by name**, which is why the name may be omitted at both definition and use site. And **an explicit `(using …)` argument list always wins over the search**, so a caller can override the ambient value without shadowing the `given`.
 
-## A real type class: Show
+This is the mechanism that threads cross-cutting context — an `ExecutionContext`, a database transaction, a request-scoped configuration — without adding an explicit parameter to every intermediate signature. Standard library APIs use it directly: `Future.apply` takes an `ExecutionContext` as a context parameter rather than as an ordinary argument.
 
-Type classes are where contextual abstraction earns its keep. The pattern has three parts: a trait parameterised on the type, `given` instances for each concrete type, and `using` (or a context bound) on functions that need the capability.
+## A type class: Show
+
+The type-class encoding has three parts: a trait parameterised on the type, a `given` instance per concrete type, and a `using` clause (or context bound) on every function that needs the capability.
 
 ```scala
 trait Show[A]:
@@ -65,38 +67,38 @@ given Show[Int] with
 given Show[Boolean] with
   extension (b: Boolean) def show: String = if b then "yes" else "no"
 
-// a derived instance that itself needs a Show[A] in context
+// a derived instance that itself requires a Show[A] in context
 given [A](using ev: Show[A]): Show[List[A]] with
   extension (xs: List[A]) def show: String =
     xs.map(_.show).mkString("[", ", ", "]")
 ```
 
-The `extension` block adds `.show` directly onto the value, so `42.show` and `List(1, 2, 3).show` read naturally at the call site — no wrapper object, no `Show.apply(x).show`.
+The `extension` block puts `.show` on the value itself, so `42.show` and `List(1, 2, 3).show` read as method calls with **no wrapper object and no `Show.apply(x).show` indirection**.
 
-## Consuming it: context bounds and summon
+The `Show[List[A]]` instance is the interesting case: it is **a parameterised given, that is, a rule rather than a value**. Resolving `List(true, false).show` requires the compiler to select that rule and then discharge its own `using ev: Show[A]` obligation with `Show[Boolean]`. Evidence composes recursively, and the composition happens at compile time — the failure mode is a compile error naming the type whose instance is missing, not a runtime lookup miss.
 
-A function that works for any `A` with a `Show` instance takes it via `using`:
+## Consuming evidence: context bounds and summon
+
+A function polymorphic in `A` but requiring a `Show[A]` takes it through `using`:
 
 ```scala
 def describe[A](a: A)(using Show[A]): String =
   s"value = ${a.show}"
 ```
 
-The `[A: Show]` **context bound** is pure sugar for exactly that `using` parameter:
+The `[A: Show]` **context bound is sugar for exactly that `using` parameter** — the same signature after desugaring:
 
 ```scala
 def describe[A: Show](a: A): String = s"value = ${a.show}"
 ```
 
-When you need the instance as a value rather than just calling its methods, `summon` retrieves it explicitly (it replaces Scala 2's `implicitly`):
+A context bound leaves the parameter anonymous. When the instance is needed as a value rather than as a receiver of extension methods, `summon` retrieves it; it is the Scala 3 replacement for Scala 2's `implicitly`.
 
 ```scala
 def widest[A: Show](xs: List[A]): Int =
-  val ev = summon[Show[A]]           // grab the given instance
+  val ev = summon[Show[A]]           // the given instance, as a value
   xs.map(x => ev.show(x).length).maxOption.getOrElse(0)
 ```
-
-Putting it together:
 
 ```scala
 @main def run =
@@ -104,11 +106,41 @@ Putting it together:
   println(List(true, false).show)    // [yes, no]
 ```
 
-`List(true, false).show` resolves the derived `Show[List[A]]` instance, which in turn summons `Show[Boolean]` — the compiler composes evidence for you.
+### Implementation sketch (Scala)
 
-## The Scala 2 equivalent, for contrast
+A second type class shows the same three parts and makes the recursive derivation explicit: the instance for `List[A]` is selected only when an instance for the element type is already resolvable.
 
-The same type class in Scala 2 leaned on `implicit` everywhere, plus an `implicit class` to fake extension methods:
+```scala
+trait JsonEncoder[A]:
+  extension (a: A) def toJson: String
+
+given JsonEncoder[Int] with
+  extension (n: Int) def toJson: String = n.toString
+
+given JsonEncoder[String] with
+  extension (s: String) def toJson: String =
+    "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+given [A](using JsonEncoder[A]): JsonEncoder[List[A]] with
+  extension (xs: List[A]) def toJson: String =
+    xs.map(_.toJson).mkString("[", ",", "]")
+
+given [A](using JsonEncoder[A]): JsonEncoder[Option[A]] with
+  extension (o: Option[A]) def toJson: String =
+    o.map(_.toJson).getOrElse("null")
+
+def encode[A: JsonEncoder](a: A): String = a.toJson
+
+@main def demo =
+  println(encode(List(1, 2, 3)))                 // [1,2,3]
+  println(encode(List(Some("a"), None)))         // ["a",null]
+```
+
+`encode(List(Some("a"), None))` requires `JsonEncoder[List[Option[String]]]`, which the compiler builds by applying the `List` rule, then the `Option` rule, then the `String` instance. Removing the `String` instance turns the expression into a compile error rather than a runtime failure.
+
+## The Scala 2 encoding, for contrast
+
+The same type class in Scala 2 used `implicit` for every role, with an `implicit class` standing in for extension methods:
 
 ```scala
 // Scala 2
@@ -125,20 +157,25 @@ implicit class ShowOps[A](a: A)(implicit s: Show[A]) {
 }
 ```
 
-Functionally identical, but the reader has to infer *which* role each `implicit` is playing.
+The behaviour is the same; the role each `implicit` plays has to be inferred from position rather than read from the keyword.
 
-## The migration story
+## Migration
 
-The mapping is mechanical, and the compiler helps:
+The mapping is mechanical:
 
-- `implicit val` / `implicit def` (a value) → `given`
+- `implicit val` / `implicit def` defining a value → `given`
 - `implicit` parameter → `using`
 - `implicitly[T]` → `summon[T]`
 - `implicit class` → `extension` methods
-- `implicit def` used for conversion → `given Conversion[A, B]` (and you must `import scala.language.implicitConversions`)
+- `implicit def` used as a conversion → `given Conversion[A, B]`, which additionally requires `import scala.language.implicitConversions`
 
-Crucially, Scala 3 still *accepts* the old `implicit` syntax, so mixed codebases compile during a transition. The `-rewrite` compiler flag combined with `-source 3.0-migration` can auto-rewrite much of it. The migration guide flags the sharp edges — chiefly that implicit conversions are now opt-in and that given resolution is slightly stricter about ambiguity, which surfaces latent bugs rather than silently picking a winner.
+Scala 3 **still accepts the Scala 2 `implicit` syntax**, so a mixed codebase compiles during a transition. The `-rewrite` compiler flag combined with `-source 3.0-migration` rewrites much of the old syntax automatically. The migration guide identifies the sharp edges: implicit conversions are now opt-in, and given resolution is stricter about ambiguity, which turns a previously silent choice between candidates into a compile error.
 
-The net effect: the mechanism that used to be Scala's most feared feature now announces its intent in the syntax. `given` defines, `using` requires, `summon` fetches, `extension` decorates — four words for four jobs the one `implicit` keyword used to blur together.
+## Pitfalls
 
-**Try next:** Write a `JsonEncoder[A]` type class with `given` instances for `Int`, `String`, and `List[A]`, add an `extension (a: A) def toJson`, then define `encode[A: JsonEncoder](a: A): String` and confirm that `List(1, 2, 3).toJson` resolves the derived `List` instance by composing the element encoder.
+- **Two `given` instances of the same type in scope produce an ambiguity error at the use site, not at the definition.** The error names the call that needed the evidence, so the offending import is often in a different file from the reported line.
+- **`implicit def` conversions no longer compile without `import scala.language.implicitConversions`.** The symptom after migration is a feature-warning-turned-error on a file that changed in no other way.
+- **A context bound gives no name to the instance.** Code that needs the instance as a value inside such a method must call `summon[Show[A]]`; referring to a parameter name that the desugaring never created is a compile error.
+- **A missing element instance surfaces as a failure on the container type.** `List(1, 2, 3).toJson` reports no `JsonEncoder[List[Int]]` when the actual gap is `JsonEncoder[Int]`, because the derived rule cannot discharge its own `using` obligation.
+- **An explicit `(using …)` argument overrides the ambient `given` silently.** A call site that passes its own value keeps compiling after the surrounding `given` is changed, so configuration changes appear to have no effect on that path.
+- **Extension methods only apply when the instance is resolvable at the call site.** Moving a `given` out of the companion object of its type removes it from the implicit scope, and `.show` stops resolving even though the trait and instance both still exist.

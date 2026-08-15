@@ -2,8 +2,8 @@
 title: "JDK Flight Recorder: always-on production profiling"
 date: 2026-08-15
 track: scala-jvm
-summary: "JFR is the profiler that's already inside your JVM: a ring buffer of GC, lock, allocation, I/O, and method-sample events cheap enough to leave running in production forever, dumped on demand when something goes wrong. One flag turns it on, the jfr CLI reads the output, and JDK 25's JEPs 509/518/520 finally fix its weakest point — CPU profiling. Plus: when to reach for JFR versus async-profiler."
-reading_time: 6
+summary: "JFR is the profiler already inside every JVM: a bounded ring of GC, lock, allocation, I/O and method-sample events cheap enough to leave running permanently, dumped on demand after an incident. One flag enables it, the jfr CLI reads the output, and JDK 25's JEPs 509/518/520 address its weakest point, CPU profiling. Includes the division of labour between JFR and async-profiler."
+reading_time: 7
 tags: [jfr, jvm, profiling, observability, jdk25, mission-control]
 sources:
   - title: "JEP 349: JFR Event Streaming"
@@ -18,26 +18,33 @@ sources:
     url: "https://jdk.java.net/jmc/9/"
 ---
 
-The [async-profiler article](/articles/scala-jvm/2026-08-15-async-profiler-jvm-flamegraphs) covered the tool you *attach* when something is on fire. **JDK Flight Recorder** is the opposite philosophy: instrumentation that is *already running* when the fire starts. Born in JRockit, locked for years behind Oracle's commercial `-XX:+UnlockCommercialFeatures` flag, JFR was open-sourced into OpenJDK with **JDK 11** (JEP 328, 2018) — so every JVM you deploy today ships a full production profiler that most teams leave switched off.
+**Gist.** An attach-when-it-breaks profiler cannot answer questions about an incident that has already ended, because the process was not being observed while it happened. JDK Flight Recorder (JFR) inverts the model: the Java Virtual Machine (JVM) continuously emits typed, timestamped events into a bounded on-disk repository, so the data for 14:32 exists before anyone asks for it. The cost is a permanent overhead budget — **targeted below 1% with the `default` settings profile** — and a fixed retention window: once the size or age cap is reached, the oldest chunks are discarded whether or not they mattered.
 
-## The flight-recorder model
+The [async-profiler article](/articles/scala-jvm/2026-08-15-async-profiler-jvm-flamegraphs) covered the tool attached after the fact. JFR is instrumentation that is already running when the fault begins. It originated in JRockit, was gated for years behind Oracle's commercial `-XX:+UnlockCommercialFeatures` flag, and was open-sourced into OpenJDK in **JDK 11** (JEP 328, 2018). Every JVM deployed since then ships a production profiler, frequently left disabled.
 
-JFR is named after the aircraft black box, and the analogy is exact. The JVM emits typed, timestamped **events** — GC pauses, safepoints, lock contention, thread parks, socket/file I/O, allocation samples, method samples, exceptions, compilation — into per-thread buffers that drain into a bounded on-disk repository. Old chunks are discarded; the recording never grows past its cap. Overhead with the `default` settings profile is targeted **below 1%**, which is the entire point: you don't decide *when* to profile, you decide when to *look*.
+## The recording model
+
+The recorded unit is an **event**: a typed record with a start timestamp, optional duration, a thread, and named fields. The JVM defines events for garbage-collection (GC) pauses, safepoints, lock contention, thread parks, socket and file input/output, allocation samples, method samples, exceptions and dynamic (JIT) compilation.
+
+The write path is the load-bearing part. Events are written into **per-thread buffers**, which avoids a shared lock on the hot path; full buffers drain into a global buffer and then into **chunks** in the repository. A recording is therefore a sequence of self-describing chunks rather than one monolithic file, which is what makes the retention policy cheap: enforcing `maxsize` or `maxage` is chunk deletion, not rewriting. **The recording never grows past its cap, and it never blocks the application to stay under it — it drops the oldest data instead.**
 
 ```bash
-# always-on: bounded ring buffer, kept for 24h, dumped if the JVM exits
-java -XX:StartFlightRecording=disk=true,maxsize=250M,maxage=1d,dumponexit=true,filename=/var/log/app/ \
+# always-on: bounded ring, kept for 24h, dumped if the JVM exits
+java -XX:StartFlightRecording=name=always-on,disk=true,maxsize=250M,maxage=1d,\
+dumponexit=true,filename=/var/log/app/exit.jfr \
      -jar app.jar
 
 # later, when something went wrong in the last hour:
-jcmd <pid> JFR.dump name=1 filename=incident.jfr
+jcmd <pid> JFR.dump name=always-on filename=incident.jfr
 ```
 
-`jcmd <pid> JFR.start settings=profile duration=60s` starts a richer, still-cheap (~2%) recording on a live process with no restart. The crucial workflow difference from every attach-based tool: when a customer reports "it was slow at 14:32", the data from 14:32 **already exists**.
+`jcmd <pid> JFR.start settings=profile duration=60s` starts a richer recording — roughly **2% overhead** — on a live process without a restart. Two settings profiles ship with the JDK: `default` for continuous use, `profile` for bounded investigation.
+
+Each event type carries an **enablement flag and a threshold**. A disabled event costs a flag test at the emission site; an enabled event below its threshold is emitted and then discarded at commit. This is why raising thresholds, rather than disabling event types, is the usual way to trade fidelity for overhead.
 
 ## Reading recordings
 
-The `jfr` CLI in every JDK does more than people expect:
+The `jfr` command in every JDK reads and transforms recordings without a graphical tool:
 
 ```bash
 jfr summary incident.jfr                       # event counts by type
@@ -47,52 +54,77 @@ jfr view allocation-by-site incident.jfr
 jfr scrub --exclude-events jdk.SystemProcess incident.jfr clean.jfr
 ```
 
-For interactive analysis, **JDK Mission Control** — currently **JMC 9** (9.1.2 is the latest GA on jdk.java.net) — gives flame views, latency histograms, and an automated rule engine that flags things like undersized heaps. And since **JEP 349** (JDK 14) you don't have to wait for a dump at all: `RecordingStream` subscribes to events in-process, which is how you wire JFR into your own metrics.
+`jfr scrub` matters for anything leaving the production boundary: recordings contain command lines, environment variables and system properties, which commonly carry credentials.
+
+For interactive analysis, **JDK Mission Control** — **JMC 9**, distributed as general-availability builds on jdk.java.net — provides flame views, latency histograms and an automated rule engine that flags conditions such as an undersized heap.
+
+**JEP 349** (JDK 14) removed the dump step for in-process consumers: `RecordingStream` delivers events to a callback as chunks are rotated, which is the supported path for feeding JFR data into an application's own metrics.
+
+### Implementation sketch (Scala)
+
+The JFR API is plain Java, so it is used unchanged from Scala. Consuming lock-contention events in-process:
 
 ```scala
 import jdk.jfr.consumer.RecordingStream
-val rs = new RecordingStream()
-rs.enable("jdk.JavaMonitorEnter").withThreshold(java.time.Duration.ofMillis(10))
-rs.onEvent("jdk.JavaMonitorEnter", e => log.warn(s"lock wait: ${e.getDuration}"))
-rs.startAsync()
+import java.time.Duration
+
+val rs = RecordingStream()
+
+// enablement and threshold are per event type: below 10 ms the event is discarded at commit
+rs.enable("jdk.JavaMonitorEnter").withThreshold(Duration.ofMillis(10))
+
+rs.onEvent("jdk.JavaMonitorEnter", e =>
+  log.warn(s"lock wait ${e.getDuration} on ${e.getClass("monitorClass").getName}")
+)
+
+rs.startAsync()   // callbacks run on the stream's own thread, not the emitting thread
 ```
 
-## Your events, not just the JVM's
-
-Custom events are a class definition away, and since JFR is plain Java API it's identical from Scala:
+Application-defined events are a class declaration:
 
 ```scala
 import jdk.jfr.{Event, Label, Name}
+import scala.annotation.meta.field
 
 @Name("com.saltmere.OrderProcessed") @Label("Order Processed")
-class OrderEvent(@Label("Items") val items: Int) extends Event
+class OrderEvent(@(Label @field)("Items") val items: Int) extends Event
 
 val e = OrderEvent(cart.size)
-e.begin(); processOrder(cart); e.commit()   // recorded only if enabled + over threshold
+e.begin()
+processOrder(cart)
+e.commit()   // a commit below the event type's threshold discards the record
 ```
 
-Events cost near-nothing when disabled, and they land on the same timeline as GC pauses and lock waits — so "this order took 900ms" sits directly above the safepoint that caused it. JDK 25 added `@Throttle` (cap an event at e.g. `"300/s"`) and `@Contextual` for tracing-style context propagation.
+The value of a custom event is not the measurement — an existing timer supplies that — but **the shared timeline**: an order taking 900 ms is recorded against the same clock as the safepoint and the GC pause that overlap it, so attribution does not depend on correlating two systems' timestamps. Two annotations shape how custom events behave: `@Throttle` caps emission at a stated rate such as `"300/s"`, and `@Contextual` — added in JDK 25 — marks fields carrying tracing-style context.
 
-## JDK 25 fixed the weak spot
+## What JDK 25 changed in CPU profiling
 
-JFR's historical weakness was CPU profiling: its method sampler was safepoint-influenced and could miss or misattribute stacks. Three JEPs shipped in **JDK 25** (September 2025) attack exactly that:
+JFR's method sampler was safepoint-influenced: samples were taken at points the JVM already had to reach, so stacks could be missed or misattributed relative to where the thread spent CPU time. Three JEPs in **JDK 25** address this.
 
-- **JEP 518 (Cooperative Sampling)** reworks the sampler to walk stacks only at well-defined points, making sampling safer and more reliable (no more crashy asynchronous walks) without giving up accuracy of *where* the sample was taken.
-- **JEP 509 (CPU-Time Profiling, experimental, Linux-only)** adds a timer-based `jdk.CPUTimeSample` event driven by actual consumed CPU time — the same signal async-profiler uses — closing most of the accuracy gap.
-- **JEP 520 (Method Timing & Tracing)** adds exact (non-sampled) timing/tracing events for methods you name via filters — deterministic answers for "how often is this called and by whom", no bytecode-agent required.
+- **JEP 518 (Cooperative Sampling)** reworks the sampler to walk stacks only at well-defined points, making the walk safer and more reliable than asynchronous walking, without losing accuracy about where the sample was taken.
+- **JEP 509 (CPU-Time Profiling)** is **experimental and Linux-only**. It adds a `jdk.CPUTimeSample` event driven by a timer on consumed CPU time — the same signal async-profiler uses — rather than by wall clock.
+- **JEP 520 (Method Timing & Tracing)** adds exact, non-sampled timing and tracing events for methods selected by filter, giving deterministic call counts and callers without a bytecode-instrumenting agent.
 
-Plus `report-on-exit`, which prints a hot-methods or GC report to stdout when the JVM exits — profiling for batch jobs with zero tooling.
+JDK 25 also adds `report-on-exit`, which prints a report such as hot methods or GC to standard output at JVM exit — usable for batch jobs with no analysis tooling in the environment.
 
-## JFR or async-profiler?
+## JFR or async-profiler
 
 | | JFR | async-profiler |
 |---|---|---|
-| Deployment | built into the JDK, always-on | attach agent / binary |
-| Coverage | whole JVM: GC, locks, I/O, alloc, custom events | CPU, alloc, locks, wall |
-| CPU profile fidelity | good since JDK 25 (JEP 509/518) | best-in-class, incl. native/kernel frames |
-| Overhead | <1% default profile | low, but attach-when-needed |
-| Output | .jfr → JMC / `jfr` CLI | flame graphs, JFR format, heatmaps |
+| Deployment | built into the JDK, always-on | attach agent or binary |
+| Coverage | whole JVM: GC, locks, I/O, allocation, custom events | CPU, allocation, locks, wall clock |
+| CPU profile fidelity | improved in JDK 25 (JEP 509/518) | includes native and kernel frames |
+| Overhead | below 1% with `default` | low, but attached when needed |
+| Output | `.jfr` → JMC or `jfr` CLI | flame graphs, JFR format, heatmaps |
 
-The practical split: **run JFR always**, everywhere, as your black box and first responder — it answers "what happened at 14:32" across every subsystem. Reach for **async-profiler** when the question narrows to CPU cycles and you need native frames, kernel stacks, or perf-event counters. They even meet in the middle: async-profiler can emit JFR-format output, and JMC opens it.
+The division of labour follows from the deployment model. JFR runs permanently and answers cross-subsystem questions about a past interval. async-profiler is the instrument once the question narrows to CPU cycles and requires native frames, kernel stacks or perf-event counters. The two are not exclusive: async-profiler can emit JFR-format output, which JMC opens.
 
-**Try next:** add `-XX:StartFlightRecording=maxsize=100M,maxage=6h` to one production service today, wait a week for the first incident, then `jcmd <pid> JFR.dump` and open it with `jfr view hot-methods` — the argument for rolling it out fleet-wide makes itself.
+## Pitfalls
+
+- **`maxage` and `maxsize` are both caps, and the tighter one wins.** A recording configured for 24 hours but capped at 100 MB on a chatty service retains far less than a day, and the shortfall is silent — the oldest chunks are already gone when the dump is taken.
+- **Without `dumponexit=true`, a `disk=true` recording leaves the repository behind but no dump.** A JVM killed by the out-of-memory killer produces no incident file unless the repository directory itself is collected.
+- **A recording dumped without `jfr scrub` carries the process command line, environment variables and system properties.** Any credential passed as a JVM argument or environment variable travels with the file.
+- **Raising fidelity by switching to `settings=profile` on every instance turns a sub-1% budget into roughly 2% fleet-wide.** The profile setting is intended for bounded investigation, not continuous operation.
+- **JEP 509 CPU-time sampling is experimental and Linux-only.** A configuration relying on `jdk.CPUTimeSample` yields nothing on macOS or Windows, and experimental features require the corresponding unlock flag.
+- **An event type that is enabled but has a threshold above the durations of interest records nothing.** The absence of `jdk.JavaMonitorEnter` events in a recording is evidence about the threshold as much as about contention.
+- **`RecordingStream` callbacks run on the stream's thread.** Blocking work inside a handler delays consumption of subsequent events rather than the application's own threads, so the loss appears as missing observations, not as latency.
