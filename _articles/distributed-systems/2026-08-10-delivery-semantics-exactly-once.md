@@ -1,21 +1,32 @@
 ---
-title: "Delivery semantics: at-most-once, at-least-once, and the 'exactly-once' myth"
+title: 'Delivery semantics: at-most-once, at-least-once, and the ''exactly-once'' myth'
 date: 2026-08-10
 track: distributed-systems
-summary: "Three delivery guarantees, defined precisely — and why interviewers want you to say that true exactly-once delivery is impossible over an unreliable network. The real answer is at-least-once plus idempotency: dedup stores, the outbox pattern, and Kafka's transactional exactly-once (and what it doesn't cover)."
+summary: 'Three delivery guarantees, defined precisely — and why interviewers want you to say that true exactly-once delivery is impossible over an unreliable network. The real answer is at-least-once plus idempotency: dedup stores, the outbox pattern, and Kafka''s transactional exactly-once (and what it doesn''t cover).'
 reading_time: 6
-tags: [messaging, delivery-semantics, idempotency, exactly-once, kafka, outbox]
+tags:
+- messaging
+- delivery-semantics
+- idempotency
+- exactly-once
+- kafka
+- outbox
+- transactions
 sources:
-  - title: "Confluent Docs — Message Delivery Guarantees for Apache Kafka"
-    url: "https://docs.confluent.io/kafka/design/delivery-semantics.html"
-  - title: "Confluent Blog — Exactly-Once Semantics Are Possible: Here's How Apache Kafka Does It"
-    url: "https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/"
-  - title: "KIP-98 — Exactly Once Delivery and Transactional Messaging"
-    url: "https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging"
-  - title: "Brave New Geek — You Cannot Have Exactly-Once Delivery"
-    url: "https://bravenewgeek.com/you-cannot-have-exactly-once-delivery/"
-  - title: "Strimzi Blog — Exactly-once semantics with Kafka transactions"
-    url: "https://strimzi.io/blog/2023/05/03/kafka-transactions/"
+- title: Confluent Docs — Message Delivery Guarantees for Apache Kafka
+  url: https://docs.confluent.io/kafka/design/delivery-semantics.html
+- title: 'Confluent Blog — Exactly-Once Semantics Are Possible: Here''s How Apache Kafka Does It'
+  url: https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/
+- title: KIP-98 — Exactly Once Delivery and Transactional Messaging
+  url: https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
+- title: Brave New Geek — You Cannot Have Exactly-Once Delivery
+  url: https://bravenewgeek.com/you-cannot-have-exactly-once-delivery/
+- title: Strimzi Blog — Exactly-once semantics with Kafka transactions
+  url: https://strimzi.io/blog/2023/05/03/kafka-transactions/
+- title: KIP-679 — Producer will enable the strongest delivery guarantee by default
+  url: https://cwiki.apache.org/confluence/display/KAFKA/KIP-679:+Producer+will+enable+the+strongest+delivery+guarantee+by+default
+- title: Message Delivery Semantics (Apache Kafka documentation)
+  url: https://kafka.apache.org/documentation/#semantics
 ---
 
 "What delivery guarantee do you want?" is one of those interview questions where the correct first move is to refuse the premise. There are three named guarantees, and only two of them are real. Getting this right — and knowing exactly why the third one is a marketing label rather than a network property — is the difference between a rehearsed answer and one that shows you understand failure.

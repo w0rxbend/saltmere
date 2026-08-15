@@ -1,21 +1,36 @@
 ---
-title: "Geospatial indexing: why B-trees can't find nearby drivers"
+title: 'Geospatial indexing: why B-trees can''t find nearby drivers'
 date: 2026-08-10
 track: distributed-systems
-summary: "The 'design Yelp / find nearby drivers' interview hinges on one fact: a B-tree indexes a single sorted dimension, and proximity is two-dimensional. This walks why range-scanning lat AND lng fails, how geohash flattens 2D to a 1D prefix (and the boundary bug that forces an 8-neighbor query), quadtrees, and the modern hierarchical grids — Google S2 on a Hilbert curve and Uber H3 on hexagons — plus how a radius / k-NN query actually runs against Redis and PostGIS."
+summary: 'The ''design Yelp / find nearby drivers'' interview hinges on one fact: a B-tree indexes a single sorted dimension, and proximity is two-dimensional. This walks why range-scanning lat AND lng fails, how geohash flattens 2D to a 1D prefix (and the boundary bug that forces an 8-neighbor query), quadtrees, and the modern hierarchical grids — Google S2 on a Hilbert curve and Uber H3 on hexagons — plus how a radius / k-NN query actually runs against Redis and PostGIS.'
 reading_time: 6
-tags: [geospatial, geohash, h3, s2, spatial-index, system-design]
+tags:
+- geospatial
+- geohash
+- h3
+- s2
+- spatial-index
+- system-design
+- quadtree
+- redis
+- indexing
 sources:
-  - title: "Uber Engineering — H3: Uber's Hexagonal Hierarchical Spatial Index"
-    url: "https://www.uber.com/us/en/blog/h3/"
-  - title: "S2Geometry — S2 Cell Hierarchy (official dev guide)"
-    url: "https://s2geometry.io/devguide/s2cell_hierarchy.html"
-  - title: "Redis — GEOSEARCH command reference"
-    url: "https://redis.io/docs/latest/commands/geosearch/"
-  - title: "PostGIS Manual — KNN and the <-> distance operator"
-    url: "https://postgis.net/docs/geometry_distance_knn.html"
-  - title: "Crunchy Data — A Deep Dive into PostGIS Nearest Neighbor Search"
-    url: "https://www.crunchydata.com/blog/a-deep-dive-into-postgis-nearest-neighbor-search"
+- title: 'Uber Engineering — H3: Uber''s Hexagonal Hierarchical Spatial Index'
+  url: https://www.uber.com/us/en/blog/h3/
+- title: S2Geometry — S2 Cell Hierarchy (official dev guide)
+  url: https://s2geometry.io/devguide/s2cell_hierarchy.html
+- title: Redis — GEOSEARCH command reference
+  url: https://redis.io/docs/latest/commands/geosearch/
+- title: PostGIS Manual — KNN and the <-> distance operator
+  url: https://postgis.net/docs/geometry_distance_knn.html
+- title: Crunchy Data — A Deep Dive into PostGIS Nearest Neighbor Search
+  url: https://www.crunchydata.com/blog/a-deep-dive-into-postgis-nearest-neighbor-search
+- title: Geohash — Wikipedia
+  url: https://en.wikipedia.org/wiki/Geohash
+- title: Redis geospatial data type
+  url: https://redis.io/docs/latest/develop/data-types/geospatial/
+- title: Quadtree — Wikipedia
+  url: https://en.wikipedia.org/wiki/Quadtree
 ---
 
 The prompt is always some flavor of "find the 10 nearest drivers" or "restaurants within 2 km." The candidate reaches for the tool they know — a database index — and hits a wall that is the whole point of the question.

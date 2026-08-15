@@ -102,3 +102,26 @@ code block:
 before the Jekyll build so a mistake names the file and line rather than
 producing a Ruby stack trace. Deliberate Liquid in prose, such as a
 `{% raw %}{{ site.baseurl }}{% endraw %}` cross-link, is fine and left alone.
+
+### Not covering the same topic twice
+
+The publishing job runs twice a day and does not remember what it wrote last
+week, so it will happily write a second article on a subject it has already
+covered — usually under a slightly different slug, which hides the repeat from
+a filename check.
+
+`TOPICS.md` is the ledger of everything covered so far, grouped by track and
+regenerated with:
+
+```bash
+python3 tools/check_duplicates.py --ledger
+```
+
+**The publishing job should read `TOPICS.md` before choosing subjects.** If a
+topic is already listed, either skip it or extend the existing article rather
+than writing a second one.
+
+CI runs `tools/check_duplicates.py` on every push. An exact slug collision
+fails the build; looser topic overlap is printed for a human to judge, because
+close neighbours — Temporal and Restate, opaque types and match types — are
+legitimately separate articles.

@@ -1,23 +1,47 @@
 ---
-title: "CDN & Edge Caching Internals: The Request Path from PoP to Origin"
+title: 'CDN & Edge Caching Internals: The Request Path from PoP to Origin'
 date: 2026-08-10
 track: sys-patterns
-summary: "How a CDN actually caches at the edge — the request path through PoPs, mid-tier shields, and origin; cache keys and header normalization; Surrogate-Control vs Cache-Control precedence; HIT/MISS/EXPIRED and the Age header; tiered caching and origin shielding as a stampede defense at CDN scale; request collapsing; surrogate-key/cache-tag purge; and the dynamic-content escape hatches (ESI, stale-while-revalidate, compute@edge). With concrete Fastly, Cloudflare, Akamai, and Varnish/VCL examples."
+summary: How a CDN actually caches at the edge — the request path through PoPs, mid-tier shields, and origin; cache keys and header normalization; Surrogate-Control vs Cache-Control precedence; HIT/MISS/EXPIRED and the Age header; tiered caching and origin shielding as a stampede defense at CDN scale; request collapsing; surrogate-key/cache-tag purge; and the dynamic-content escape hatches (ESI, stale-while-revalidate, compute@edge). With concrete Fastly, Cloudflare, Akamai, and Varnish/VCL examples.
 reading_time: 6
-tags: [cdn, edge-caching, fastly, cloudflare, varnish, surrogate-keys, shielding, request-collapsing, cache-invalidation, interview-prep]
+tags:
+- cdn
+- edge-caching
+- fastly
+- cloudflare
+- varnish
+- surrogate-keys
+- shielding
+- request-collapsing
+- cache-invalidation
+- interview-prep
+- caching
+- cache-control
+- edge
+- system-design
 sources:
-  - title: "Fastly Documentation — Working with surrogate keys"
-    url: "https://www.fastly.com/documentation/guides/full-site-delivery/purging/working-with-surrogate-keys/"
-  - title: "Fastly Documentation — Request collapsing"
-    url: "https://www.fastly.com/documentation/guides/concepts/cache/request-collapsing/"
-  - title: "Fastly Documentation — Shielding"
-    url: "https://www.fastly.com/documentation/guides/concepts/shielding/"
-  - title: "Fastly Documentation — Surrogate-Control header"
-    url: "https://www.fastly.com/documentation/reference/http/http-headers/Surrogate-Control/"
-  - title: "Cloudflare Docs — Tiered Cache"
-    url: "https://developers.cloudflare.com/cache/how-to/tiered-cache/"
-  - title: "Cloudflare Docs — Cache keys"
-    url: "https://developers.cloudflare.com/cache/how-to/cache-keys/"
+- title: Fastly Documentation — Working with surrogate keys
+  url: https://www.fastly.com/documentation/guides/full-site-delivery/purging/working-with-surrogate-keys/
+- title: Fastly Documentation — Request collapsing
+  url: https://www.fastly.com/documentation/guides/concepts/cache/request-collapsing/
+- title: Fastly Documentation — Shielding
+  url: https://www.fastly.com/documentation/guides/concepts/shielding/
+- title: Fastly Documentation — Surrogate-Control header
+  url: https://www.fastly.com/documentation/reference/http/http-headers/Surrogate-Control/
+- title: Cloudflare Docs — Tiered Cache
+  url: https://developers.cloudflare.com/cache/how-to/tiered-cache/
+- title: Cloudflare Docs — Cache keys
+  url: https://developers.cloudflare.com/cache/how-to/cache-keys/
+- title: What is an Anycast Network? (Cloudflare Learning Center)
+  url: https://www.cloudflare.com/learning/cdn/glossary/anycast-network/
+- title: Using Amazon CloudFront Origin Shield (AWS documentation)
+  url: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/origin-shield.html
+- title: Soft purges (Fastly documentation)
+  url: https://www.fastly.com/documentation/guides/full-site-delivery/purging/soft-purges/
+- title: Purging with surrogate keys (Fastly documentation)
+  url: https://www.fastly.com/documentation/guides/full-site-delivery/purging/purging-with-surrogate-keys/
+- title: RFC 5861 — HTTP Cache-Control Extensions for Stale Content
+  url: https://datatracker.ietf.org/doc/html/rfc5861
 ---
 
 A CDN is a cache with a map of the world stapled to it. The protocol-level rules — `Cache-Control`, `ETag`, freshness, revalidation — are covered in [HTTP caching semantics](/articles/microservices/2026-08-10-http-caching-cache-control-etag). This article is about what a content delivery network adds on top: a physical topology of caches, a key that decides what counts as "the same object," and controls that let you override the origin's opinion about caching entirely. The load-shedding math behind coalescing lives in [cache stampede & request coalescing](/articles/microservices/2026-08-10-cache-stampede-request-coalescing); here we look at how it plays out across PoPs.
@@ -117,3 +141,7 @@ Not everything is a cacheable blob. The edge has escape hatches for the rest:
 The through-line: a modern CDN is not a dumb mirror. It is a distributed, programmable cache designed to answer as far from your origin as possible — and to invalidate precisely enough that you can afford to.
 
 **Try next:** Add `Surrogate-Key` headers to two related endpoints in a test service, cache them with a long `Surrogate-Control: max-age`, then watch `Age` climb on repeated requests and drop to zero after a single-key purge — and compare `CF-Cache-Status` / `X-Cache` before and after enabling shielding or Tiered Cache.
+
+## Hit ratio math
+
+Cache hit ratio = hits / (hits + misses). The number that matters is its complement: **origin load = (1 − hit ratio) × request rate**. At 10,000 rps, 90% → 1,000 rps to origin; 99% → 100 rps. Moving from 98% to 99% *halves* origin traffic — which is why origin shield exists, why you normalize cache keys (strip marketing query params, limit `Vary`), and why a purge-all is so violent: it takes you to 0% instantly against an origin provisioned for 1%.

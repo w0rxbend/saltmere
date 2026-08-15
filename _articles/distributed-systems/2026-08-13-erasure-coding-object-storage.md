@@ -42,7 +42,7 @@ The Azure **Local Reconstruction Codes** paper (USENIX ATC 2012) attacks exactly
 
 Two planes, deliberately separated:
 
-- **Metadata path:** key → (stripe layout, shard locations, version). A replicated, strongly consistent index — quorum-replicated and typically [LSM-backed](/articles/distributed-systems/2026-08-11-lsm-trees-vs-b-trees) — handles PUT/GET lookups, multipart bookkeeping, and listing. This is where consistency lives.
+- **Metadata path:** key → (stripe layout, shard locations, version). A replicated, strongly consistent index — quorum-replicated and typically [LSM-backed](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees) — handles PUT/GET lookups, multipart bookkeeping, and listing. This is where consistency lives.
 - **Data path:** shards land on storage nodes chosen so no two shards of a stripe share a failure domain (disk, host, rack, AZ) — placement is the [consistent-hashing / placement-map problem](/articles/distributed-systems/2026-07-25-consistent-hashing-ring) again. A background repair service watches for missing shards and reconstructs onto fresh disks.
 
 A common production pattern (Azure does this explicitly): writes first land 3x-replicated in an append-only journal for low latency, then sealed extents are erasure-coded lazily and the replicas dropped. Hot recent data pays replication's overhead briefly; cold bulk pays 1.3–1.5x forever.

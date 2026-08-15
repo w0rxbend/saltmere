@@ -1,21 +1,30 @@
 ---
-title: "Rendezvous hashing (HRW): pick the highest score, skip the ring"
+title: 'Rendezvous hashing (HRW): pick the highest score, skip the ring'
 date: 2026-08-10
 track: distributed-systems
-summary: "Consistent hashing needs a ring and hundreds of virtual nodes per host to stay balanced. Rendezvous hashing gets the same 1/N remapping and even load with no bookkeeping at all: for each key, score every node and take the max. Here's why it works, a runnable implementation, and how it stacks up against the ring and jump hash."
+summary: 'Consistent hashing needs a ring and hundreds of virtual nodes per host to stay balanced. Rendezvous hashing gets the same 1/N remapping and even load with no bookkeeping at all: for each key, score every node and take the max. Here''s why it works, a runnable implementation, and how it stacks up against the ring and jump hash.'
 reading_time: 6
-tags: [rendezvous-hashing, hrw, consistent-hashing, sharding, load-balancing]
+tags:
+- rendezvous-hashing
+- hrw
+- consistent-hashing
+- sharding
+- load-balancing
 sources:
-  - title: "Thaler & Ravishankar, Using Name-Based Mappings to Increase Hit Rates (IEEE/ACM ToN, Feb 1998)"
-    url: "https://www.microsoft.com/en-us/research/wp-content/uploads/2017/02/HRW98.pdf"
-  - title: "Rendezvous hashing — Wikipedia"
-    url: "https://en.wikipedia.org/wiki/Rendezvous_hashing"
-  - title: "Envoy — Supported load balancers (ring hash vs Maglev)"
-    url: "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers.html"
-  - title: "Lamping & Veach, A Fast, Minimal Memory, Consistent Hash Algorithm (jump hash)"
-    url: "https://arxiv.org/abs/1406.2294"
-  - title: "Damian Gryski, Consistent Hashing: Algorithmic Tradeoffs"
-    url: "https://dgryski.medium.com/consistent-hashing-algorithmic-tradeoffs-ef6b8e2fcae8"
+- title: Thaler & Ravishankar, Using Name-Based Mappings to Increase Hit Rates (IEEE/ACM ToN, Feb 1998)
+  url: https://www.microsoft.com/en-us/research/wp-content/uploads/2017/02/HRW98.pdf
+- title: Rendezvous hashing — Wikipedia
+  url: https://en.wikipedia.org/wiki/Rendezvous_hashing
+- title: Envoy — Supported load balancers (ring hash vs Maglev)
+  url: https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers.html
+- title: Lamping & Veach, A Fast, Minimal Memory, Consistent Hash Algorithm (jump hash)
+  url: https://arxiv.org/abs/1406.2294
+- title: 'Damian Gryski, Consistent Hashing: Algorithmic Tradeoffs'
+  url: https://dgryski.medium.com/consistent-hashing-algorithmic-tradeoffs-ef6b8e2fcae8
+- title: Thaler & Ravishankar — Using Name-Based Mappings to Increase Hit Rates (IEEE/ACM Trans. Networking, Feb 1998)
+  url: https://www.semanticscholar.org/paper/Using-name-based-mappings-to-increase-hit-rates-Thaler-Ravishankar/6a3d10bb30818c86c18cef1e5e4b128ae80840ae
+- title: 'Consistent Hashing vs. Rendezvous Hashing: A Comparison (DZone)'
+  url: https://dzone.com/articles/consistent-hashing-vs-rendezvous-hashing-a-compara
 ---
 
 You have `K` cache keys and `N` cache servers, and the server set keeps changing — nodes get added for capacity, yanked when they die. You want a `key -> node` mapping that is (a) deterministic and coordination-free, so every client agrees without asking anyone; (b) evenly balanced, so no server eats a hotspot; and (c) *stable*, so resizing the cluster moves as few keys as possible. `hash(key) % N` fails (c) catastrophically — change `N` and almost every key relocates. The [consistent hash ring](/articles/distributed-systems/2026-07-25-consistent-hashing-ring) fixes that, but it buys stability with machinery: a sorted ring, and a few hundred *virtual nodes* per host to smooth out lumpy arcs.
@@ -72,3 +81,21 @@ The load-balancer world is instructive by contrast. **Envoy** ships two consiste
 The takeaway: if you find yourself standing up a ring with 200 vnodes per host just to shard a dozen caches, HRW gives you the same distribution and the same `1/N` churn in twenty lines with nothing to maintain.
 
 **Try next:** implement weighted HRW with the `-w / ln(u)` transform, then verify empirically that a node with weight 2 draws twice the keyspace — and measure how many keys move when you bump one node's weight versus adding a node.
+
+## Weighting and replica sets
+
+Uneven node capacities are handled without vnodes. Map the raw hash into `(0,1]`, then use a closed-form weighted score so win probability is proportional to `weight`:
+
+```python
+import math
+def weighted_score(key, node, weight):
+    u = (int.from_bytes(hashlib.blake2b(f"{key}:{node}".encode(),
+                        digest_size=8).digest(), "big") + 1) / 2**64
+    return weight / -math.log(u)   # win prob ∝ weight
+```
+
+And replication is free: instead of the single argmax, take the **top-k** nodes by score. Those k are the natural replica set, and if one leaves, only its share of keys shifts to the next-highest node — the k-th replica each key gains is exactly the (k+1)-th ranked node it already knew about.
+
+This is why HRW quietly shows up in caching meshes, GLB backends, and shard routers: no shared ring to keep consistent across clients, top-k replicas for free, and remapping you can prove is minimal on a whiteboard.
+
+**Try next:** implement `hrw_node`, hash 100k keys over 10 nodes and record the assignment, then drop node 5 and re-hash. Count how many keys moved — it should be within noise of 1/10, and every moved key should have pointed at node 5.

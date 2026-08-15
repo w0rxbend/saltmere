@@ -18,7 +18,7 @@ sources:
     url: "https://vkontech.com/exploring-kafka-steams-partitioning-scaling-and-fault-tolerance/"
 ---
 
-A `count()` over a stream needs somewhere to keep the counts. Kafka Streams' answer is radical locality: state lives in an embedded [RocksDB](/articles/distributed-systems/2026-08-11-lsm-trees-vs-b-trees) instance *inside your application process*, one store per task, no database to call. The interview question is always the same: your process dies and takes its local disk with it — where did the counts go? The answer is the changelog topic, and everything interesting about Kafka Streams operations follows from it.
+A `count()` over a stream needs somewhere to keep the counts. Kafka Streams' answer is radical locality: state lives in an embedded [RocksDB](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees) instance *inside your application process*, one store per task, no database to call. The interview question is always the same: your process dies and takes its local disk with it — where did the counts go? The answer is the changelog topic, and everything interesting about Kafka Streams operations follows from it.
 
 ## Streams, tables, and why an aggregation is a table
 
@@ -67,7 +67,7 @@ Because state is local, you can expose it directly — no read-path database. `s
 
 ## The configs that matter
 
-- **`commit.interval.ms`** (default 30 000 ms) — how often offsets are committed and caches flushed downstream; it bounds both your end-to-end latency and your reprocessing window after a crash. With `processing.guarantee=exactly_once_v2` the default drops to 100 ms, because commit = transaction boundary — Streams EOS is the transactions machinery wired through the topology, covered in [exactly-once in Kafka](/articles/microservices/2026-08-13-exactly-once-delivery-semantics-kafka), so state stores, changelogs, and output topics commit atomically.
+- **`commit.interval.ms`** (default 30 000 ms) — how often offsets are committed and caches flushed downstream; it bounds both your end-to-end latency and your reprocessing window after a crash. With `processing.guarantee=exactly_once_v2` the default drops to 100 ms, because commit = transaction boundary — Streams EOS is the transactions machinery wired through the topology, covered in [exactly-once in Kafka](/articles/distributed-systems/2026-08-10-delivery-semantics-exactly-once), so state stores, changelogs, and output topics commit atomically.
 - **`statestore.cache.max.bytes`** (default 10 MiB per instance) — the write cache that dedups repeated updates per key before they hit RocksDB, the changelog, and downstream. Bigger cache = fewer, larger updates; zero = every single update emitted (useful in tests).
 - **`num.standby.replicas`** — see above; the single cheapest availability win for stateful apps.
 

@@ -1,19 +1,32 @@
 ---
-title: "CQRS: when one model can't serve both the write and the read"
+title: 'CQRS: when one model can''t serve both the write and the read'
 date: 2026-08-10
 track: microservices
-summary: "A normalized write model optimized for validation is a poor fit for complex, denormalized read views — and the two scale differently. CQRS splits them: commands change state, queries read purpose-built projections. The catch you must name in an interview is eventual consistency."
+summary: 'A normalized write model optimized for validation is a poor fit for complex, denormalized read views — and the two scale differently. CQRS splits them: commands change state, queries read purpose-built projections. The catch you must name in an interview is eventual consistency.'
 reading_time: 6
-tags: [cqrs, read-models, projections, eventual-consistency, event-sourcing, ddd, scalability]
+tags:
+- cqrs
+- read-models
+- projections
+- eventual-consistency
+- event-sourcing
+- ddd
+- scalability
+- event-driven
+- bounded-context
 sources:
-  - title: "Martin Fowler, bliki: CQRS"
-    url: "https://martinfowler.com/bliki/CQRS.html"
-  - title: "Microsoft Azure Architecture Center: CQRS pattern"
-    url: "https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs"
-  - title: "Chris Richardson, Microservices Pattern: CQRS"
-    url: "https://microservices.io/patterns/data/cqrs.html"
-  - title: "Greg Young, CQRS Documents"
-    url: "https://cqrs.wordpress.com/wp-content/uploads/2010/11/cqrs_documents.pdf"
+- title: 'Martin Fowler, bliki: CQRS'
+  url: https://martinfowler.com/bliki/CQRS.html
+- title: 'Microsoft Azure Architecture Center: CQRS pattern'
+  url: https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs
+- title: 'Chris Richardson, Microservices Pattern: CQRS'
+  url: https://microservices.io/patterns/data/cqrs.html
+- title: Greg Young, CQRS Documents
+  url: https://cqrs.wordpress.com/wp-content/uploads/2010/11/cqrs_documents.pdf
+- title: Greg Young — CQRS (what it is and isn't)
+  url: https://gregfyoung.wordpress.com/2012/03/02/cqrs/
+- title: Udi Dahan — Clarified CQRS
+  url: https://udidahan.com/2009/12/09/clarified-cqrs/
 ---
 
 ## One model, two jobs, both done badly

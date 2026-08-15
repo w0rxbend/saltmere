@@ -63,7 +63,7 @@ Before fetching from a new host, fetch `https://host/robots.txt` — now formall
 | 8-byte fingerprints, mem+disk (Mercator) | ~80 GB + disk | none | in-memory hash of popular URLs in front of a sorted disk file |
 | Bloom filter | ~12 GB (10 bits/key) | tunable ~1% | a false positive silently *skips* a real URL — acceptable for crawling |
 
-The Internet Archive's crawler used the Bloom-filter route; Mercator deliberately didn't, trading disk seeks for zero false negatives. The corpus [Bloom/cuckoo filter article](/articles/distributed-systems/2026-08-13-bloom-cuckoo-filters) covers the mechanics.
+The Internet Archive's crawler used the Bloom-filter route; Mercator deliberately didn't, trading disk seeks for zero false negatives. The corpus [Bloom/cuckoo filter article](/articles/distributed-systems/2026-08-10-cuckoo-filters-vs-bloom) covers the mechanics.
 
 **Content-seen test.** Mirrors and boilerplate mean different URLs serve near-identical pages. Exact checksums catch exact copies; for *near*-duplicates the production answer is **SimHash** (Manku, Jain & Das Sarma, WWW 2007, at Google): hash each page's features into a **64-bit fingerprint** such that similar pages differ in few bits, then flag pages within **Hamming distance k = 3** — parameters they validated on an 8B-page corpus, with precision/recall both near 0.75. Their trick for finding all fingerprints within distance 3 among billions: store several permuted, sorted copies of the fingerprint table so candidates share a long exact prefix.
 

@@ -18,7 +18,7 @@ sources:
     url: "https://jdk.java.net/jmc/9/"
 ---
 
-The [async-profiler article](/articles/scala-jvm/async-profiler-jvm-flamegraphs) covered the tool you *attach* when something is on fire. **JDK Flight Recorder** is the opposite philosophy: instrumentation that is *already running* when the fire starts. Born in JRockit, locked for years behind Oracle's commercial `-XX:+UnlockCommercialFeatures` flag, JFR was open-sourced into OpenJDK with **JDK 11** (JEP 328, 2018) — so every JVM you deploy today ships a full production profiler that most teams leave switched off.
+The [async-profiler article](/articles/scala-jvm/2026-08-15-async-profiler-jvm-flamegraphs) covered the tool you *attach* when something is on fire. **JDK Flight Recorder** is the opposite philosophy: instrumentation that is *already running* when the fire starts. Born in JRockit, locked for years behind Oracle's commercial `-XX:+UnlockCommercialFeatures` flag, JFR was open-sourced into OpenJDK with **JDK 11** (JEP 328, 2018) — so every JVM you deploy today ships a full production profiler that most teams leave switched off.
 
 ## The flight-recorder model
 

@@ -1,24 +1,32 @@
 ---
-title: "Bloom vs Cuckoo Filters: The Membership Guards Behind Your Cache"
+title: 'Bloom vs Cuckoo Filters: The Membership Guards Behind Your Cache'
 date: 2026-08-10
 track: distributed-systems
 summary: Approximate set-membership structures answer "have I seen this key?" in a few bits per element so you can skip a cache miss, a disk seek, or an SSTable read. This walks the Bloom filter (k hash functions, no false negatives, the exact sizing formulas for m and k, why it can't delete) then the cuckoo filter (fingerprints in a cuckoo table with partial-key hashing, deletable, better space below ~3% FP, two-bucket locality) — with a real Bloom implementation, a comparison table, and the load-factor caveat that bites cuckoo.
 reading_time: 6
 tags:
-  - bloom-filter
-  - cuckoo-filter
-  - probabilistic-data-structures
-  - caching
-  - lsm-tree
+- bloom-filter
+- cuckoo-filter
+- probabilistic-data-structures
+- caching
+- lsm-tree
 sources:
-  - title: "Cuckoo Filter: Practically Better Than Bloom (Fan, Andersen, Kaminsky, Mitzenmacher, CoNEXT 2014)"
-    url: "https://www.cs.cmu.edu/~dga/papers/cuckoo-conext2014.pdf"
-  - title: "Bloom filter — Wikipedia (optimal m and k formulas, counting variant)"
-    url: "https://en.wikipedia.org/wiki/Bloom_filter"
-  - title: "RocksDB Bloom Filter — facebook/rocksdb Wiki"
-    url: "https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter"
-  - title: "How to Choose Between Bloom Filter and Cuckoo Filter in Redis"
-    url: "https://oneuptime.com/blog/post/2026-03-31-redis-how-to-choose-between-bloom-filter-and-cuckoo-filter-in-redi/view"
+- title: 'Cuckoo Filter: Practically Better Than Bloom (Fan, Andersen, Kaminsky, Mitzenmacher, CoNEXT 2014)'
+  url: https://www.cs.cmu.edu/~dga/papers/cuckoo-conext2014.pdf
+- title: Bloom filter — Wikipedia (optimal m and k formulas, counting variant)
+  url: https://en.wikipedia.org/wiki/Bloom_filter
+- title: RocksDB Bloom Filter — facebook/rocksdb Wiki
+  url: https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+- title: How to Choose Between Bloom Filter and Cuckoo Filter in Redis
+  url: https://oneuptime.com/blog/post/2026-03-31-redis-how-to-choose-between-bloom-filter-and-cuckoo-filter-in-redi/view
+- title: Space/Time Trade-offs in Hash Coding with Allowable Errors — Burton H. Bloom (CACM, 1970)
+  url: https://dl.acm.org/doi/10.1145/362686.362692
+- title: Algorithmic Nuggets in Content Delivery — Maggs & Sitaraman (SIGCOMM CCR, 2015)
+  url: https://courses.cs.duke.edu/spring16/compsci590.6/CCRpaper.pdf
+- title: Bloom Filters (Apache Cassandra Documentation)
+  url: https://cassandra.apache.org/doc/latest/cassandra/managing/operating/bloom_filters.html
+- title: When Bloom Filters Don't Bloom (Cloudflare blog)
+  url: https://blog.cloudflare.com/when-bloom-filters-dont-bloom/
 ---
 
 Every read-through cache has a failure mode where the answer is *nothing*. A request arrives for a key that does not exist — not in the cache, not in the database. The cache can't hold "absence" for free, so the request falls through to the store, finds nothing, and returns. Do that a million times a second with random non-existent keys and you have **cache penetration**: your cache is a no-op and your database eats every query. (See the [penetration / breakdown / avalanche writeup](/articles/distributed-systems/2026-08-10-cache-penetration-breakdown-avalanche) for the full taxonomy.)
@@ -125,3 +133,7 @@ Cuckoo filters are not free lunch. They fill to a hard occupancy limit — the p
 These sit alongside two cousins that solve *different* problems, so don't confuse them in an interview: [HyperLogLog](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation) estimates *how many distinct* elements (cardinality), and Count-Min sketches estimate *how often* an element appears (frequency). Bloom and cuckoo answer only *membership*.
 
 **Try next:** build the Bloom class above, size it for `n = 1e6`, `p = 0.01`, insert a million keys, then measure the empirical false-positive rate against a million never-inserted keys — you should land near 1% and see `m/n ≈ 9.6` bits and `k = 7`. Then sweep `p` from 0.1 down to 0.0001 and watch bits-per-element grow linearly in `log₂(1/p)` while `k` creeps up one hash at a time.
+
+## Counting Bloom filters
+
+Replace each bit with a small counter (typically 4 bits): increment on insert, decrement on delete, treat "nonzero" as set. This is how *Summary Cache* (Fan et al., 2000) let web caches exchange contents. Costs: ~4× the space, and deleting an item you never inserted (or counter overflow) silently reintroduces false negatives. Mention it, then pivot — the modern answer to "I need deletes" is usually a cuckoo filter.

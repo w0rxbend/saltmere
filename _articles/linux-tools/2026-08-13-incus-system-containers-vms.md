@@ -1,21 +1,38 @@
 ---
-title: "Incus: one CLI for system containers and VMs, the LXD fork that stuck"
+title: 'Incus: one CLI for system containers and VMs, the LXD fork that stuck'
 date: 2026-08-13
 track: linux-tools
-summary: "Incus is the community fork of LXD, run by its original maintainers under Linux Containers. It manages full-OS system containers and KVM virtual machines behind one API — a different tool from Docker, not a competitor to it."
+summary: Incus is the community fork of LXD, run by its original maintainers under Linux Containers. It manages full-OS system containers and KVM virtual machines behind one API — a different tool from Docker, not a competitor to it.
 reading_time: 5
-tags: [incus, lxd, containers, virtualization, kvm, linux-tools]
+tags:
+- incus
+- lxd
+- containers
+- virtualization
+- kvm
+- linux-tools
+- lxc
+- virtual-machines
+- linux-containers
 sources:
-  - title: "Linux Containers — Incus (introduction)"
-    url: "https://linuxcontainers.org/incus/"
-  - title: "Linux Containers — Incus news / releases"
-    url: "https://linuxcontainers.org/incus/news/"
-  - title: "Incus: LXD's Community Fork, Two Years In (SumGuy's Ramblings)"
-    url: "https://sumguy.com/incus-lxd-fork/"
-  - title: "Incus: LXC system containers + KVM on any Linux host (Amir Eslampanah)"
-    url: "https://amireslampanah.com/tutorials/incus-containers-and-vms.html"
-  - title: "Install Incus on Ubuntu 26.04 / 24.04 / 22.04 (ComputingForGeeks)"
-    url: "https://computingforgeeks.com/install-lxc-incus-ubuntu/"
+- title: Linux Containers — Incus (introduction)
+  url: https://linuxcontainers.org/incus/
+- title: Linux Containers — Incus news / releases
+  url: https://linuxcontainers.org/incus/news/
+- title: 'Incus: LXD''s Community Fork, Two Years In (SumGuy''s Ramblings)'
+  url: https://sumguy.com/incus-lxd-fork/
+- title: 'Incus: LXC system containers + KVM on any Linux host (Amir Eslampanah)'
+  url: https://amireslampanah.com/tutorials/incus-containers-and-vms.html
+- title: Install Incus on Ubuntu 26.04 / 24.04 / 22.04 (ComputingForGeeks)
+  url: https://computingforgeeks.com/install-lxc-incus-ubuntu/
+- title: Incus documentation — Introduction
+  url: https://linuxcontainers.org/incus/docs/main/
+- title: Introducing Incus — Linux Containers announcement
+  url: https://linuxcontainers.org/incus/announcement/
+- title: Migrating from LXD — Incus documentation
+  url: https://linuxcontainers.org/incus/docs/main/howto/server_migrate_lxd/
+- title: Zabbly — Incus package repository
+  url: https://zabbly.com/incus/
 ---
 
 When Canonical moved LXD in-house in 2023 and put it behind a CLA, the people who had built it forked it. **Incus** is that fork — Apache-2.0, hosted under the neutral **Linux Containers** project, and led by LXD's original maintainers. Two-plus years on it's the version the distros ship: it's in Debian, Ubuntu, Fedora and Arch, and it moves fast. The current line is **Incus 7.3** (released 31 July 2026) on a monthly cadence, with **7.0 LTS** for people who want stability over features.
@@ -100,3 +117,35 @@ incus launch web-base web3                    # stamp new instances from it
 Incus isn't a Docker replacement; reach for it when you want machines rather than packaged processes — CI runners, per-project dev boxes, or a homelab where containers and VMs live behind one command.
 
 **Try next:** `incus launch images:ubuntu/24.04 lab --vm`, then `incus launch images:ubuntu/24.04 lab-c` — put a VM and a container side by side, `incus list` them, and feel how little the VM flag costs you.
+
+## Where it is in 2026
+
+Incus does yearly LTS lines plus a monthly feature stream. As of August 2026 the current feature release is **Incus 7.1** (released May 29, 2026), and the supported LTS is the **7.0 series** (7.0.0, May 2026), with the older 6.0 LTS still receiving fixes. On packaging: Incus is in Debian (since Debian 13) and available on Ubuntu, and for the newest builds the project points at the **Zabbly** repositories maintained by Stéphane Graber, which ship both the stable and LTS channels for Debian and Ubuntu.
+
+Install from Zabbly on a Debian/Ubuntu host:
+
+```sh
+curl -fsSL https://pkgs.zabbly.com/key.asc | sudo tee /etc/apt/keyrings/zabbly.asc
+sudo sh -c 'cat > /etc/apt/sources.list.d/zabbly-incus-stable.sources' <<'EOF'
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/stable
+Suites: $(. /etc/os-release && echo $VERSION_CODENAME)
+Components: main
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF
+sudo apt update && sudo apt install -y incus
+sudo incus admin init --minimal      # storage pool + default network, no prompts
+```
+
+## Migrating off LXD
+
+You don't dump and re-import. Incus ships **`lxd-to-incus`**, an official one-shot migrator that reads your running LXD's instances, profiles, storage pools, and networks and moves them over in place, leaving LXD stopped afterward:
+
+```sh
+sudo lxd-to-incus          # interactive; verifies both daemons, then transfers state
+```
+
+It refuses to run on configurations it can't translate cleanly, so it fails loudly rather than silently dropping data — read its preflight output before confirming.
+
+**Try next:** On a spare Debian/Ubuntu box, install Incus from Zabbly, `incus launch images:debian/13 t1` and `incus launch images:debian/13 t2 --vm`, then `incus list` and compare how fast each reaches `RUNNING`.

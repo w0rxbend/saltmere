@@ -18,7 +18,7 @@ sources:
     url: "https://www.scala-lang.org/api/current/scala/compiletime.html"
 ---
 
-In C, `inline` is a suggestion the compiler is free to ignore. In Scala 3, **`inline` is a language guarantee**: the call site is *always* replaced by the definition's body at compile time, or compilation fails. That firm semantics is what makes it a metaprogramming tool rather than an optimizer knob — because once the compiler is guaranteed to be looking at the expanded code, it can be asked to *evaluate* parts of it, branch on types, refine result types, and emit custom errors. A large slice of what needed `def macro` machinery in Scala 2 (and what [match types](/articles/scala-jvm/scala3-match-types) do at the type level) is now plain, readable code.
+In C, `inline` is a suggestion the compiler is free to ignore. In Scala 3, **`inline` is a language guarantee**: the call site is *always* replaced by the definition's body at compile time, or compilation fails. That firm semantics is what makes it a metaprogramming tool rather than an optimizer knob — because once the compiler is guaranteed to be looking at the expanded code, it can be asked to *evaluate* parts of it, branch on types, refine result types, and emit custom errors. A large slice of what needed `def macro` machinery in Scala 2 (and what [match types](/articles/scala-jvm/2026-08-04-scala3-match-types) do at the type level) is now plain, readable code.
 
 ## inline def and inline parameters
 
@@ -87,7 +87,7 @@ inline def sumOf[T <: Tuple]: Int =
 val six: 6 = sumOf[(1, 2, 3)]   // computed entirely at compile time
 ```
 
-This is exactly the pattern `Mirror`-based [typeclass derivation](/articles/scala-jvm/scala3-typeclass-derivation-mirror) uses to walk a case class's field types — no macro in sight, and the failure mode is a *readable custom error*, not an implicit-not-found wall.
+This is exactly the pattern `Mirror`-based [typeclass derivation](/articles/scala-jvm/2026-08-07-scala3-typeclass-derivation-mirror) uses to walk a case class's field types — no macro in sight, and the failure mode is a *readable custom error*, not an implicit-not-found wall.
 
 ## When you still want real macros
 

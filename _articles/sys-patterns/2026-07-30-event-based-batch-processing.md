@@ -18,13 +18,13 @@ sources:
     url: "https://cloud.google.com/pubsub/docs/building-pubsub-messaging-system"
 ---
 
-A [work queue](/articles/sys-patterns/work-queue-pattern) is one queue drained by interchangeable workers: every item gets the same treatment. But most real batch jobs aren't one step. You ingest raw events, drop the junk, enrich the survivors, partition by customer, and roll up per region. The naive move is to cram all of that into one program that loops over the input and does each step inline — a **monolithic batch job**.
+A [work queue](/articles/sys-patterns/2026-07-26-work-queue-pattern) is one queue drained by interchangeable workers: every item gets the same treatment. But most real batch jobs aren't one step. You ingest raw events, drop the junk, enrich the survivors, partition by customer, and roll up per region. The naive move is to cram all of that into one program that loops over the input and does each step inline — a **monolithic batch job**.
 
 Brendan Burns' **event-driven batch processing** pattern (Chapter 12 of *Designing Distributed Systems*, 2nd ed.) is the alternative: build each step as its own single-purpose stage, and wire the stages together with message queues, where *the output of one stage's queue is the input to the next*. The wiring — not the code inside any stage — is where the leverage is.
 
 ## The stages, and why the queue between them matters
 
-The reusable stages are the same vocabulary the [coordinated-batch article](/articles/sys-patterns/coordinated-batch-workflow) enumerated — **copier** (duplicate a stream to N consumers), **filter** (drop non-matching events), **splitter** (fan one event into several), **sharder** (route by key), **merger** (recombine streams). That article was about the *coordinated* case: a barrier and a reduce, where the final answer needs every shard done, mapped onto a DAG runtime.
+The reusable stages are the same vocabulary the [coordinated-batch article](/articles/sys-patterns/2026-07-27-coordinated-batch-workflow) enumerated — **copier** (duplicate a stream to N consumers), **filter** (drop non-matching events), **splitter** (fan one event into several), **sharder** (route by key), **merger** (recombine streams). That article was about the *coordinated* case: a barrier and a reduce, where the final answer needs every shard done, mapped onto a DAG runtime.
 
 This is the other case. Event-driven means there is **no orchestrator and no barrier**. Each stage is a long-lived consumer that reads from an input topic, does one transform, and publishes to an output topic. There is no central plan of the pipeline — the topology *is* the set of topic subscriptions. Burns' framing: chaining these queues together "allows for the construction of complicated event-driven workflows out of simple reusable components."
 

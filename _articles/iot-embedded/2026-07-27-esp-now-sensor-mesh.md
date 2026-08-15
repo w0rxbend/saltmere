@@ -16,7 +16,7 @@ sources:
     url: "https://developer.espressif.com/blog/2024/08/arduino-esp-now-lib/"
 ---
 
-In the [SEN5x + MQTT article](/articles/iot-embedded/sen5x-mqtt/) the node associated with an access point, waited for DHCP, opened a TCP socket, and did an MQTT handshake before a single PM2.5 reading left the board. For a mains-powered gateway that is fine. For a coin-cell or 18650 air-quality node that wakes once a minute, the association and DHCP dance can burn more energy than the measurement itself. ESP-NOW removes that whole stack.
+In the [SEN5x + MQTT article](/articles/iot-embedded/2026-07-24-esp32-sen5x-air-quality-mqtt/) the node associated with an access point, waited for DHCP, opened a TCP socket, and did an MQTT handshake before a single PM2.5 reading left the board. For a mains-powered gateway that is fine. For a coin-cell or 18650 air-quality node that wakes once a minute, the association and DHCP dance can burn more energy than the measurement itself. ESP-NOW removes that whole stack.
 
 ## What ESP-NOW actually is
 
@@ -80,7 +80,7 @@ void app_main(void) {
 
 ## How deep sleep rewrites the flow
 
-There is no persistent connection to keep alive, so the loop is stateless: **deep-sleep timer wakes the chip, `app_main` runs top to bottom, one frame goes out, the send callback confirms the ack, and the node sleeps again.** Nothing is retained between cycles except what you stash in RTC memory (a sequence counter is worth keeping there to detect drops). Contrast this with the association-per-wake pattern from the [ESP32 deep-sleep article](/articles/iot-embedded/esp32-deep-sleep/): here the radio is on for a single frame, not a multi-step handshake, so the awake window shrinks dramatically. Don't block waiting in `app_main` after `esp_now_send`; let the callback drive the transition to sleep so you never sleep before the frame is actually transmitted.
+There is no persistent connection to keep alive, so the loop is stateless: **deep-sleep timer wakes the chip, `app_main` runs top to bottom, one frame goes out, the send callback confirms the ack, and the node sleeps again.** Nothing is retained between cycles except what you stash in RTC memory (a sequence counter is worth keeping there to detect drops). Contrast this with the association-per-wake pattern from the [ESP32 deep-sleep article](/articles/iot-embedded/2026-07-26-esp32-deep-sleep-power/): here the radio is on for a single frame, not a multi-step handshake, so the awake window shrinks dramatically. Don't block waiting in `app_main` after `esp_now_send`; let the callback drive the transition to sleep so you never sleep before the frame is actually transmitted.
 
 ## The gateway: ESP-NOW to MQTT
 

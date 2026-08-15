@@ -18,7 +18,7 @@ sources:
     url: "https://fasterdata.es.net/host-tuning/linux/recent-tcp-enhancements/bbr-tcp/"
 ---
 
-Linux's default congestion control, **CUBIC**, belongs to the loss-based family: push more packets until one is dropped, back off, repeat. That heuristic has two failure modes baked in. On a path with **deep buffers**, the drop only happens after every queue is full, so CUBIC *operates* at maximum queue depth — that standing queue is **bufferbloat**, and it taxes every other flow's latency. On a path with **random loss** — WiFi, cellular, a long transatlantic link with a 0.1% loss floor — CUBIC treats every stray drop as congestion and halves its window, so a 10 Gbit pipe delivers a trickle. The [cake qdisc article](/articles/linux-tools/cake-qdisc-bufferbloat) attacked bufferbloat from the router side; **BBR** attacks it from the sender side.
+Linux's default congestion control, **CUBIC**, belongs to the loss-based family: push more packets until one is dropped, back off, repeat. That heuristic has two failure modes baked in. On a path with **deep buffers**, the drop only happens after every queue is full, so CUBIC *operates* at maximum queue depth — that standing queue is **bufferbloat**, and it taxes every other flow's latency. On a path with **random loss** — WiFi, cellular, a long transatlantic link with a 0.1% loss floor — CUBIC treats every stray drop as congestion and halves its window, so a 10 Gbit pipe delivers a trickle. The [cake qdisc article](/articles/linux-tools/2026-07-30-cake-qdisc-bufferbloat) attacked bufferbloat from the router side; **BBR** attacks it from the sender side.
 
 ## The model instead of the heuristic
 

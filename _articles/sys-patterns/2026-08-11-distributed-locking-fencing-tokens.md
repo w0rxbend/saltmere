@@ -34,7 +34,7 @@ Two clients wrote to the resource. Silent corruption.
 
 > "If the GC pause lasts longer than the lease expiry period, and the client doesn't realise that it has expired, it may go ahead and make some unsafe change."
 
-Checking the lease "am I still the holder?" right before writing does not save you, because the pause can land *between* the check and the write. No amount of tightening the lock protocol closes this, because the failure is on the client side of the wire. This is the same zombie-leader problem the [leader-election pattern](/articles/sys-patterns/leader-election-pattern) warns about, and the reason electing a single leader — whether via a lease or a [bully/ring election](/articles/distributed-systems/election-algorithms-bully-ring) — still isn't sufficient by itself.
+Checking the lease "am I still the holder?" right before writing does not save you, because the pause can land *between* the check and the write. No amount of tightening the lock protocol closes this, because the failure is on the client side of the wire. This is the same zombie-leader problem the [leader-election pattern](/articles/sys-patterns/2026-07-25-leader-election-pattern) warns about, and the reason electing a single leader — whether via a lease or a [bully/ring election](/articles/distributed-systems/2026-07-30-election-algorithms-bully-ring) — still isn't sufficient by itself.
 
 ## The Kleppmann vs antirez debate, fairly
 

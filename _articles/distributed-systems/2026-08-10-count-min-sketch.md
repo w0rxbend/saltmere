@@ -1,26 +1,36 @@
 ---
-title: "The Count-Min Sketch: Frequency Estimation in Sublinear Space"
+title: 'The Count-Min Sketch: Frequency Estimation in Sublinear Space'
 date: 2026-08-10
 track: distributed-systems
 summary: How a two-dimensional array of counters and d hash functions estimates how often you've seen a key using kilobytes instead of gigabytes, why it overestimates but never underestimates, the ε ≈ e/w error bound, the conservative-update trick, and how it powers TinyLFU cache admission and hot-key detection.
 reading_time: 6
 tags:
-  - count-min-sketch
-  - probabilistic-data-structures
-  - frequency-estimation
-  - tinylfu
-  - caching
+- count-min-sketch
+- probabilistic-data-structures
+- frequency-estimation
+- tinylfu
+- caching
+- streaming
+- heavy-hitters
 sources:
-  - title: "An Improved Data Stream Summary: The Count-Min Sketch and its Applications (Cormode & Muthukrishnan, 2005) — encyclopedia entry"
-    url: "http://dimacs.rutgers.edu/~graham/pubs/papers/encalgs-cm.pdf"
-  - title: "Count–min sketch — Wikipedia"
-    url: "https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch"
-  - title: "TinyLFU: A Highly Efficient Cache Admission Policy (Einziger, Friedman, Manes, 2017)"
-    url: "https://dl.acm.org/doi/10.1145/3149371"
-  - title: "W-TinyLFU Eviction Policy — Caffeine documentation"
-    url: "https://www.mintlify.com/ben-manes/caffeine/advanced/efficiency"
-  - title: "Count-Min Sketch with Conservative Updates: Worst-Case Analysis (arXiv 2405.12034)"
-    url: "https://arxiv.org/html/2405.12034v1"
+- title: 'An Improved Data Stream Summary: The Count-Min Sketch and its Applications (Cormode & Muthukrishnan, 2005) — encyclopedia entry'
+  url: http://dimacs.rutgers.edu/~graham/pubs/papers/encalgs-cm.pdf
+- title: Count–min sketch — Wikipedia
+  url: https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch
+- title: 'TinyLFU: A Highly Efficient Cache Admission Policy (Einziger, Friedman, Manes, 2017)'
+  url: https://dl.acm.org/doi/10.1145/3149371
+- title: W-TinyLFU Eviction Policy — Caffeine documentation
+  url: https://www.mintlify.com/ben-manes/caffeine/advanced/efficiency
+- title: 'Count-Min Sketch with Conservative Updates: Worst-Case Analysis (arXiv 2405.12034)'
+  url: https://arxiv.org/html/2405.12034v1
+- title: 'An Improved Data Stream Summary: The Count-Min Sketch and its Applications — Cormode & Muthukrishnan (J. Algorithms, 2005)'
+  url: http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf
+- title: Count-Min Sketch — Graham Cormode's project page
+  url: https://sites.google.com/site/countminsketch/
+- title: 'Count-Min Sketch: The Art and Science of Estimating Stuff — Redis Blog'
+  url: https://redis.io/blog/count-min-sketch-the-art-and-science-of-estimating-stuff/
+- title: Count-min sketch — Redis Documentation (CMS commands)
+  url: https://redis.io/docs/latest/develop/data-types/probabilistic/count-min-sketch/
 ---
 
 ## The problem: counting frequencies you can't afford to store

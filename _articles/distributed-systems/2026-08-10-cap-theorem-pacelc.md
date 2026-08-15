@@ -1,21 +1,32 @@
 ---
-title: "CAP and PACELC: the trade-off is C-vs-A only during a partition"
+title: 'CAP and PACELC: the trade-off is C-vs-A only during a partition'
 date: 2026-08-10
 track: distributed-systems
-summary: "CAP is not 'pick 2 of 3.' Partitions are not optional, so the only real choice CAP forces is consistency vs availability, and only while a partition is happening. PACELC fixes CAP's blind spot — the latency-vs-consistency trade-off you pay in the normal case. Here are precise definitions, Brewer's own walk-back, real system classifications, and how to answer 'is this CP or AP?' without hand-waving."
+summary: CAP is not 'pick 2 of 3.' Partitions are not optional, so the only real choice CAP forces is consistency vs availability, and only while a partition is happening. PACELC fixes CAP's blind spot — the latency-vs-consistency trade-off you pay in the normal case. Here are precise definitions, Brewer's own walk-back, real system classifications, and how to answer 'is this CP or AP?' without hand-waving.
 reading_time: 6
-tags: [cap-theorem, pacelc, consistency, availability, linearizability, abadi]
+tags:
+- cap-theorem
+- pacelc
+- consistency
+- availability
+- linearizability
+- abadi
+- latency
 sources:
-  - title: "Gilbert & Lynch, Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services (SIGACT News 2002)"
-    url: "https://www.comp.nus.edu.sg/~gilbert/pubs/BrewersConjecture-SigAct.pdf"
-  - title: "Brewer, CAP Twelve Years Later: How the 'Rules' Have Changed (IEEE Computer, 2012)"
-    url: "https://ieeexplore.ieee.org/document/6133253/"
-  - title: "Abadi, Consistency Tradeoffs in Modern Distributed Database System Design (IEEE Computer, 2012)"
-    url: "https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf"
-  - title: "Abadi, Problems with CAP, and Yahoo's little known NoSQL system (DBMS Musings, 2010)"
-    url: "https://dbmsmusings.blogspot.com/2010/04/problems-with-cap-and-yahoos-little.html"
-  - title: "PACELC design principle — Wikipedia"
-    url: "https://en.wikipedia.org/wiki/PACELC_design_principle"
+- title: Gilbert & Lynch, Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services (SIGACT News 2002)
+  url: https://www.comp.nus.edu.sg/~gilbert/pubs/BrewersConjecture-SigAct.pdf
+- title: 'Brewer, CAP Twelve Years Later: How the ''Rules'' Have Changed (IEEE Computer, 2012)'
+  url: https://ieeexplore.ieee.org/document/6133253/
+- title: Abadi, Consistency Tradeoffs in Modern Distributed Database System Design (IEEE Computer, 2012)
+  url: https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf
+- title: Abadi, Problems with CAP, and Yahoo's little known NoSQL system (DBMS Musings, 2010)
+  url: https://dbmsmusings.blogspot.com/2010/04/problems-with-cap-and-yahoos-little.html
+- title: PACELC design principle — Wikipedia
+  url: https://en.wikipedia.org/wiki/PACELC_design_principle
+- title: Gilbert & Lynch, Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services (ACM SIGACT News 33:2, 2002)
+  url: https://www.cs.princeton.edu/courses/archive/spr22/cos418/papers/cap.pdf
+- title: 'Brewer, CAP Twelve Years Later: How the "Rules" Have Changed (IEEE Computer, Feb 2012)'
+  url: https://sites.cs.ucsb.edu/~rich/class/cs293b-cloud/papers/brewer-cap.pdf
 ---
 
 Almost everything said about CAP in interviews is subtly wrong. "You can only have two of three" is a slogan that survives because it rhymes, not because it's accurate. Let me state the theorem precisely, kill the misconception, and then show the framework that actually captures the trade-off most systems make in production — PACELC.
@@ -84,3 +95,20 @@ Do not answer the label first. Answer the *mechanism*, then let the label fall o
 And keep the caveat ready: real systems are **tunable and per-operation**. Cassandra with `QUORUM`/`QUORUM` behaves far more like CP than the same cluster at `ONE`/`ONE`. The honest answer names the default and the knob.
 
 **Try next:** take a system you run and place it on the PACELC grid twice — once at its default settings, once at its strongest-consistency settings — and write the one-sentence justification for each cell. Then force a partition in a test cluster (drop traffic between two nodes with `iptables`) and observe which of C or A your reads and writes actually give up; compare that to the label you predicted.
+
+## A worked example: reading PACELC off a quorum config
+
+PACELC labels aren't fixed per product — for tunable stores they're a config decision. Cassandra with `N=3` replicas:
+
+```yaml
+# EC end: writes and reads intersect (R + W > N), linearizable-ish reads
+replication_factor: 3
+write_consistency: QUORUM   # W = 2
+read_consistency:  QUORUM   # R = 2   ->  R + W = 4 > 3, overlap guaranteed
+
+# EL end: same cluster, favor latency, accept staleness
+write_consistency: ONE      # W = 1
+read_consistency:  ONE      # R = 1   ->  R + W = 2 < 3, may read stale
+```
+
+The first block buys `EC`: every read set intersects the last write set, so you don't return stale data — at the cost of waiting for two nodes. The second buys `EL`: one-node round trips, lowest latency, no overlap guarantee. Same binary shows up under partition: with `QUORUM` writes, the minority side (1 of 3 nodes) can't reach `W=2` and *refuses* writes — that's leaning `PC`. With `ONE`, the lone node keeps accepting — that's `PA`. One knob moves you across both halves of PACELC.

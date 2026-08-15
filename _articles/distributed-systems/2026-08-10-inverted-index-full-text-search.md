@@ -1,26 +1,35 @@
 ---
-title: "The Inverted Index and Full-Text Search: How Lucene and Elasticsearch Actually Work"
+title: 'The Inverted Index and Full-Text Search: How Lucene and Elasticsearch Actually Work'
 date: 2026-08-10
 track: distributed-systems
-summary: "\"Design search\" is a system-design staple, and the whole thing rests on one data structure: the inverted index that maps each term to a postings list of doc ids. This walks the index and its positions for phrase queries, the analysis pipeline you must apply identically at index and query time, relevance ranking from TF-IDF to BM25 (the Lucene/Elasticsearch default since 2016) with the k1 saturation and b length-normalization knobs, and how Lucene builds immutable segments that merge like an LSM-tree. Includes a ~30-line Python inverted index plus BM25 scorer and a positional phrase query."
+summary: '"Design search" is a system-design staple, and the whole thing rests on one data structure: the inverted index that maps each term to a postings list of doc ids. This walks the index and its positions for phrase queries, the analysis pipeline you must apply identically at index and query time, relevance ranking from TF-IDF to BM25 (the Lucene/Elasticsearch default since 2016) with the k1 saturation and b length-normalization knobs, and how Lucene builds immutable segments that merge like an LSM-tree. Includes a ~30-line Python inverted index plus BM25 scorer and a positional phrase query.'
 reading_time: 6
 tags:
-  - inverted-index
-  - full-text-search
-  - bm25
-  - lucene
-  - elasticsearch
+- inverted-index
+- full-text-search
+- bm25
+- lucene
+- elasticsearch
+- search
 sources:
-  - title: "Practical BM25 - Part 2: The BM25 Algorithm and its Variables (Elastic Blog)"
-    url: "https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables"
-  - title: "Practical BM25 - Part 3: Considerations for Picking b and k1 in Elasticsearch (Elastic Blog)"
-    url: "https://www.elastic.co/blog/practical-bm25-part-3-considerations-for-picking-b-and-k1-in-elasticsearch"
-  - title: "Robertson & Zaragoza — The Probabilistic Relevance Framework: BM25 and Beyond"
-    url: "https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf"
-  - title: "LUCENE-6789: change IndexSearcher default similarity to BM25 (ASF Jira)"
-    url: "https://issues.apache.org/jira/browse/LUCENE-6789"
-  - title: "BM25Similarity (Apache Lucene core API)"
-    url: "https://lucene.apache.org/core/8_2_0/core/org/apache/lucene/search/similarities/BM25Similarity.html"
+- title: 'Practical BM25 - Part 2: The BM25 Algorithm and its Variables (Elastic Blog)'
+  url: https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables
+- title: 'Practical BM25 - Part 3: Considerations for Picking b and k1 in Elasticsearch (Elastic Blog)'
+  url: https://www.elastic.co/blog/practical-bm25-part-3-considerations-for-picking-b-and-k1-in-elasticsearch
+- title: 'Robertson & Zaragoza — The Probabilistic Relevance Framework: BM25 and Beyond'
+  url: https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf
+- title: 'LUCENE-6789: change IndexSearcher default similarity to BM25 (ASF Jira)'
+  url: https://issues.apache.org/jira/browse/LUCENE-6789
+- title: BM25Similarity (Apache Lucene core API)
+  url: https://lucene.apache.org/core/8_2_0/core/org/apache/lucene/search/similarities/BM25Similarity.html
+- title: 'Robertson & Zaragoza, The Probabilistic Relevance Framework: BM25 and Beyond (FnTIR, 2009)'
+  url: https://dl.acm.org/doi/abs/10.1561/1500000019
+- title: Elastic blog — Elasticsearch from the Top Down (segments, distributed search)
+  url: https://www.elastic.co/blog/found-elasticsearch-top-down
+- title: Apache Lucene — Core News (release history)
+  url: https://lucene.apache.org/core/corenews.html
+- title: quickwit-oss/tantivy — full-text search engine library in Rust
+  url: https://github.com/quickwit-oss/tantivy
 ---
 
 Ask a candidate to "design a search feature" and the weak answer reaches for `WHERE body LIKE '%quick brown%'`. That scan reads every row, matches raw bytes, can't rank results, and can't use an index — it's O(rows × doc length) on every query. The strong answer names the data structure the whole field is built on: the **inverted index**. Lucene — the library under Elasticsearch, OpenSearch, and Solr — is one very good implementation of it. This is what's happening under the hood.
@@ -131,3 +140,13 @@ The last piece is *how the index is built at scale*, and it mirrors storage engi
 Left alone, segment count would explode and every query would touch hundreds of files, so a background **merge** policy periodically combines small segments into fewer larger ones, physically dropping tombstoned docs along the way. Buffer in memory → flush immutable sorted runs → merge in the background, trading write amplification for fast reads: that is precisely the **[LSM-tree](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees)** shape, with segments playing the role of SSTables and merge playing compaction. Recognizing that a search index and a RocksDB store are the same idea in different clothes is exactly the kind of connection interviewers are listening for.
 
 **Try next:** run the code above, then bump `k1` from 1.2 to 3.0 and re-score `quick brown` — watch doc 2's lead over doc 1 widen as repeated `quick` gets rewarded more; then set `b = 0` and see the length penalty on the longer doc 2 disappear.
+
+## Distributed search: shard by document, scatter-gather
+
+Elasticsearch/OpenSearch partition an index **by document**: each doc is routed to one shard (a full Lucene index) by hash of its ID — consistent with the partitioning schemes covered elsewhere in this track. A query can't be routed, so it fans out:
+
+1. **Query phase (scatter):** the coordinating node sends the query to one copy of every shard; each returns its local top-k as `(doc_id, score)` — no documents yet.
+2. **Merge:** the coordinator heap-merges N shards × k entries into a global top-k.
+3. **Fetch phase (gather):** it fetches the actual `_source` for only those winners from the shards that own them.
+
+Two classic gotchas: deep pagination (`from=10000` forces every shard to return 10 010 candidates — hence `search_after`), and per-shard IDF — each shard computes BM25 from its own statistics, so scores can differ for identical docs on differently-populated shards. With realistic shard sizes term statistics even out; Elastic's Practical BM25 series shows the small-index case where they don't.

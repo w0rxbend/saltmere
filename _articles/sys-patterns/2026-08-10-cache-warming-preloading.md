@@ -78,7 +78,7 @@ LoadingCache<Key, Graph> graphs = Caffeine.newBuilder()
     .build(key -> loadExpensiveGraph(key));      // CacheLoader for load AND async refresh
 ```
 
-Combining `refreshAfterWrite` (short) with `expireAfterWrite` (longer) gives the best of both: hot keys, which get queried, are refreshed silently and never expire under load; cold keys, which aren't queried, eventually hard-expire and free memory. Override `CacheLoader.reload(key, oldValue)` if you want refresh to reuse the previous value (e.g. batch reloads, or serve-stale-on-error — Caffeine keeps the old value if the reload throws). This is the pattern the [caching strategies overview](/articles/sys-patterns/) recommends whenever recompute is expensive and staleness of a few seconds is acceptable.
+Combining `refreshAfterWrite` (short) with `expireAfterWrite` (longer) gives the best of both: hot keys, which get queried, are refreshed silently and never expire under load; cold keys, which aren't queried, eventually hard-expire and free memory. Override `CacheLoader.reload(key, oldValue)` if you want refresh to reuse the previous value (e.g. batch reloads, or serve-stale-on-error — Caffeine keeps the old value if the reload throws). This is the pattern the [caching strategies overview](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/) recommends whenever recompute is expensive and staleness of a few seconds is acceptable.
 
 ## Strategy 3: Staged traffic ramp after failover
 

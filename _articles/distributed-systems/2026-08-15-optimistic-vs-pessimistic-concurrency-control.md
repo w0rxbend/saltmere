@@ -1,19 +1,38 @@
 ---
-title: "Optimistic vs Pessimistic Concurrency Control: 2PL, OCC, and When Each Wins"
+title: 'Optimistic vs Pessimistic Concurrency Control: 2PL, OCC, and When Each Wins'
 date: 2026-08-15
 track: distributed-systems
-summary: "Pessimistic control (two-phase locking) assumes conflict and blocks up front; optimistic control (OCC) assumes no conflict and checks at commit, aborting the loser. The right choice is a bet on your contention level. Here's strict 2PL and its deadlocks, the read/validate/write phases of Kung & Robinson's 1981 OCC, where MVCC sits between them, and a pseudocode of OCC backward validation."
+summary: Pessimistic control (two-phase locking) assumes conflict and blocks up front; optimistic control (OCC) assumes no conflict and checks at commit, aborting the loser. The right choice is a bet on your contention level. Here's strict 2PL and its deadlocks, the read/validate/write phases of Kung & Robinson's 1981 OCC, where MVCC sits between them, and a pseudocode of OCC backward validation.
 reading_time: 6
-tags: [concurrency-control, two-phase-locking, occ, mvcc, serializability]
+tags:
+- concurrency-control
+- two-phase-locking
+- occ
+- mvcc
+- serializability
+- 2pl
+- compare-and-swap
+- etag
+- transactions
 sources:
-  - title: "Kung & Robinson, On Optimistic Methods for Concurrency Control (ACM TODS, 1981)"
-    url: "https://dl.acm.org/doi/10.1145/319566.319567"
-  - title: "PostgreSQL docs — Introduction to Multiversion Concurrency Control (MVCC)"
-    url: "https://www.postgresql.org/docs/current/mvcc-intro.html"
-  - title: "Databricks — Concurrency Control: locking, MVCC, and optimistic strategies"
-    url: "https://www.databricks.com/blog/concurrency-control"
-  - title: "Ziqi Wang — Analyzing Optimistic Concurrency Control Anomalies and Solutions"
-    url: "https://wangziqi2013.github.io/article/2018/03/21/Analyzing-OCC-Anomalies-and-Solutions.html"
+- title: Kung & Robinson, On Optimistic Methods for Concurrency Control (ACM TODS, 1981)
+  url: https://dl.acm.org/doi/10.1145/319566.319567
+- title: PostgreSQL docs — Introduction to Multiversion Concurrency Control (MVCC)
+  url: https://www.postgresql.org/docs/current/mvcc-intro.html
+- title: 'Databricks — Concurrency Control: locking, MVCC, and optimistic strategies'
+  url: https://www.databricks.com/blog/concurrency-control
+- title: Ziqi Wang — Analyzing Optimistic Concurrency Control Anomalies and Solutions
+  url: https://wangziqi2013.github.io/article/2018/03/21/Analyzing-OCC-Anomalies-and-Solutions.html
+- title: Kung & Robinson — On Optimistic Methods for Concurrency Control (ACM TODS, 1981)
+  url: https://www.cs.cmu.edu/~dga/15-712/F07/lectures/12-optimism.pdf
+- title: Optimistic concurrency control (Wikipedia)
+  url: https://en.wikipedia.org/wiki/Optimistic_concurrency_control
+- title: RFC 9110 §13.1.1 / §8.8 — If-Match, ETag, and conditional requests
+  url: https://www.rfc-editor.org/rfc/rfc9110#name-if-match
+- title: HTTP conditional requests (MDN)
+  url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Conditional_requests
+- title: Handling Optimistic Concurrency with ETags (Ed-Fi Alliance)
+  url: https://docs.ed-fi.org/reference/data-exchange/api-guidelines/design-and-implementation-guidelines/api-implementation-guidelines/handling-optimistic-concurrency-with-etags/
 ---
 
 Two transactions want the same rows. You can assume they will collide and make each one grab locks before it touches anything — **pessimistic** control — or you can assume collisions are rare, let both run full speed against private copies, and check for a conflict only at commit — **optimistic** control. That single bet drives everything downstream: pessimistic control pays with blocking and deadlocks, optimistic control pays with wasted work and aborts. This is a different axis from isolation *levels*; a system picks a control strategy first, then the anomalies it forbids fall out of how strictly that strategy is applied.
@@ -77,3 +96,18 @@ The deciding variable is **contention**. Under low contention, most OCC validati
 The honest caveat: nobody ships a pure version of either. Production databases layer MVCC for reads, locks or optimistic validation for writes, and tune the mix to the workload — so "is this database optimistic or pessimistic?" almost always answers *both, in different places*.
 
 **Try next:** open two `psql` sessions and force a deadlock (each updates two rows in opposite order) to watch Postgres detect the cycle and abort a victim with SQLSTATE `40P01`; then rerun at `SERIALIZABLE` and trigger an optimistic `40001` abort instead — same conflict, opposite strategy.
+
+## Same bet at the API layer: ETag + If-Match
+
+The pattern isn't database-only. HTTP gives you OCC across stateless clients via conditional requests (RFC 9110). A `GET` returns an `ETag` — an opaque version token for that resource. The client echoes it back on write in `If-Match`; the server applies the change only if the current ETag still matches, else returns **412 Precondition Failed**.
+
+```http
+GET /accounts/42            -> 200  ETag: "v7"
+PUT /accounts/42            If-Match: "v7"
+   -> 200 (ETag now "v8")   if unchanged
+   -> 412 Precondition Failed   if another writer already moved it to "v8"
+```
+
+A 412 is the HTTP version of `rows affected = 0`: re-fetch, reconcile, retry. Same three phases, same optimistic bet — just stretched across a network with no server-side lock held between read and write. Which is exactly why it scales for lost-update prevention on public APIs, where holding a lock across a client's think-time would be a denial-of-service waiting to happen.
+
+**Try next:** add a `version integer` column, spin up two clients that read version 7 and both try the conditional `UPDATE`. Confirm exactly one gets `rows affected = 1`; make the loser re-read and retry, then crank concurrency until aborts dominate and you can see OCC's high-contention cliff.

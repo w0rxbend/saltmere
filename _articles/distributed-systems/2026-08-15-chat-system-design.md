@@ -24,7 +24,7 @@ Start the interview by splitting the problem: a **connection layer** (long-lived
 
 ## Connection layer
 
-Clients hold one **WebSocket** to a gateway (transport trade-offs are in [the WebSocket/SSE article](/articles/sys-patterns/2026-08-13-websocket-sse-long-polling-realtime)); the gateway is the only stateful edge piece. It maintains:
+Clients hold one **WebSocket** to a gateway (transport trade-offs are in [the WebSocket/SSE article](/articles/microservices/2026-08-10-realtime-websocket-sse-longpoll)); the gateway is the only stateful edge piece. It maintains:
 
 - **Session registry:** `user_id → {gateway, device_id}` in a shared store (Redis, or Slack-style consistent hashing so a conversation's server is computable). Routing a message to a user = look up their gateway, forward.
 - **Presence heartbeats:** client pings every ~30 s; the registry entry carries a TTL of ~2 missed heartbeats, so "online" is just "registry key exists." Broadcast presence changes lazily and only to conversations currently on screen — presence fan-out at Slack-scale is *more* traffic than messages, which is why Slack moved clients to subscription-based presence instead of pushing everyone's status to everyone.

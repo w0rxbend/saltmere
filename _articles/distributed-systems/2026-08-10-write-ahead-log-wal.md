@@ -1,26 +1,34 @@
 ---
-title: "Write-Ahead Logging: How Databases Survive a Crash Mid-Update"
+title: 'Write-Ahead Logging: How Databases Survive a Crash Mid-Update'
 date: 2026-08-10
 track: distributed-systems
 summary: A crash in the middle of updating a data page leaves that page half-written and the database corrupt. Write-ahead logging fixes this with one rule — describe the change in a sequential, append-only log and fsync it BEFORE touching the data page ("log first"). This walks the durability problem, the WAL rule, redo vs undo logging, the LSN, checkpoints and ARIES-style analysis→redo→undo recovery, group commit's throughput-vs-latency trade, the torn-page problem and Postgres full_page_writes, and how the same log becomes the source for replication and CDC. Includes a minimal append-only WAL plus replay.
 reading_time: 6
 tags:
-  - write-ahead-log
-  - durability
-  - crash-recovery
-  - aries
-  - databases
+- write-ahead-log
+- durability
+- crash-recovery
+- aries
+- databases
+- wal
+- postgres
 sources:
-  - title: "ARIES: A Transaction Recovery Method... Using Write-Ahead Logging (Mohan, Haderle, Lindsay, Pirahesh, Schwarz, ACM TODS 1992)"
-    url: "https://web.stanford.edu/class/cs345d-01/rl/aries.pdf"
-  - title: "PostgreSQL Documentation: 28.3. Write-Ahead Logging (WAL) — Introduction"
-    url: "https://www.postgresql.org/docs/current/wal-intro.html"
-  - title: "PostgreSQL Documentation: 28.1. Reliability (torn pages, full_page_writes)"
-    url: "https://www.postgresql.org/docs/current/wal-reliability.html"
-  - title: "PostgreSQL Documentation: 19.5. Write Ahead Log (commit_delay, group commit, wal_sync_method)"
-    url: "https://www.postgresql.org/docs/current/runtime-config-wal.html"
-  - title: "Write-ahead logging and the ARIES crash recovery algorithm (Kevin Sookocheff)"
-    url: "https://sookocheff.com/post/databases/write-ahead-logging/"
+- title: 'ARIES: A Transaction Recovery Method... Using Write-Ahead Logging (Mohan, Haderle, Lindsay, Pirahesh, Schwarz, ACM TODS 1992)'
+  url: https://web.stanford.edu/class/cs345d-01/rl/aries.pdf
+- title: 'PostgreSQL Documentation: 28.3. Write-Ahead Logging (WAL) — Introduction'
+  url: https://www.postgresql.org/docs/current/wal-intro.html
+- title: 'PostgreSQL Documentation: 28.1. Reliability (torn pages, full_page_writes)'
+  url: https://www.postgresql.org/docs/current/wal-reliability.html
+- title: 'PostgreSQL Documentation: 19.5. Write Ahead Log (commit_delay, group commit, wal_sync_method)'
+  url: https://www.postgresql.org/docs/current/runtime-config-wal.html
+- title: Write-ahead logging and the ARIES crash recovery algorithm (Kevin Sookocheff)
+  url: https://sookocheff.com/post/databases/write-ahead-logging/
+- title: 'Mohan et al., ARIES: A Transaction Recovery Method (ACM TODS, 1992)'
+  url: https://dl.acm.org/doi/10.1145/128765.128770
+- title: Hironobu Suzuki, The Internals of PostgreSQL — Ch. 9, WAL
+  url: https://www.interdb.jp/pg/pgsql09.html
+- title: RocksDB wiki — Write Ahead Log File Format
+  url: https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-File-Format
 ---
 
 "How does your database survive `kill -9` in the middle of a write?" is a question with exactly one production answer, and every relational engine — PostgreSQL, InnoDB, SQLite, Oracle — gives the same one. This is the write-ahead log.
@@ -118,3 +126,17 @@ One more payoff: because the WAL is a complete, ordered record of *every* change
 For where the WAL sits inside the storage engine, see [LSM-Trees vs B-Trees](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees) — both lean on a WAL for durability. For building pipelines on top of the log, see [Debezium change data capture](/articles/microservices/2026-07-31-debezium-change-data-capture).
 
 **Try next:** disable `full_page_writes` on a scratch Postgres, pull the plug (or `kill -9` mid-`pgbench`), and see whether recovery still succeeds — then turn it back on and watch the WAL volume spike right after each checkpoint.
+
+## WAL vs command logging
+
+| | Physical/physiological WAL (ARIES, Postgres) | Command logging (VoltDB-style) |
+|---|---|---|
+| What's logged | Page/tuple-level effects (before+after images) | The transaction's command + parameters |
+| Log volume | Larger | Tiny |
+| Recovery | Fast: apply effects, no re-execution | Slow: re-execute every command since snapshot |
+| Requirement | None special | Commands must be **deterministic** |
+| Fits | General-purpose, ad-hoc SQL | In-memory stores with stored-procedure workloads |
+
+Command logging is a legitimate answer to "can we log less?" — but the moment a transaction reads the clock, a random number, or interleaves nondeterministically, replay diverges. That determinism requirement is the same one Raft-style replicated state machines impose, which is no coincidence: a replicated log and a recovery log are the same idea pointed at different failure modes.
+
+**Try next:** set `synchronous_commit = off` on a scratch Postgres, run `pgbench` before and after, and watch commit throughput jump while `pg_stat_wal` shows identical WAL volume — then read `pg_waldump` output for one of your own transactions.

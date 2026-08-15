@@ -63,7 +63,7 @@ A flame graph stacks call frames vertically: the bottom bar is the entry point, 
 
 ## eBPF: profiling without touching the code
 
-SDKs are great for your own services but useless for a Postgres process, an nginx sidecar, or a binary you can't rebuild. This is where **eBPF** whole-system profiling comes in — the same kernel technology behind the auto-instrumentation covered in the journal's [Beyla](/articles/observability/beyla) and [Alloy](/articles/observability/alloy) pieces. An eBPF profiler samples stacks in the kernel across *every* process on the host, no code changes and no restarts.
+SDKs are great for your own services but useless for a Postgres process, an nginx sidecar, or a binary you can't rebuild. This is where **eBPF** whole-system profiling comes in — the same kernel technology behind the auto-instrumentation covered in the journal's [Beyla](/articles/observability/2026-07-24-ebpf-zero-code-instrumentation-beyla-obi) and [Alloy](/articles/observability/2026-07-26-grafana-alloy-collector) pieces. An eBPF profiler samples stacks in the kernel across *every* process on the host, no code changes and no restarts.
 
 Grafana [Alloy](https://grafana.com/docs/alloy/latest/reference/components/pyroscope/pyroscope.ebpf/) ships a `pyroscope.ebpf` component that does exactly this and forwards the profiles to a Pyroscope backend:
 

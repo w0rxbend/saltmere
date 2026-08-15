@@ -53,6 +53,12 @@ jobs:
       - name: Check articles for unescaped Liquid
         run: python3 tools/check_liquid.py
 
+      # The publishing job has no memory across runs and periodically re-covers
+      # a subject under a slightly different slug. An exact slug collision fails
+      # here; softer topic overlap is printed for a human to judge.
+      - name: Check articles for duplicate topics
+        run: python3 tools/check_duplicates.py
+
       - name: Build with Jekyll
         # Outputs to the './_site' directory by default
         run: bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}"

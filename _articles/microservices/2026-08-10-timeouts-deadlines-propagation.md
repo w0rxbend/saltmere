@@ -1,19 +1,36 @@
 ---
-title: "Timeouts and Deadline Propagation: Spend a Time Budget, Not a Guess"
+title: 'Timeouts and Deadline Propagation: Spend a Time Budget, Not a Guess'
 date: 2026-08-10
 track: microservices
-summary: "Every remote call needs a timeout, or one hung dependency drains your thread pool and takes the whole fleet down. But a per-attempt timeout isn't enough: you need an overall deadline, propagated down every hop, so a downstream service stops working on a request its caller already abandoned."
+summary: 'Every remote call needs a timeout, or one hung dependency drains your thread pool and takes the whole fleet down. But a per-attempt timeout isn''t enough: you need an overall deadline, propagated down every hop, so a downstream service stops working on a request its caller already abandoned.'
 reading_time: 6
-tags: [timeouts, deadlines, resiliency, grpc, go, context, backpressure]
+tags:
+- timeouts
+- deadlines
+- resiliency
+- grpc
+- go
+- context
+- backpressure
+- context-cancellation
+- tail-latency
 sources:
-  - title: "gRPC — Deadlines guide"
-    url: "https://grpc.io/docs/guides/deadlines/"
-  - title: "Amazon Builders' Library — Timeouts, retries, and backoff with jitter (Marc Brooker)"
-    url: "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter"
-  - title: "Go — context package documentation"
-    url: "https://pkg.go.dev/context"
-  - title: "Microsoft Learn — Reliable gRPC services with deadlines and cancellation"
-    url: "https://learn.microsoft.com/en-us/aspnet/core/grpc/deadlines-cancellation"
+- title: gRPC — Deadlines guide
+  url: https://grpc.io/docs/guides/deadlines/
+- title: Amazon Builders' Library — Timeouts, retries, and backoff with jitter (Marc Brooker)
+  url: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter
+- title: Go — context package documentation
+  url: https://pkg.go.dev/context
+- title: Microsoft Learn — Reliable gRPC services with deadlines and cancellation
+  url: https://learn.microsoft.com/en-us/aspnet/core/grpc/deadlines-cancellation
+- title: gRPC over HTTP/2 (PROTOCOL-HTTP2) — grpc-timeout
+  url: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
+- title: Google SRE Book — Addressing Cascading Failures
+  url: https://sre.google/sre-book/addressing-cascading-failures/
+- title: 'Go Blog — Go Concurrency Patterns: Context'
+  url: https://go.dev/blog/context
+- title: Marc Brooker (AWS) — Timeouts, retries, and backoff with jitter
+  url: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
 ---
 
 Ask an interviewer to name the cheapest resiliency bug you can ship and they'll often land here: a remote call with no timeout. It looks harmless in code review — the happy path works, latency is fine in staging. Then one afternoon a dependency gets slow instead of failing, and every thread that calls it parks, waiting forever. The [Amazon Builders' Library](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter) puts it plainly: when a request hangs, the client keeps holding "memory, threads, connections, [and] ephemeral ports," and "when a number of requests hold on to resources for a long time, the server can run out of those resources." That is how a single slow dependency cascades into a full outage — not by crashing, but by never letting go.

@@ -50,7 +50,7 @@ A *storage* decision, not an integration one: the append-only log of events **is
 
 ## 4. CQRS
 
-Separate models for writing and reading — commands mutate a write model, queries hit denormalized read models kept in sync (often by events, not necessarily). It's the only one of the four that isn't inherently about events at all; it just pairs well with them. Details in [CQRS: one model to change, another to read](/articles/microservices/2026-08-11-cqrs-read-write-models/). Fowler's caution: used judiciously it's valuable, used as a default it adds "a lot of complexity for little gain."
+Separate models for writing and reading — commands mutate a write model, queries hit denormalized read models kept in sync (often by events, not necessarily). It's the only one of the four that isn't inherently about events at all; it just pairs well with them. Details in [CQRS: one model to change, another to read](/articles/microservices/2026-08-10-cqrs-read-models/). Fowler's caution: used judiciously it's valuable, used as a default it adds "a lot of complexity for little gain."
 
 ## The comparison table
 

@@ -1,26 +1,34 @@
 ---
-title: "LSM-Trees vs B-Trees: The Two Storage Engines Under Every Database"
+title: 'LSM-Trees vs B-Trees: The Two Storage Engines Under Every Database'
 date: 2026-08-10
 track: distributed-systems
 summary: Every OLTP database picks one of two on-disk shapes. B-trees update pages in place, keep everything sorted for cheap reads and range scans, and lean on a write-ahead log for crash safety — the engine under PostgreSQL and InnoDB. LSM-trees buffer writes in a memtable, flush immutable sorted SSTables, and merge them in the background — the engine under RocksDB, Cassandra, and LevelDB. This walks the mechanics of both, the three amplifications (write / read / space) each one trades, a concrete LSM write→flush→compaction and read path, and how to pick.
 reading_time: 6
 tags:
-  - lsm-tree
-  - b-tree
-  - storage-engines
-  - databases
-  - compaction
+- lsm-tree
+- b-tree
+- storage-engines
+- databases
+- compaction
+- rocksdb
+- bloom-filter
 sources:
-  - title: "Designing Data-Intensive Applications, Ch.3 (Kleppmann) — Storage and Retrieval"
-    url: "https://dataintensive.net/"
-  - title: "The Log-Structured Merge-Tree (O'Neil, Cheng, Gawlick, O'Neil, Acta Informatica 1996)"
-    url: "https://www.cs.umb.edu/~poneil/lsmtree.pdf"
-  - title: "Compaction — facebook/rocksdb Wiki"
-    url: "https://github.com/facebook/rocksdb/wiki/Compaction"
-  - title: "Leveled Compaction — facebook/rocksdb Wiki"
-    url: "https://github.com/facebook/rocksdb/wiki/Leveled-Compaction"
-  - title: "Read, write & space amplification — B-Tree vs LSM (Mark Callaghan, Small Datum)"
-    url: "http://smalldatum.blogspot.com/2015/11/read-write-space-amplification-b-tree.html"
+- title: Designing Data-Intensive Applications, Ch.3 (Kleppmann) — Storage and Retrieval
+  url: https://dataintensive.net/
+- title: The Log-Structured Merge-Tree (O'Neil, Cheng, Gawlick, O'Neil, Acta Informatica 1996)
+  url: https://www.cs.umb.edu/~poneil/lsmtree.pdf
+- title: Compaction — facebook/rocksdb Wiki
+  url: https://github.com/facebook/rocksdb/wiki/Compaction
+- title: Leveled Compaction — facebook/rocksdb Wiki
+  url: https://github.com/facebook/rocksdb/wiki/Leveled-Compaction
+- title: Read, write & space amplification — B-Tree vs LSM (Mark Callaghan, Small Datum)
+  url: http://smalldatum.blogspot.com/2015/11/read-write-space-amplification-b-tree.html
+- title: The Log-Structured Merge-Tree (LSM-Tree) — O'Neil, Cheng, Gawlick, O'Neil (Acta Informatica, 1996)
+  url: https://dl.acm.org/doi/10.1007/s002360050048
+- title: 'Designing Access Methods: The RUM Conjecture — Athanassoulis et al. (EDBT 2016)'
+  url: https://stratos.seas.harvard.edu/publications/designing-access-methods-rum-conjecture
+- title: 'Compaction Series: Space Amplification in Size-Tiered Compaction (ScyllaDB)'
+  url: https://www.scylladb.com/2018/01/17/compaction-series-space-amplification/
 ---
 
 "How does your database store a row on disk?" is really an invitation to pick a side in a decades-old argument. Two answers are in production use, and both solve the same problem: durably persist sorted key-value pairs on a device that is slow at random I/O. The **B-tree** keeps data sorted in fixed-size pages and mutates them in place. The **LSM-tree** never mutates anything — it appends, then merges. Understanding *why* those philosophies diverge, and what each one costs, is the whole interview.
@@ -90,3 +98,15 @@ Every engine trades three quantities (Mark Callaghan's framing on *Small Datum* 
 - **The honest caveat:** modern engines blur the line — RocksDB tunes across the whole amplification triangle, and B-tree engines add compression. The interview answer is not "LSM is faster" — it's "which amplification can this workload afford to pay?"
 
 **Try next:** trace a `DELETE` through an LSM-tree and explain how a tombstone can resurrect a key if compaction and a stale replica race — then connect it to why range tombstones exist.
+
+## The three amplifications and the RUM conjecture
+
+Storage engines are judged on three overheads. You can improve two by paying in the third — the point of the **RUM conjecture** (Athanassoulis et al., EDBT 2016): read, update, and memory overheads cannot all be minimized at once.
+
+| | Write amplification | Read amplification | Space amplification |
+|---|---|---|---|
+| **B-tree** | High (random page rewrites + WAL) | Low (one traversal) | Low–moderate (fragmentation, ~⅔ page fill) |
+| **LSM leveled** | High (repeated re-merges) | Moderate (probe several levels) | Low (RocksDB keeps ~90% of data in the last level) |
+| **LSM size-tiered** | Low | High (many overlapping runs) | High (up to ~2× transient, worse on overwrites) |
+
+Note the LSM row isn't one thing — the compaction strategy picks where on the curve you sit.

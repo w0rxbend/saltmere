@@ -1,26 +1,37 @@
 ---
-title: "Real-Time to the Browser: Polling vs SSE vs WebSockets"
+title: 'Real-Time to the Browser: Polling vs SSE vs WebSockets'
 date: 2026-08-10
 track: microservices
 summary: The "design a live feed / chat / notifications" interview asks one thing under the hood — how do bytes get from server to client without a page refresh? Short polling, long polling, Server-Sent Events, and WebSockets, compared by direction, transport, overhead, reconnection, and proxy-friendliness, with a decision table and working snippets.
 reading_time: 6
 tags:
-  - realtime
-  - websocket
-  - sse
-  - http
-  - scaling
+- realtime
+- websocket
+- sse
+- http
+- scaling
+- server-sent-events
+- long-polling
+- system-design
 sources:
-  - title: "Using server-sent events (MDN Web Docs)"
-    url: "https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events"
-  - title: "EventSource (MDN Web Docs)"
-    url: "https://developer.mozilla.org/en-US/docs/Web/API/EventSource"
-  - title: "Server-sent events (WHATWG HTML Standard, §9.2)"
-    url: "https://html.spec.whatwg.org/multipage/server-sent-events.html"
-  - title: "RFC 6455 — The WebSocket Protocol"
-    url: "https://www.rfc-editor.org/rfc/rfc6455.html"
-  - title: "The WebSockets API (MDN Web Docs)"
-    url: "https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API"
+- title: Using server-sent events (MDN Web Docs)
+  url: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
+- title: EventSource (MDN Web Docs)
+  url: https://developer.mozilla.org/en-US/docs/Web/API/EventSource
+- title: Server-sent events (WHATWG HTML Standard, §9.2)
+  url: https://html.spec.whatwg.org/multipage/server-sent-events.html
+- title: RFC 6455 — The WebSocket Protocol
+  url: https://www.rfc-editor.org/rfc/rfc6455.html
+- title: The WebSockets API (MDN Web Docs)
+  url: https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API
+- title: RFC 6455 — The WebSocket Protocol
+  url: https://datatracker.ietf.org/doc/html/rfc6455
+- title: Slack Engineering — Migrating Millions of Concurrent Websockets to Envoy
+  url: https://slack.engineering/migrating-millions-of-concurrent-websockets-to-envoy/
+- title: Ably — What is HTTP Long Polling?
+  url: https://ably.com/topic/long-polling
+- title: MDN — WebTransport API
+  url: https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API
 ---
 
 Every "design a live feed," "design chat," or "design notifications" question collapses to one problem: HTTP was built for the client to ask and the server to answer, but you need the server to talk first. There are four production answers, and interviewers want you to reach for the cheapest one that meets the requirement — not the most impressive. Here they are in ascending order of power and cost.
@@ -156,3 +167,39 @@ Short and long polling scale like any stateless HTTP endpoint — put them behin
 The interview-grade summary: default to **SSE** for server→client feeds (auto-reconnect and resumability are gifts; just serve it over HTTP/2), reach for **WebSockets** only when you need low-latency *client→server*, keep **long polling** in your pocket as the universal fallback, and use **short polling** when "slightly stale" is genuinely acceptable. Naming the cheap option first is the signal that you've done this before.
 
 **Try next:** work through how a slow WebSocket consumer creates unbounded server-side send buffers, and the flow-control strategies that prevent it, in the companion article on [backpressure and flow control](/articles/sys-patterns/2026-07-31-backpressure-flow-control).
+
+## What a million connections actually costs
+
+Persistent connections shift cost from per-message to per-connection *state*: a file descriptor, kernel socket buffers, TLS session, heartbeat timer, and userspace session object per client — tens of KB each, so 1M idle clients is tens of GB of mostly-idle state spread across a gateway tier. The real limits are operational. Every LB in the path holds the same state, and each LB↔backend pair has ~64K ephemeral ports. Deploys become the hard part: restarting a gateway drops every connection it holds, and a million clients reconnecting at once is a thundering herd aimed at your auth stack — Slack's [Envoy migration](https://slack.engineering/migrating-millions-of-concurrent-websockets-to-envoy/) write-up is largely about exactly this: draining millions of WebSockets slowly and surviving mass-reconnect storms.
+
+Proxy behavior differs per mechanism. Idle timeouts kill quiet connections: AWS ALB defaults to 60 s idle, nginx `proxy_read_timeout` likewise — so WebSockets need ping/pong inside the timeout, and SSE needs periodic `: keepalive` comment lines. SSE additionally requires buffering off (`X-Accel-Buffering: no` for nginx), or your events sit in a proxy buffer. And because a client's connection lands on *one* gateway node but a message for them can originate anywhere, you need a **pub/sub backplane** (Redis pub/sub, Kafka, NATS): publishers write to a channel, every gateway subscribes and fans out to its local sockets. Sticky routing then matters only for in-flight session state, not correctness.
+
+Reconnect/backfill is the part candidates forget. SSE gives you `Last-Event-ID` natively. WebSocket gives you nothing: you implement resume tokens — a per-session monotonically increasing sequence number the client echoes on reconnect so the server can replay from a short retained buffer, falling back to full state resync when the buffer has aged out.
+
+## Minimal working SSE (Node, no dependencies)
+
+```js
+// server.mjs — run: node server.mjs
+import http from "node:http";
+let id = 0;
+http.createServer((req, res) => {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    "x-accel-buffering": "no",              // stop nginx buffering the stream
+  });
+  const last = req.headers["last-event-id"]; // resume point after reconnect
+  if (last) res.write(`: client resumed after event ${last}\n\n`);
+  const t = setInterval(() =>
+    res.write(`id: ${++id}\nevent: tick\ndata: {"ts":${Date.now()}}\n\n`), 2000);
+  req.on("close", () => clearInterval(t));   // client gone: free the state
+}).listen(8080);
+```
+
+```js
+// client (browser console) — reconnection and Last-Event-ID are automatic
+const es = new EventSource("http://localhost:8080/");
+es.addEventListener("tick", e => console.log(e.lastEventId, e.data));
+```
+
+Kill the server mid-stream and restart it: the browser reconnects on its own and you'll see the resume comment with the last delivered ID. That's the whole backfill contract, handed to you by the protocol.

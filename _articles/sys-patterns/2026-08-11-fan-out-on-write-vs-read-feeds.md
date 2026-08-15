@@ -72,7 +72,7 @@ def home_timeline(user_id, cursor):
     return rank(dedupe(merged))[:PAGE]
 ```
 
-`cursor` here is a `(timestamp, post_id)` pair, not a page number — the merged stream shifts constantly as new posts land, so `OFFSET`-style paging would skip and duplicate rows. Page it with **keyset (seek) pagination**, carrying the last item's sort key forward; see [keyset pagination vs OFFSET](/articles/microservices/2026-08-11-keyset-pagination-vs-offset) for the cursor mechanics and why the composite key matters.
+`cursor` here is a `(timestamp, post_id)` pair, not a page number — the merged stream shifts constantly as new posts land, so `OFFSET`-style paging would skip and duplicate rows. Page it with **keyset (seek) pagination**, carrying the last item's sort key forward; see [keyset pagination vs OFFSET](/articles/microservices/2026-08-10-pagination-offset-vs-keyset) for the cursor mechanics and why the composite key matters.
 
 ## Trade-offs
 

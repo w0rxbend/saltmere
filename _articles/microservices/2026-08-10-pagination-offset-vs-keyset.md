@@ -1,27 +1,32 @@
 ---
-title: "Pagination at Scale: Why OFFSET Falls Over and Keyset Wins"
+title: 'Pagination at Scale: Why OFFSET Falls Over and Keyset Wins'
 date: 2026-08-10
 track: microservices
-summary: "OFFSET pagination is O(offset) — the database scans and throws away every row before the page you want, so page 10,000 crawls and concurrent inserts make rows duplicate or vanish. Keyset (seek-method / cursor) pagination stays O(limit) by riding the index with a row-value WHERE clause, and it is stable under writes. Here is the Big-O framing, concrete SQL for both, a base64 opaque-cursor encode/decode, composite keys, deletions, and how Relay- and Stripe-style API cursors are built."
+summary: OFFSET pagination is O(offset) — the database scans and throws away every row before the page you want, so page 10,000 crawls and concurrent inserts make rows duplicate or vanish. Keyset (seek-method / cursor) pagination stays O(limit) by riding the index with a row-value WHERE clause, and it is stable under writes. Here is the Big-O framing, concrete SQL for both, a base64 opaque-cursor encode/decode, composite keys, deletions, and how Relay- and Stripe-style API cursors are built.
 reading_time: 6
 tags:
-  - pagination
-  - databases
-  - sql
-  - api-design
-  - postgresql
-  - microservices
+- pagination
+- databases
+- sql
+- api-design
+- postgresql
+- microservices
+- keyset
+- cursor
+- postgres
 sources:
-  - title: "We need tool support for keyset pagination (No-Offset) — Markus Winand"
-    url: "https://use-the-index-luke.com/no-offset"
-  - title: "Paging Through Results: OFFSET is bad, fetch the next page — Use The Index, Luke!"
-    url: "https://use-the-index-luke.com/sql/partial-results/fetch-next-page"
-  - title: "GraphQL Cursor Connections Specification — Relay"
-    url: "https://relay.dev/graphql/connections.htm"
-  - title: "Pagination — Stripe API Reference"
-    url: "https://docs.stripe.com/api/pagination"
-  - title: "Keyset Cursors, Not Offsets, for Postgres Pagination — Sequin"
-    url: "https://blog.sequinstream.com/keyset-cursors-not-offsets-for-postgres-pagination/"
+- title: We need tool support for keyset pagination (No-Offset) — Markus Winand
+  url: https://use-the-index-luke.com/no-offset
+- title: 'Paging Through Results: OFFSET is bad, fetch the next page — Use The Index, Luke!'
+  url: https://use-the-index-luke.com/sql/partial-results/fetch-next-page
+- title: GraphQL Cursor Connections Specification — Relay
+  url: https://relay.dev/graphql/connections.htm
+- title: Pagination — Stripe API Reference
+  url: https://docs.stripe.com/api/pagination
+- title: Keyset Cursors, Not Offsets, for Postgres Pagination — Sequin
+  url: https://blog.sequinstream.com/keyset-cursors-not-offsets-for-postgres-pagination/
+- title: Pagination — Slack Developer Docs
+  url: https://docs.slack.dev/apis/web-api/pagination/
 ---
 
 You built a list endpoint. `?page=2&size=20` works fine in the demo. Six months later a customer with 400,000 orders opens page 15,000 and the request times out — while the customer on page 1 is fast. Nothing changed except the offset. That asymmetry is the whole story, and it is a classic system-design interview probe: *how does your pagination behave at page N, and what happens when someone inserts a row mid-scan?*

@@ -18,7 +18,7 @@ sources:
     url: "https://lwn.net/Articles/877167/"
 ---
 
-The [earlier io_uring article](/articles/linux-tools/io-uring-async-syscalls) covered what the two rings buy you: batched submission, completion without syscalls. But even a perfectly batched `recv` still ends the same way — the NIC DMAs the packet into a kernel `sk_buff`, and the kernel **memcpy**s the payload into your buffer. At 1 Gbit/s nobody notices. At 100 or 200 Gbit/s, that copy *is* the workload: it burns CPU cycles and, worse, memory bandwidth, twice touching every byte you receive. **zcrx** — io_uring zero-copy receive, developed by David Wei (Meta) and Pavel Begunkov and **merged in Linux 6.15** (May 2025) — deletes the copy. The NIC writes packet payloads directly into memory your process registered; the kernel only ever touches the headers.
+The [earlier io_uring article](/articles/linux-tools/2026-07-26-io-uring-async-syscalls) covered what the two rings buy you: batched submission, completion without syscalls. But even a perfectly batched `recv` still ends the same way — the NIC DMAs the packet into a kernel `sk_buff`, and the kernel **memcpy**s the payload into your buffer. At 1 Gbit/s nobody notices. At 100 or 200 Gbit/s, that copy *is* the workload: it burns CPU cycles and, worse, memory bandwidth, twice touching every byte you receive. **zcrx** — io_uring zero-copy receive, developed by David Wei (Meta) and Pavel Begunkov and **merged in Linux 6.15** (May 2025) — deletes the copy. The NIC writes packet payloads directly into memory your process registered; the kernel only ever touches the headers.
 
 ## Send was the easy half
 

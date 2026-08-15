@@ -24,7 +24,7 @@ Flink 2.x's headline answer is **disaggregated state**: object storage (S3/OSS/H
 
 ## ForSt: the LSM tree moves to object storage
 
-The new backend is **ForSt** ("For Streaming"), a RocksDB descendant whose [LSM tree](/articles/distributed-systems/2026-08-11-lsm-trees-vs-b-trees) reads and writes SST files on a distributed filesystem directly. Local disk (`state.backend.forst.cache.dir`) holds a tiered cache of hot files, so the working set behaves locally while ownership sits remotely. Compaction — CPU-heavy in RocksDB — can be pushed to a remote compaction service off the compute nodes.
+The new backend is **ForSt** ("For Streaming"), a RocksDB descendant whose [LSM tree](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees) reads and writes SST files on a distributed filesystem directly. Local disk (`state.backend.forst.cache.dir`) holds a tiered cache of hot files, so the working set behaves locally while ownership sits remotely. Compaction — CPU-heavy in RocksDB — can be pushed to a remote compaction service off the compute nodes.
 
 Because the live state files *already sit* in the same DFS as checkpoints, two things fall out:
 

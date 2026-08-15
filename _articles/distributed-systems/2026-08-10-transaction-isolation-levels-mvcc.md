@@ -1,21 +1,36 @@
 ---
-title: "Isolation levels & MVCC: the anomalies, not the names, are the spec"
+title: 'Isolation levels & MVCC: the anomalies, not the names, are the spec'
 date: 2026-08-10
 track: distributed-systems
-summary: "The 'I' in ACID, defined properly. Isolation levels are named by which read phenomena they forbid — dirty read, non-repeatable read, phantom — but the SQL standard's names are a trap: Postgres has no real read-uncommitted, its 'repeatable read' is snapshot isolation, and MySQL InnoDB defaults to repeatable read. MVCC lets readers not block writers, but snapshot isolation still permits write skew and lost update. Here's the anomaly/level matrix, a concrete write-skew example, and the SERIALIZABLE / SELECT FOR UPDATE fixes."
+summary: 'The ''I'' in ACID, defined properly. Isolation levels are named by which read phenomena they forbid — dirty read, non-repeatable read, phantom — but the SQL standard''s names are a trap: Postgres has no real read-uncommitted, its ''repeatable read'' is snapshot isolation, and MySQL InnoDB defaults to repeatable read. MVCC lets readers not block writers, but snapshot isolation still permits write skew and lost update. Here''s the anomaly/level matrix, a concrete write-skew example, and the SERIALIZABLE / SELECT FOR UPDATE fixes.'
 reading_time: 6
-tags: [transactions, isolation-levels, mvcc, snapshot-isolation, write-skew, serializable]
+tags:
+- transactions
+- isolation-levels
+- mvcc
+- snapshot-isolation
+- write-skew
+- serializable
+- postgres
 sources:
-  - title: "Kleppmann, Designing Data-Intensive Applications, Ch. 7 (Weak Isolation & Serializability)"
-    url: "https://dataintensive.net/"
-  - title: "Berenson, Bernstein, Gray, Melton, O'Neil, O'Neil — A Critique of ANSI SQL Isolation Levels (SIGMOD 1995)"
-    url: "https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf"
-  - title: "PostgreSQL Documentation — 13.2. Transaction Isolation"
-    url: "https://www.postgresql.org/docs/current/transaction-iso.html"
-  - title: "MySQL 8.0 Reference Manual — 17.7.2.1 Transaction Isolation Levels"
-    url: "https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html"
-  - title: "The Morning Paper — A Critique of ANSI SQL Isolation Levels (summary)"
-    url: "https://blog.acolyer.org/2016/02/24/a-critique-of-ansi-sql-isolation-levels/"
+- title: Kleppmann, Designing Data-Intensive Applications, Ch. 7 (Weak Isolation & Serializability)
+  url: https://dataintensive.net/
+- title: Berenson, Bernstein, Gray, Melton, O'Neil, O'Neil — A Critique of ANSI SQL Isolation Levels (SIGMOD 1995)
+  url: https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf
+- title: PostgreSQL Documentation — 13.2. Transaction Isolation
+  url: https://www.postgresql.org/docs/current/transaction-iso.html
+- title: MySQL 8.0 Reference Manual — 17.7.2.1 Transaction Isolation Levels
+  url: https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html
+- title: The Morning Paper — A Critique of ANSI SQL Isolation Levels (summary)
+  url: https://blog.acolyer.org/2016/02/24/a-critique-of-ansi-sql-isolation-levels/
+- title: Berenson et al., A Critique of ANSI SQL Isolation Levels (SIGMOD 1995)
+  url: https://www.cs.cmu.edu/~15721-f24/papers/Critique_of_ANSI_Isolation_Levels.pdf
+- title: Ports & Grittner, Serializable Snapshot Isolation in PostgreSQL (VLDB 2012)
+  url: https://arxiv.org/abs/1208.4179
+- title: PostgreSQL wiki — SSI (Serializable Snapshot Isolation)
+  url: https://wiki.postgresql.org/wiki/SSI
+- title: Vlad Mihalcea — A beginner's guide to the write skew anomaly
+  url: https://vladmihalcea.com/write-skew-2pl-mvcc/
 ---
 
 Ask a candidate "what does the I in ACID mean" and you'll hear "transactions don't interfere." True but useless. Isolation is a *spectrum*, and the interview question underneath it is always: **which concurrency anomalies does this level allow, and what does that cost me?** Get the anomalies right and the four SQL isolation levels fall out for free — because the levels are literally *defined* by which anomalies they forbid.
@@ -110,3 +125,13 @@ The trade-off in one line: `FOR UPDATE` is targeted, pessimistic, and needs you 
 Levels are defined by anomalies, not by their names. Read committed stops dirty reads; repeatable read adds non-repeatable reads; serializable stops everything including write skew. But the names are per-database fiction: Postgres has no dirty reads at all, its repeatable read is snapshot isolation that also blocks phantoms, and MySQL InnoDB defaults to repeatable read while Postgres defaults to read committed. MVCC makes weak isolation cheap — snapshots let readers and writers pass each other — but snapshot isolation still permits write skew, which you fix with `SELECT ... FOR UPDATE` on the rows your invariant reads, or with true `SERIALIZABLE` plus a retry loop.
 
 **Try next:** open two `psql` sessions, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` in both, and reproduce the doctors write skew end to end — watch both commit and the invariant break. Then rerun at `SERIALIZABLE` and confirm one aborts with `could not serialize access`; wrap it in a retry and prove the invariant holds.
+
+## SSI: serializable without serial execution
+
+Postgres 9.1+ implements **Serializable Snapshot Isolation** (Cahill's algorithm, productionized by Ports & Grittner). It runs transactions on plain snapshots but additionally tracks reads with non-blocking **SIREAD locks** (including predicate/index-range granularity, which is how phantoms and write skew through predicates get caught). It watches for **rw-antidependencies** — T1 read something T2 later wrote. Theory says every SI anomaly requires two consecutive rw-antidependencies in the conflict graph; when SSI sees that "dangerous structure," it aborts one transaction with `40001`.
+
+The contract this imposes on application code: *any* serializable transaction can be rejected even without touching the same rows as anyone else, so you must wrap them in a retry loop. False positives exist (the check is conservative), but there's no blocking and, per the VLDB paper, modest overhead versus plain SI. Compare that to the pessimistic alternative — 2PL takes shared locks on everything read and blocks instead of aborting.
+
+Interview closer: "repeatable read in Postgres" and "repeatable read in MySQL/InnoDB" are different animals (InnoDB's uses next-key locking for writes and can still exhibit its own quirks), so always answer in terms of anomalies, not level names.
+
+**Try next:** run the doctors demo in two psql terminals at REPEATABLE READ, then at SERIALIZABLE, and inspect the SIREAD locks mid-flight with `SELECT locktype, relation::regclass, mode FROM pg_locks WHERE mode = 'SIReadLock';`.

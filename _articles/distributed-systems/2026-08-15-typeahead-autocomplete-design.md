@@ -75,7 +75,7 @@ antirez's original trick predates `ZADD`-per-prefix designs: he stored *every pr
 Where do scores come from? Log every submitted query, then:
 
 - **Offline aggregation (the classic answer):** MapReduce/Spark job aggregates the query log (say, weekly or daily), computes per-phrase counts with time decay, builds top-k per prefix, ships immutable trie snapshots to servers, atomically swaps pointers. Simple, testable, and rank stability is a *feature* — suggestions shouldn't jitter per keystroke.
-- **Streaming updates:** consume the query stream and `ZINCRBY` live (the Prefixy model), or push through a stream processor that maintains per-prefix top-k. Needed if "breaking news" must surface in minutes. The costs: hot-key contention on short prefixes, and unbounded phrase cardinality — cap ZSET sizes (`ZREMRANGEBYRANK` after insert) and consider a Count-Min Sketch for the long tail of counts, which the corpus covers in the [heavy hitters article](/articles/distributed-systems/2026-08-14-count-min-sketch-heavy-hitters).
+- **Streaming updates:** consume the query stream and `ZINCRBY` live (the Prefixy model), or push through a stream processor that maintains per-prefix top-k. Needed if "breaking news" must surface in minutes. The costs: hot-key contention on short prefixes, and unbounded phrase cardinality — cap ZSET sizes (`ZREMRANGEBYRANK` after insert) and consider a Count-Min Sketch for the long tail of counts, which the corpus covers in the [heavy hitters article](/articles/distributed-systems/2026-08-10-count-min-sketch).
 
 Most real systems are hybrid: batch job owns the baseline ranking; a small streaming layer overlays trending queries.
 

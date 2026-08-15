@@ -20,7 +20,7 @@ sources:
 
 A cache is finite, so a cache is defined less by what it stores than by **what it decides to forget**. When the cache is full and a new item arrives, the eviction (or replacement) policy picks the victim. That single decision, made millions of times a second, sets your hit ratio — and a few points of hit ratio is the difference between a database that idles and one that melts.
 
-This article is about **eviction**: given a full cache, what do you remove? A closely related question — *admission*, i.e. whether a new item deserves to enter at all — is covered in a [separate article on TinyLFU's doorkeeper](/articles/sys-patterns/). Here I mention admission only where a modern policy (W-TinyLFU, S3-FIFO) blends the two.
+This article is about **eviction**: given a full cache, what do you remove? A closely related question — *admission*, i.e. whether a new item deserves to enter at all — is covered in a [separate article on TinyLFU's doorkeeper](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/). Here I mention admission only where a modern policy (W-TinyLFU, S3-FIFO) blends the two.
 
 ## The tension: recency vs. frequency vs. scans
 
@@ -127,4 +127,4 @@ Sentinel head/tail nodes remove all the null-checking around empty and single-el
 
 If you need a default that is simple, concurrent, and hard to beat on skewed traffic, **SIEVE** or **S3-FIFO** are the current sweet spot — FIFO-based, lock-light, scan-resistant. If you're on the JVM, **Caffeine's W-TinyLFU** is the mature, battle-tested choice. **ARC** remains the textbook example of principled self-tuning. And plain **LRU** is still fine when locality is strong and scans are absent — just know that the moment a batch job walks your keyspace, its hit ratio falls off a cliff.
 
-**Try next:** run your own production trace through the open-source [libCacheSim](https://github.com/1a1a11a/libCacheSim) simulator and compare LRU vs. SIEVE vs. W-TinyLFU hit ratios — then re-read the [TinyLFU admission](/articles/sys-patterns/) article to see how *admission* control stacks on top of the eviction policy you just picked.
+**Try next:** run your own production trace through the open-source [libCacheSim](https://github.com/1a1a11a/libCacheSim) simulator and compare LRU vs. SIEVE vs. W-TinyLFU hit ratios — then re-read the [TinyLFU admission](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/) article to see how *admission* control stacks on top of the eviction policy you just picked.

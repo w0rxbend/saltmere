@@ -90,7 +90,7 @@ Look for `ABS_DONE_1` / `SECURE_BOOT_EN` and the crypt-count fields flipping to 
 
 ## How this meets OTA
 
-Secure Boot and flash encryption change what an OTA update *is*. The [OTA updates article](/articles/iot-embedded/esp32-ota/) covers `esp_https_ota`, the A/B partition dance, and rollback. Layer security on top and three things follow:
+Secure Boot and flash encryption change what an OTA update *is*. The [OTA updates article](/articles/iot-embedded/2026-07-26-esp32-ota-updates/) covers `esp_https_ota`, the A/B partition dance, and rollback. Layer security on top and three things follow:
 
 1. **Every OTA image must be signed** with the same private key, or the new slot fails verification and the device stays on the old app. Your build pipeline, not just your bench, needs that key.
 2. **OTA partitions are encrypted per-device.** The incoming image arrives as plaintext ciphertext-for-transit (protect it with HTTPS); the flash driver re-encrypts it with the device's own eFuse key as it writes. You ship one signed binary; each board stores its own ciphertext.

@@ -1,21 +1,39 @@
 ---
-title: "Semantic caching for LLMs: cache by meaning, not by key"
+title: 'Semantic caching for LLMs: cache by meaning, not by key'
 date: 2026-08-10
 track: microservices
-summary: "Exact-match caching whiffs on LLM traffic because 'reset my password' and 'how do I change my password?' are different strings. A semantic cache embeds the query, does an ANN lookup in a vector store, and serves a cached answer when similarity clears a threshold. Here's the architecture, the false-hit trap, and how GPTCache and Redis LangCache build it."
+summary: Exact-match caching whiffs on LLM traffic because 'reset my password' and 'how do I change my password?' are different strings. A semantic cache embeds the query, does an ANN lookup in a vector store, and serves a cached answer when similarity clears a threshold. Here's the architecture, the false-hit trap, and how GPTCache and Redis LangCache build it.
 reading_time: 6
-tags: [llm, semantic-cache, caching, vector-database, gptcache, redis, embeddings]
+tags:
+- llm
+- semantic-cache
+- caching
+- vector-database
+- gptcache
+- redis
+- embeddings
+- llm-serving
+- vector-search
+- ai-infrastructure
 sources:
-  - title: "GPTCache — Semantic cache for LLMs (README)"
-    url: "https://github.com/zilliztech/gptcache/blob/main/README.md"
-  - title: "GPTCache documentation"
-    url: "https://gptcache.readthedocs.io/"
-  - title: "Semantic Caching for LLMs — RedisVL user guide (SemanticCache)"
-    url: "https://redis.io/docs/latest/develop/ai/redisvl/0.7.0/user_guide/llmcache/"
-  - title: "Introducing LangCache and vector sets — Redis blog"
-    url: "https://redis.io/blog/spring-release-2025/"
-  - title: "Semantic caching thresholds and why they matter — Portkey"
-    url: "https://portkey.ai/blog/semantic-caching-thresholds/"
+- title: GPTCache — Semantic cache for LLMs (README)
+  url: https://github.com/zilliztech/gptcache/blob/main/README.md
+- title: GPTCache documentation
+  url: https://gptcache.readthedocs.io/
+- title: Semantic Caching for LLMs — RedisVL user guide (SemanticCache)
+  url: https://redis.io/docs/latest/develop/ai/redisvl/0.7.0/user_guide/llmcache/
+- title: Introducing LangCache and vector sets — Redis blog
+  url: https://redis.io/blog/spring-release-2025/
+- title: Semantic caching thresholds and why they matter — Portkey
+  url: https://portkey.ai/blog/semantic-caching-thresholds/
+- title: 'GPTCache: An Open-Source Semantic Cache for LLM Applications (paper, OpenReview)'
+  url: https://openreview.net/pdf?id=ivwM8NwM4Z
+- title: Redis LangCache — semantic caching service (Redis docs)
+  url: https://redis.io/docs/latest/develop/ai/context-engine/langcache/
+- title: Cache LLM Responses — RedisVL SemanticCache user guide
+  url: https://docs.redisvl.com/en/latest/user_guide/03_llmcache.html
+- title: 'Semantic Caching for LLMs: Beyond Prefix Caching (TrueFoundry)'
+  url: https://www.truefoundry.com/blog/semantic-caching-ai-gateway
 ---
 
 A classic cache is a hash map: exact key in, value out. That contract is perfect for `GET /user/42` and useless for a chat model. Ask an LLM "how do I reset my password?" and then "what's the way to change my password?" — two different strings, one intent, two full-price API calls. Byte-for-byte keying gives you a near-zero hit rate on natural-language traffic, because humans almost never phrase the same question the same way twice.
