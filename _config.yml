@@ -63,10 +63,16 @@ tracks:
     name: CAD & 3D Printing
     blurb: "Parametric modeling with FreeCAD, KiCad, and the print pipeline."
 
+# Repository documentation, not site pages. STYLE.md and TOPICS.md must be
+# excluded rather than merely unlinked: Jekyll renders every root-level .md
+# through Liquid, and STYLE.md documents Liquid tag syntax, which would abort
+# the build.
 exclude:
   - Gemfile
-  - tools
-  - _preview
   - Gemfile.lock
   - README.md
+  - STYLE.md
+  - TOPICS.md
+  - tools
+  - _preview
   - vendor
