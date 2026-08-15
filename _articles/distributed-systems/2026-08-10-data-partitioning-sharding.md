@@ -1,9 +1,9 @@
 ---
-title: "Partitioning and sharding: pick a scheme, then survive the resize"
+title: "Partitioning and sharding: choosing a scheme and surviving the resize"
 date: 2026-08-10
 track: distributed-systems
-summary: "A single node runs out of disk and CPU, so you split the data. This walks the three partitioning schemes and their trade-offs, the hot-key problem and how salting fixes it, secondary indexes under partitioning, and the one decision that bites everyone in interviews: why hash(key) % N melts your cluster on resize, and what to do instead."
-reading_time: 6
+summary: "A single node exhausts its disk and CPU, so the dataset is split. This article covers the three partitioning schemes and their trade-offs, the hot-key problem and salting, secondary indexes under partitioning, and why hash(key) % N reshuffles almost the whole cluster on resize."
+reading_time: 7
 tags: [partitioning, sharding, consistent-hashing, rebalancing, ddia]
 sources:
   - title: "Kleppmann, Designing Data-Intensive Applications — Ch.6 Partitioning (O'Reilly)"
@@ -18,85 +18,92 @@ sources:
     url: "http://muratbuffalo.blogspot.com/2024/09/ddia-chp-6-partitioning.html"
 ---
 
-One node has a finite amount of disk, RAM, and IOPS. When your dataset or write rate outgrows it, you split the data into **partitions** (shards) and spread them across nodes. The goal is to spread load *evenly*: a partition holding 90% of the traffic, or the node it lives on, is a "hot spot," and a hot spot means one machine is your bottleneck no matter how many others you bought. Kleppmann's DDIA Ch.6 frames the whole topic as a sequence of decisions, and this article walks them in interview order: which scheme, how to handle skew, what happens to secondary indexes, and — the part people botch — how to add nodes without reshuffling everything.
+**Gist.** A single node has finite disk, RAM and I/O operations per second (IOPS), so a dataset that outgrows it must be split into **partitions** (shards) spread across nodes. Every partitioning scheme is a choice of key-to-partition function, and each function trades even load distribution against the ability to answer a query from one partition. The cost is paid twice: at query time, when a scheme that scatters keys forces scatter-gather; and at resize time, when a scheme whose mapping depends on the node count moves nearly all the data.
+
+The failure that partitioning exists to prevent, and the one it most often creates, is the **hot spot**: a partition — or the node hosting it — that receives a disproportionate share of traffic. A cluster with one saturated node and nine idle ones has the throughput of one node. Kleppmann's *Designing Data-Intensive Applications* (DDIA) Chapter 6 organises the topic as a sequence of decisions, and this article follows that order: which scheme, how to handle skew, what happens to secondary indexes, and how to add nodes without reshuffling everything.
 
 ## Three ways to assign keys to partitions
 
-**Range partitioning** keeps keys sorted and gives each partition a contiguous range — `a`–`f` here, `g`–`m` there, like volumes of an encyclopedia. Range scans are cheap because adjacent keys sit together, so `WHERE ts BETWEEN ...` hits one partition. HBase and Bigtable work this way. The danger is skew: if your key is a timestamp and you're writing "now," every insert lands on the *same* partition (the one whose upper bound is the max), so you get a sequential-write hot spot even though the data is evenly sized. Range is great for time-series *reads*, terrible for time-series *writes* on a raw timestamp key.
+**Range partitioning** keeps keys sorted and gives each partition a contiguous range — `a`–`f` on one partition, `g`–`m` on the next. Because adjacent keys are stored together, a bounded scan such as `WHERE ts BETWEEN ...` is answered by **one partition**. HBase and Bigtable partition this way. The failure mode is skew under monotonically increasing keys: if the key is a timestamp and writes are always "now", every insert lands on **the single partition whose upper bound is the maximum**, producing a sequential-write hot spot even while the partitions remain evenly sized. Range partitioning suits time-series *reads* and is hostile to time-series *writes* on a raw timestamp key.
 
-**Hash partitioning** runs the key through a hash function and assigns by the hash value, so `hash("now")` and `hash("now"+1ms)` land on different partitions. This destroys the sequential-write hot spot and spreads load evenly — Cassandra uses Murmur3, MongoDB's hashed shard key exists specifically so a monotonically increasing `_id` distributes instead of piling onto one chunk. The cost is that you lose sorted order: a range query now has to fan out to *every* partition (a broadcast/scatter-gather), because "close" keys are deliberately scattered. MongoDB's docs say this plainly — hashed sharding trades targeted range operations for even distribution.
+**Hash partitioning** applies a hash function to the key and assigns by the hash value, so `hash("now")` and `hash("now" + 1 ms)` land on unrelated partitions. This removes the sequential-write hot spot. Cassandra uses Murmur3; MongoDB's hashed shard key exists so that a monotonically increasing `_id` distributes across chunks rather than accumulating in one. The cost is the loss of sorted order: a range query must fan out to **every** partition (a broadcast, or scatter-gather), because neighbouring keys are deliberately scattered. The MongoDB manual states the trade directly — hashed sharding gives even distribution in exchange for targeted range operations.
 
-**Directory / lookup-based** partitioning keeps an explicit map from key (or key-range) to partition in a routing tier. Vitess's *lookup vindexes* do exactly this: a backing table stores `column value -> keyspace ID`, letting you shard on a secondary column or place specific keys deliberately. It's the most flexible — you can move a single hot tenant to its own shard by editing one mapping — but the directory is another hop and a potential bottleneck/SPOF, so it's usually cached and made highly available.
+**Directory (lookup-based) partitioning** stores an explicit map from key, or key-range, to partition in a routing tier. Vitess *lookup vindexes* implement this: a backing table holds `column value -> keyspace ID`, which permits sharding on a secondary column or deliberately placing specific keys. It is the most flexible scheme — relocating one hot tenant to a dedicated shard is an edit to a single mapping — but the directory is an extra hop, a shared dependency and a single point of failure unless replicated and cached.
 
 | Scheme | Even spread | Range scans | Move one hot key | Real systems |
 |---|---|---|---|---|
-| Range | Poor (skew/append hot spots) | Excellent | Split the range | HBase, Bigtable, Vitess range vindex |
+| Range | Poor (skew/append hot spots) | Excellent | Split the range | HBase, Bigtable |
 | Hash | Excellent | Broadcast to all | Hard (see salting) | Cassandra, MongoDB hashed, Citus |
 | Directory/lookup | Fully controllable | Depends on backing | Trivial (edit map) | Vitess lookup vindex |
 
-## The hot-key (celebrity) problem
+## The hot-key problem
 
-Hashing spreads *keys* evenly, but it can't help when one *key* is hot. A celebrity with 50M followers, or a `product_id` in a flash sale, hashes to exactly one partition — and now that partition is overloaded regardless of scheme. DDIA notes most systems don't solve this automatically; it's on the application.
+Hashing distributes *keys* evenly; it cannot help when a single *key* is hot. An account with millions of followers, or one `product_id` during a flash sale, hashes to exactly one partition, and that partition is overloaded under any scheme. DDIA notes that most systems do not correct this automatically: the responsibility sits with the application.
 
-The standard fix is **salting**: split the hot key into `N` sub-keys by prefixing (or suffixing) a small random number, spreading its load across `N` partitions.
+The standard mitigation is **salting**: the hot key is split into `N` sub-keys by prefixing or suffixing a small random value, so its writes spread over `N` partitions. The trade-off DDIA states is that **every read of a salted key must query all `N` sub-partitions and merge the results**, and the application must record which keys are salted — so salting is applied only to the few keys observed to be hot. The heavier alternative is a **dedicated shard** for the key, which a directory scheme makes cheap because rerouting is one map entry.
 
-```python
-# A hot key "celebrity:123" is split across 16 virtual sub-keys.
-HOT_KEYS = {"celebrity:123"}
-FANOUT = 16
+## Secondary indexes: local versus global
 
-def write_key(key):
-    if key in HOT_KEYS:
-        return f"{random.randrange(FANOUT)}:{key}"  # 0:celebrity:123 ... 15:celebrity:123
-    return key
+Partitioning by primary key does not carry secondary indexes (`WHERE color = 'red'`) along with it. Two designs exist.
 
-def read_all(key):
-    if key in HOT_KEYS:
-        # reads now scatter/gather across all 16 sub-keys and merge
-        return merge(get(f"{s}:{key}") for s in range(FANOUT))
-    return get(key)
-```
+- **Local, or document-partitioned, index.** Each partition indexes only the rows it stores. Writes touch **one partition** and can be applied atomically with the row. Reads on the indexed attribute must **scatter-gather across every partition**, because matching rows exist everywhere. Elasticsearch, MongoDB and Cassandra's default indexes work this way.
+- **Global, or term-partitioned, index.** The index is itself partitioned by the *term*: `color=red` on one partition, `color=blue` on another. Reads are targeted to one partition. Writes are cross-partition — one row insert may touch several index partitions — and are therefore commonly applied **asynchronously**, so the index lags the data.
 
-The trade-off is explicit in DDIA: writes get distributed, but every *read* of a salted key must query all `N` sub-partitions and combine results, and you need bookkeeping to remember which keys are salted. So you salt only the few keys that are actually hot. The heavier-weight alternative is a **dedicated shard**: pull the celebrity onto its own node entirely — this is where a directory scheme shines, since rerouting one key is a one-line map edit.
-
-## Secondary indexes: local vs global
-
-Partition by primary key and your secondary indexes (`WHERE color = 'red'`) don't automatically follow. Two designs, and interviewers love the trade-off:
-
-- **Local / document-partitioned index.** Each partition indexes only its own rows. Writes are cheap (one partition, atomic with the row). Reads are expensive: a query on `color` must **scatter-gather** across every partition because red cars live everywhere. This is Elasticsearch, MongoDB, Cassandra's default.
-- **Global / term-partitioned index.** The index itself is partitioned by the *term* (`color=red` lives on one partition, `color=blue` on another). Reads are cheap and targeted. Writes are expensive and cross-partition: inserting one row may touch several index partitions, so it's usually done **asynchronously**, meaning your index can lag the data.
-
-The rule of thumb: local favors writes, global favors reads, and global's async update is why "I wrote it but the index doesn't show it yet" is normal.
+Local partitioning favours writes, global favours reads, and the asynchronous update path of a global index is why a freshly written row can be absent from an index query that follows it.
 
 ## Rebalancing: why `hash(key) % N` is a trap
 
-Here's the mistake that sinks interviews. The obvious hash mapping is `node = hash(key) % N`. It's balanced — until `N` changes. Add one node and the *divisor* changes, so almost every key's `% N` result changes, and nearly all your data must move at once.
+The direct hash mapping is `node = hash(key) % N`. It is balanced while `N` is constant, but `N` is the divisor: when a node is added, almost every key's residue changes, and nearly the whole dataset must move at once. A key keeps its node across a move from 5 nodes to 6 only when `hash(key) % 5 == hash(key) % 6`, which for uniformly distributed hashes holds for about one key in six; the other **roughly five keys in six move**, where the ideal for adding a sixth node is about 1/6. The consequences are a network storm during the move and a cold cache on every node, not only the new one.
 
-```python
-keys = range(100_000)
-def owner(k, N): return hash(k) % N
-moved = sum(owner(k, 5) != owner(k, 6) for k in keys)
-print(moved / 100_000)   # ~0.83 — going 5 -> 6 nodes reshuffles ~83% of keys
+**Fix 1 — a fixed number of partitions.** Decouple partition count from node count: create many partitions up front, far more than there are nodes, and assign whole partitions to nodes. With `partition = hash(key) % 1024`, the divisor never changes, so no key ever rehashes; adding a node moves **whole partitions**, not keys. Citus (32 shards by default, assigned by hash range) and Elasticsearch work this way. The constraint is that the partition count is fixed at creation and bounds how far the data can be spread.
+
+**Fix 2 — consistent hashing.** Nodes and keys are placed on a hash ring and a key belongs to the next node clockwise, so adding a node reassigns only the arc between it and its predecessor — **about K/N keys**, the theoretical minimum for K keys over N nodes. Dynamo and Cassandra use this. A ring walkthrough is at [/articles/distributed-systems/2026-07-25-consistent-hashing-ring](/articles/distributed-systems/2026-07-25-consistent-hashing-ring), and [rendezvous (highest random weight, HRW) hashing](/articles/distributed-systems/2026-08-10-rendezvous-hrw-hashing) achieves the same K/N churn without ring bookkeeping.
+
+**Fix 3 — dynamic partitioning.** In range-partitioned stores, a partition **splits** when it grows past a threshold and **merges** when it shrinks, as a B-tree node does. HBase and MongoDB do this, so the partition count tracks data volume instead of being fixed in advance.
+
+### Implementation sketch (Scala)
+
+The two mappings differ in one place — whether the node count appears in the key's hash — and that difference is what the churn measurement exposes.
+
+```scala
+final case class Ring(nodes: Vector[String]):
+  // Modulo mapping: the node count is the divisor, so it enters every key's result.
+  def byModulo(key: String): String =
+    nodes(Math.floorMod(key.hashCode, nodes.size))
+
+  // Fixed-partition mapping: the divisor is a constant, so keys never rehash.
+  def byPartition(key: String, partitions: Int = 1024): String =
+    val p = Math.floorMod(key.hashCode, partitions)
+    nodes(p * nodes.size / partitions)   // whole partitions assigned to nodes
+
+def churn(keys: Seq[String], before: Ring, after: Ring)(
+    owner: (Ring, String) => String): Double =
+  keys.count(k => owner(before, k) != owner(after, k)).toDouble / keys.size
+
+val keys  = (1 to 100_000).map(i => s"key:$i")
+val five  = Ring((1 to 5).map(i => s"n$i").toVector)
+val six   = Ring((1 to 6).map(i => s"n$i").toVector)
+
+churn(keys, five, six)((r, k) => r.byModulo(k))     // near-total reshuffle
+churn(keys, five, six)((r, k) => r.byPartition(k))  // only reassigned partitions move
 ```
-
-Adding 20% capacity should move ~1/6 of the data; `% N` moves 83% of it. That's a network storm and a cache wipeout for one node.
-
-**Fix 1 — fixed number of partitions.** Decouple partition count from node count: create *many* partitions up front (say 1024), far more than nodes, and assign whole partitions to nodes. `partition = hash(key) % 1024` never changes because 1024 never changes. Adding a node just *moves a few whole partitions* onto it; keys never rehash. This is Citus (32 shards by default, hash-range assigned) and Elasticsearch. The catch: you fix the partition count at creation and it caps how far you can spread.
-
-**Fix 2 — consistent hashing.** Place nodes and keys on a hash ring; a key belongs to the next node clockwise, so adding a node reassigns only the arc between it and its predecessor — about **K/N keys**, the theoretical minimum. Dynamo and Cassandra use this. See the ring walkthrough at [/articles/distributed-systems/2026-07-25-consistent-hashing-ring](/articles/distributed-systems/2026-07-25-consistent-hashing-ring), and [rendezvous (HRW) hashing](/articles/distributed-systems/2026-08-10-rendezvous-hrw-hashing) for a bookkeeping-free variant with the same K/N churn.
-
-**Fix 3 — dynamic partitioning.** For range-partitioned stores, let partitions **split** when they grow past a threshold and **merge** when they shrink, like a B-tree. HBase and MongoDB do this; the partition count tracks the data volume automatically instead of being fixed.
 
 ## Request routing
 
-Once keys move, clients need to find them. Three options, mirrored in real systems:
+Once keys move, clients must locate them. Three arrangements appear in production systems.
 
-1. **Client-aware.** The client holds the partition map and connects directly — one hop, but every client must track topology changes.
-2. **Routing tier.** A partition-aware proxy (Vitess's `vtgate`, a `mongos`) sits in front and forwards. Clean clients, extra hop and infrastructure.
-3. **Gossip / any-node.** Contact any node; if it doesn't own the key it forwards. Cassandra and Riak gossip membership so every node can route. No separate tier, but more coordination chatter.
+1. **Client-aware.** The client holds the partition map and connects to the owning node directly: one network hop, at the cost of every client tracking topology changes.
+2. **Routing tier.** A partition-aware proxy — Vitess `vtgate`, MongoDB `mongos` — forwards requests. Clients stay simple; the system gains a hop and a tier to operate.
+3. **Any-node forwarding.** A request goes to any node, which forwards it if it does not own the key. Cassandra and Riak gossip membership so that every node can route. No separate tier, at the cost of membership traffic.
 
-The routing table is itself distributed state, so many systems park the authoritative map in ZooKeeper/etcd and push changes to subscribers.
+The routing table is itself distributed state, so the authoritative map is often held in a consensus store such as ZooKeeper or etcd, with changes pushed to subscribers.
 
-The interview through-line: **choose a scheme for your access pattern (range for scans, hash for even writes, directory for control), plan for skew before it bites, and never let your partition count equal your node count.** Fixed partitions or a hash ring is the difference between adding a node in seconds and reshuffling the whole cluster.
+## Pitfalls
 
-**Try next:** take the `hash(key) % N` snippet above, swap in the fixed-partition scheme (`hash % 1024`, then map partitions to nodes), and measure how many keys move going 5 → 6 nodes. You should see ~1/6, not 83%.
+- **A timestamp primary key under range partitioning serialises all writes.** Every insert falls in the highest range, so one node absorbs the entire write rate while the others sit idle and the partition sizes still look balanced.
+- **Hash partitioning silently converts range queries into broadcasts.** A `BETWEEN` filter that was one seek before sharding now touches every partition, and tail latency becomes the slowest partition's latency.
+- **Setting the partition count equal to the node count.** Every subsequent capacity change alters the divisor, so nearly all keys are remapped and moved at once.
+- **Salting a key without recording that it is salted.** Reads that use the unsalted key return only the fraction of writes that happened to carry no prefix, which reads as data loss rather than as a routing bug.
+- **Reading a global secondary index immediately after a write.** The index is updated asynchronously across partitions, so the row exists and the index entry does not yet.
+- **Fixing the partition count too low at creation.** Partitions cannot be subdivided later in this scheme, so the maximum useful node count is capped at the partition count.
+- **Treating a lookup directory as free.** It is consulted on every routed request; if it is neither cached nor replicated, its availability becomes the cluster's availability.

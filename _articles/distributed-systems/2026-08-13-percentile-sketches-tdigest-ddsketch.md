@@ -1,9 +1,9 @@
 ---
-title: "p99 without the raw data: t-digest, DDSketch, and why you can't average percentiles"
+title: "p99 without the raw data: t-digest, DDSketch, and why percentiles do not average"
 date: 2026-08-13
 track: distributed-systems
-summary: "Averaging per-host p99s is statistically meaningless — in the demo below it's off by 32%. Streaming sketches (t-digest, DDSketch, HDR histogram) compress millions of latencies into kilobytes, and their killer property is mergeability: combine host sketches and read the true global percentile."
-reading_time: 5
+summary: "Averaging per-host p99s is statistically meaningless — in the demonstration below it is off by 32%. Streaming sketches (t-digest, DDSketch, HDR histogram) compress millions of latencies into kilobytes, and their decisive property is mergeability: host sketches combine into the true global percentile."
+reading_time: 7
 tags: [percentiles, t-digest, ddsketch, latency, sketches]
 sources:
   - title: "Computing Extremely Accurate Quantiles Using t-Digests — Dunning & Ertl (arXiv 2019)"
@@ -18,27 +18,41 @@ sources:
     url: "https://bravenewgeek.com/everything-you-know-about-latency-is-wrong/"
 ---
 
-Classic interview trap: "Each of your 50 API servers reports its own p99 latency. How do you get the service-wide p99?" The tempting answer — average them, maybe weighted by request count — is wrong, and not slightly wrong. A percentile is a point on a distribution; the percentile of a union of distributions is not any arithmetic combination of the parts' percentiles. If one host serves 1% of traffic at 2 s and the rest are fast, the fleet p99 can sit near 2 s while the *average* of per-host p99s barely moves. There is no correction factor: once each host has collapsed its distribution to a single number, the information needed is gone.
+**Gist.** A percentile is a point on a distribution, and the percentile of a union of distributions is not any arithmetic combination of the parts' percentiles, so a fleet-wide p99 cannot be recovered from per-host p99 values. A **quantile sketch** — a compressed, mergeable summary of the distribution rather than a single answer — restores the composition: each host ships a sketch of a few kilobytes and any aggregator merges them and reads a valid quantile. The cost is bounded approximation error, plus the operational burden of transporting and storing a structured object instead of one floating-point gauge per series.
 
-The fix is to ship something richer than a number but far smaller than the raw data: a **quantile sketch**.
+## Why the naive aggregation fails
+
+The standard interview framing: 50 application programming interface (API) servers each report their own p99 latency; the service-wide p99 is requested. Averaging the reported values, weighted by request count or not, is not slightly wrong — it is answering a different question. **Once a host has collapsed its distribution to one number, the information needed to place the fleet-wide 99th percentile has been discarded**, and no correction factor recovers it. If one host serves 1% of traffic at 2 s while the rest are fast, the fleet p99 can sit near 2 s while the mean of the per-host p99s barely moves.
+
+The remedy is to ship something richer than a number and far smaller than the raw samples.
 
 ## t-digest: adaptive bins, sharp tails
 
-Ted Dunning's t-digest represents a distribution as a few hundred centroids (mean + count). A *scale function* limits how many samples a centroid may absorb depending on where it sits: centroids near the median can be fat, centroids near q=0 or q=1 must stay tiny. The result is a structure of a few KB whose accuracy is best exactly where you care — the extreme tails — with p99.9 typically resolved to a fraction of a percent. Two digests merge by combining their centroid lists and re-compressing. Caveat worth knowing: t-digest's error bound is empirical, not proven — adversarial orderings can degrade it, which is precisely the gap the next sketch was built to close.
+Ted Dunning's t-digest represents a distribution as a few hundred **centroids**, each a mean paired with a count. A **scale function** bounds how many samples a centroid may absorb according to its position in the distribution: centroids near the median may be fat, centroids approaching q = 0 or q = 1 must stay small. The structure therefore spends its resolution where the tails are, and occupies a few kilobytes. Two digests merge by concatenating their centroid lists and re-compressing.
 
-## DDSketch: a guarantee you can state
+The limitation is stated plainly by the construction: **t-digest's accuracy is characterised empirically rather than by a proven worst-case bound**, so adversarial input orderings can degrade it. That gap is what the next sketch closes.
 
-Datadog's DDSketch (VLDB 2019) is almost embarrassingly simple: exponentially-spaced buckets, where value *x* lands in bucket ⌈log_γ x⌉ with γ chosen from your target **relative error** α. That construction gives a provable guarantee: any returned quantile q̂ satisfies |q̂ − q| ≤ α·q. Relative error is the right currency for latency — being off by 2 ms is fine at p50=200 ms and disastrous at p99.9=4 ms — and merging two DDSketches is exact bucket-wise addition, with a bucket-collapsing rule to cap memory. This bucket layout should sound familiar: [Prometheus native histograms](/articles/observability/2026-07-30-prometheus-native-histograms) are the same exponential-bucket idea as a first-class metric type — see that article for the PromQL side; the point here is that "exponential buckets + counts" is *the* mergeable latency representation, whatever the branding.
+## DDSketch: a guarantee that can be stated
+
+Datadog's DDSketch (VLDB 2019) uses **exponentially spaced buckets**: a value *x* is mapped to bucket ⌈log_γ *x*⌉, with γ derived from a target **relative error** α. The paper's relation is γ = (1 + α) / (1 − α). The resulting guarantee is a bound, not an observation: for a quantile whose true value is *x*, the returned value *x̂* satisfies **|x̂ − x| ≤ α·x**. The error is on the value returned, not on the rank — DDSketch does not promise that the element it returns sits at exactly rank q.
+
+Relative error is the appropriate currency for latency. An absolute error of 2 ms is negligible against a p50 of 200 ms and ruinous against a p99.9 of 4 ms; a relative bound scales with the magnitude being measured. Merging is **exact bucket-wise addition of counts**, since two sketches built with the same γ share an identical bucket layout, and a **bucket-collapsing rule** caps memory by folding the extreme buckets together once a configured bucket limit is reached.
+
+The layout recurs elsewhere: [Prometheus native histograms](/articles/observability/2026-07-30-prometheus-native-histograms) implement the same exponential-bucket idea as a first-class metric type — that article covers the PromQL side. The point here is that "exponential buckets plus counts" is the mergeable latency representation regardless of branding.
 
 ## HDR histogram: the in-process workhorse
 
-Gil Tene's HdrHistogram predates both: fixed value range, buckets sized to a configured number of significant digits, recording is a couple of array-index operations with no allocation. It's bigger than a t-digest but constant-size, brutally fast, and losslessly mergeable — the standard choice inside benchmark harnesses (wrk2, JMH pipelines) and latency-critical services. Tene's talks also supply the other classic percentile sin, *coordinated omission*: pausing your load generator while the system stalls silently deletes the worst samples.
+Gil Tene's HdrHistogram predates both. It fixes a value range in advance and sizes buckets to a configured number of significant digits, so **recording a sample is a small number of array-index operations with no allocation**. It is larger than a t-digest but constant-size, and two histograms configured alike merge by adding bucket counts, which makes it the standard choice inside benchmark harnesses (wrk2, JMH pipelines) and latency-sensitive services.
 
-## Mergeability is the whole game
+Tene's work also names the second classic percentile error, **coordinated omission**: a load generator that pauses while the system under test stalls stops issuing requests exactly during the slow window, silently deleting the worst samples from the record.
 
-All three earn their place through one algebraic property: **merge(sketch(A), sketch(B)) ≈ sketch(A ∪ B)**. That makes percentile estimation *distributive*: every host keeps a local sketch, ships it each flush interval, and any aggregator — per-AZ, per-service, global — merges freely and reads a statistically valid p99. Same trick as [HyperLogLog](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation) for distinct counts: don't ship answers, ship compressed distributions, because answers don't compose and distributions do.
+## Mergeability is the whole property
 
-Here's the failure and the fix in 30 lines (`pip install ddsketch numpy`):
+All three structures earn their place through one algebraic law: **merge(sketch(A), sketch(B)) ≈ sketch(A ∪ B)**, exact for DDSketch and HdrHistogram bucket counts, approximate for t-digest re-compression. That law makes percentile estimation distributive. Every host maintains a local sketch, ships it each flush interval, and any aggregator — per availability zone, per service, global — merges freely and reads a statistically valid p99. The same reasoning underlies [HyperLogLog](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation) for distinct counts: answers do not compose, compressed distributions do.
+
+## Demonstration
+
+The failure and the correction, using the `ddsketch` and `numpy` Python packages:
 
 ```python
 import numpy as np
@@ -54,7 +68,7 @@ for h in range(8):
     sk = DDSketch(relative_accuracy=0.01)
     for v in lat:
         sk.add(v)
-    merged.merge(sk)                           # sketches merge losslessly
+    merged.merge(sk)                           # bucket counts add exactly
     per_host_p99.append(np.percentile(lat, 99))
     all_values.append(lat)
 
@@ -67,7 +81,7 @@ print(f"merged-sketch p99   : {sketch:8.1f} ms  ({100*(sketch-truth)/truth:+.2f}
 print(f"avg of per-host p99 : {naive:8.1f} ms  ({100*(naive-truth)/truth:+.2f}%)")
 ```
 
-Output from this exact script:
+Output from this script:
 
 ```text
 true p99            :    425.6 ms
@@ -75,8 +89,55 @@ merged-sketch p99   :    424.2 ms  (-0.34%)
 avg of per-host p99 :    290.9 ms  (-31.64%)
 ```
 
-The merged sketch lands within its promised 1%; the averaged per-host p99s understate the tail by nearly a third — a dashboard that would swear an SLO was met while a chunk of users waited twice as long.
+The merged sketch lands inside its promised 1%. The averaged per-host p99s understate the tail by nearly a third — a dashboard showing 291 ms against a real tail of 426 ms, about 46% higher than reported. Any latency threshold falling between those two values is reported as met while it is being missed.
 
-The interview summary: never aggregate percentiles, aggregate *distributions*; pick DDSketch/native histograms when you need a stated relative-error guarantee and cross-host merging, t-digest when you want tiny sketches with excellent tail behavior, HDR histogram when you control the process and want raw speed; and quote memory honestly — kilobytes per (host, endpoint) series versus gigabytes of raw samples.
+### Implementation sketch (Scala)
 
-**Try next:** take one latency metric you currently export as a pre-computed p99 gauge and re-export it as a distribution (DDSketch, or a Prometheus native histogram) — then compare the merged fleet p99 against the old averaged gauge during your next deploy.
+The load-bearing part of DDSketch is the index mapping and the fact that merging is addition on a shared bucket layout.
+
+```scala
+final class DDSketch(alpha: Double):
+  private val gamma: Double = (1 + alpha) / (1 - alpha)
+  private val logGamma: Double = math.log(gamma)
+  private var buckets: Map[Int, Long] = Map.empty
+  private var count: Long = 0L
+
+  private def index(x: Double): Int = math.ceil(math.log(x) / logGamma).toInt
+
+  // the bucket's representative value: every point in bucket i is within alpha of it
+  private def value(i: Int): Double = 2 * math.pow(gamma, i) / (gamma + 1)
+
+  def add(x: Double): Unit =
+    require(x > 0, "the log mapping is defined for positive values only")
+    val i = index(x)
+    buckets = buckets.updated(i, buckets.getOrElse(i, 0L) + 1)
+    count += 1
+
+  /** Exact: two sketches with the same alpha share one bucket layout. */
+  def merge(other: DDSketch): Unit =
+    require(other.gamma == gamma, "sketches with different gamma cannot merge")
+    other.buckets.foreach: (i, c) =>
+      buckets = buckets.updated(i, buckets.getOrElse(i, 0L) + c)
+    count += other.count
+
+  def quantile(q: Double): Double =
+    val rank = math.floor(q * (count - 1)).toLong
+    var seen = 0L
+    buckets.toSeq.sortBy(_._1)
+      .find: (_, c) =>
+        seen += c
+        seen > rank
+      .map((i, _) => value(i))
+      .getOrElse(Double.NaN)
+```
+
+The bucket-collapsing rule that caps memory is omitted; without it the map grows with the dynamic range of the input.
+
+## Pitfalls
+
+- **Averaging or summing per-host p99 gauges.** The dashboard reports a tail far below the real one — the demonstration above understates by 31.6% — because each host discarded its distribution before export.
+- **Merging sketches configured with different parameters.** DDSketch bucket indices are only comparable under the same γ; combining sketches built with different relative accuracies adds counts belonging to different value ranges.
+- **Feeding DDSketch non-positive values directly.** The index is ⌈log_γ *x*⌉, which is undefined at zero and for negatives; zero and negative inputs need separate handling rather than falling through the log mapping.
+- **Coordinated omission in the load generator.** Measured p99 looks healthy through a stall because the generator stopped issuing requests during the stall and never recorded the slow responses.
+- **Treating t-digest's tail accuracy as a guarantee.** Its error is characterised empirically, so an adversarial or strongly ordered input stream can degrade quantiles that benchmarks showed to be tight.
+- **Exceeding an HdrHistogram's configured value range.** Recordings above the highest trackable value are rejected or clipped, so a stall longer than the configured range disappears from precisely the region under investigation.

@@ -1,9 +1,9 @@
 ---
-title: "Quorum replication: why R + W > N is the whole game"
+title: "Quorum replication: the R + W > N inequality"
 date: 2026-07-25
 track: distributed-systems
-summary: "Vector clocks tell you a conflict happened. Quorums stop most conflicts from happening in the first place — with a single inequality you can tune per request. Here's the rule, the arithmetic, and a 30-line simulation."
-reading_time: 5
+summary: "Vector clocks detect that a conflict happened. Quorums prevent most conflicts from arising, through a single inequality tuned per deployment. The rule, its arithmetic, and a simulation of the overlap property."
+reading_time: 6
 tags: [replication, quorum, consistency, availability, van-steen]
 sources:
   - title: "van Steen & Tanenbaum, Distributed Systems (4th ed.), §7.5 Replication protocols"
@@ -14,69 +14,93 @@ sources:
     url: "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
 ---
 
-Once you can *detect* a write-write conflict with vector clocks, the next question is how to *avoid* most of them without falling back to a global lock. Chapter 7 of van Steen & Tanenbaum gives the answer that Dynamo, Cassandra, and Riak all ship: quorum-based replication. The entire mechanism is one inequality you get to tune per request.
+**Gist.** Once a write-write conflict can be *detected* with vector clocks, the remaining problem is avoiding most conflicts without serialising every operation through a global lock. Quorum-based replication, described in chapter 7 of van Steen & Tanenbaum and introduced as weighted voting by Gifford (SOSP 1979), stores an object on `N` replicas and requires each read and each write to contact overlapping subsets, so that **every read set intersects the most recent write set**. The cost is that each operation now waits on several replicas rather than one, and the availability of reads and of writes moves in opposite directions as the quorum sizes are tuned.
 
 ## The rule
 
-Store every object on `N` replicas. On each operation, don't talk to all of them — talk to a *quorum*:
+Every object is stored on `N` replicas. An operation contacts a *quorum* rather than all of them:
 
 - a write must be acknowledged by `W` replicas,
 - a read must collect responses from `R` replicas.
 
-Pick `W` and `R` so that:
+`W` and `R` are chosen so that:
 
 ```
 R + W > N      # read quorum and write quorum always overlap
-W > N / 2      # two writes can never both win in disjoint sets
+W > N / 2      # two writes cannot both succeed on disjoint sets
 ```
 
-The first line is the one that matters most. If `R + W > N`, then any read set and any write set share at least one replica — by pigeonhole, they *cannot* be disjoint. So a read is guaranteed to touch at least one replica that saw the latest committed write. Attach a version (a vector clock or a plain counter) to each copy and the reader just keeps the newest one. That is how you get read-your-writes without contacting every node.
+The first inequality carries the guarantee. If `R + W > N`, a read set of size `R` and a write set of size `W` cannot be disjoint: were they disjoint their union would require `R + W` distinct replicas, more than the `N` that exist, so **by the pigeonhole principle at least one replica belongs to both**. That shared replica has already applied the latest committed write, so its copy is present among the read responses. Each copy carries a version — a vector clock or a monotonic counter — and the reader selects the newest of the `R` responses. Read-after-write consistency for a completed write therefore holds without contacting every node.
+
+The second inequality is a separate property. `R + W > N` says a reader sees a completed write; `W > N / 2` says two write quorums also overlap, so two concurrent writes cannot each succeed on a set the other never touched. Without it, `W = 1` on `N = 3` permits two writes to land on two different replicas with no replica witnessing both, and **the conflict is only discoverable later, on a read that happens to reach both**.
 
 ## The arithmetic is the design knob
 
-The same inequality gives you a slider between latency and consistency, and you can move it *per call*:
+The same inequality yields a slider between latency and consistency:
 
 | N | W | R | Behavior |
 |---|---|---|----------|
 | 3 | 2 | 2 | Balanced. Tolerates 1 node down for both reads and writes. |
-| 3 | 3 | 1 | Fast reads, `ROWA` writes — but any node down blocks writes. |
-| 3 | 1 | 3 | Fast writes, slow reads. Write survives if 2 nodes are down. |
-| 3 | 1 | 1 | `R + W = 2 ≯ 3`: **not** a strict quorum. Fast, eventually consistent, may read stale. |
+| 3 | 3 | 1 | Fast reads, `ROWA` writes — any node down blocks writes. |
+| 3 | 1 | 3 | Fast writes, slow reads. A write survives 2 nodes being down. |
+| 3 | 1 | 1 | `R + W = 2 ≯ 3`: **not** a strict quorum. Lowest latency, may read stale. |
 
-That last row is the important one: it's a legal, useful configuration, it just doesn't satisfy `R + W > N`, so it gives up the overlap guarantee in exchange for the lowest possible latency and highest availability. Dynamo exposes exactly these `(N, R, W)` knobs so each workload picks its own point on the curve — shopping carts favor availability, so they run low `W`; a config service that must never read stale runs `R + W > N`.
+The tolerance figures follow directly: an operation needing `k` responses survives `N − k` unreachable replicas, so **raising `W` for write-side consistency lowers write availability by exactly the same count**. Read-one-write-all (`ROWA`, row 2) is the extreme case — reads reach any single replica, and one unreachable replica stops all writes.
 
-## Prove it to yourself in 30 lines
+Rows 3 and 4 also violate `W > N / 2`, so write quorums no longer overlap even where the read guarantee survives. The last row abandons the overlap guarantee entirely in exchange for the lowest latency and the highest availability.
 
-Simulate replicas as a list of `(value, version)` and check the overlap property directly:
+Dynamo exposes the `(N, R, W)` triple so that each service instance selects its own point. The paper reports `(3, 2, 2)` as the configuration common to several instances, and describes a "high performance read engine" pattern in which services set `R = 1` and `W = N`.
 
-```python
-import random
+### Implementation sketch (Scala)
 
-N = 5
-replicas = [(None, 0)] * N          # (value, version) per replica
+The overlap property is checkable directly. Replicas are modelled as `(value, version)` pairs; a write mutates an arbitrary `W`-subset, a read samples an arbitrary `R`-subset and takes the highest version.
 
-def write(value, W):
-    version = max(v for _, v in replicas) + 1
-    targets = random.sample(range(N), W)      # any W replicas ack
-    for i in targets:
-        replicas[i] = (value, version)
-    return set(targets)
+```scala
+import scala.util.Random
 
-def read(R):
-    responders = random.sample(range(N), R)   # any R replicas answer
-    latest = max((replicas[i] for i in responders), key=lambda x: x[1])
-    return latest, set(responders)
+final case class Copy(value: Option[String], version: Long)
 
-w_set = write("v2", W=3)
-(val, ver), r_set = read(R=3)          # R + W = 6 > N = 5
-assert w_set & r_set, "quorums must overlap!"   # never fires
-print(val, "read from a quorum overlapping the write:", w_set & r_set)
+final class Store(n: Int):
+  private val replicas = Array.fill(n)(Copy(None, 0L))
+
+  private def sample(k: Int): Set[Int] =
+    Random.shuffle((0 until n).toList).take(k).toSet
+
+  def write(value: String, w: Int): Set[Int] =
+    val version = replicas.map(_.version).max + 1
+    val targets = sample(w)
+    targets.foreach(i => replicas(i) = Copy(Some(value), version))
+    targets
+
+  def read(r: Int): (Copy, Set[Int]) =
+    val responders = sample(r)
+    // the newest of R responses; correct only if some responder saw the write
+    (responders.map(i => replicas(i)).maxBy(_.version), responders)
+
+@main def overlap(): Unit =
+  val store = Store(5)
+  val written = store.write("v2", w = 3)
+  val (copy, answered) = store.read(r = 3)   // R + W = 6 > N = 5
+  assert((written & answered).nonEmpty)      // cannot fail
 ```
 
-Run it in a loop with `W=3, R=3` and the assertion never fires — every read set intersects the write set. Now drop to `W=2, R=2` (`R + W = 4 ≯ 5`) and it fails within a handful of iterations: you've reproduced a stale read. Being able to *cause* the stale read on demand is what makes the inequality stop feeling like trivia.
+With `N = 5, W = 3, R = 3` the assertion cannot fail: **the intersection is non-empty for every possible pair of subsets**, not merely for the ones the random sampler happens to draw. Lowering both to 2 gives `R + W = 4 ≯ 5`, and repeated iterations produce disjoint sets — a reproducible stale read, and the reason the inequality is a guarantee rather than a heuristic.
 
-## Where it bites
+## Where the guarantee stops
 
-Strict quorums are not linearizability. Concurrent writes can still produce siblings (that's why you kept the version), a coordinator crash mid-write can leave `W` partially applied, and "sloppy quorums" with hinted handoff — what Dynamo actually runs — relax the *membership* of the quorum during partitions, trading the clean overlap proof for staying writable. The clean rule is the mental model; production is the rule plus a pile of caveats.
+A strict quorum is not linearizability. Three gaps remain:
 
-**Try next:** extend the simulation to store a vector clock per replica instead of an integer version, run two concurrent writes at `W=2, N=3`, and detect the resulting siblings on read. You'll have wired quorums and last article's vector clocks into one working replica.
+- **Concurrent writes still produce siblings.** The overlap guarantees a reader *sees* the conflicting versions; it does not order them. Version metadata is what turns the sighting into a detectable conflict, which is why the version travels with every copy.
+- **A coordinator crash mid-write leaves `W` partially applied.** Fewer than `W` replicas acknowledged, so the write never completed, yet the replicas that did apply it retain the value. A later read may return it.
+- **Sloppy quorums relax membership.** Dynamo, under partition, accepts a write on replicas outside the object's designated set and records a hint so the value is handed off to the intended replica once it is reachable. The `W` acknowledgements are then not `W` acknowledgements *from the preference list*, so the pigeonhole argument no longer applies to the intended set. Writability is preserved; the clean overlap proof is not.
+
+The inequality is the mental model. Production systems are the inequality plus these caveats.
+
+## Pitfalls
+
+- Configuring `R + W > N` while running sloppy quorums with hinted handoff: reads still return stale values, because the acknowledging replicas during a partition are not the replicas the read set is drawn from.
+- Treating `R + W > N` as linearizability: two concurrent writes both satisfy the inequality and both survive, so a read returns siblings rather than a single latest value.
+- Setting `W = 1` to reduce write latency: `W > N / 2` is violated, so two writes can land on disjoint replicas and neither coordinator observes the other.
+- Raising `W` to `N` for stronger writes (`ROWA`): a single unreachable replica makes every write fail, since no write quorum can be assembled.
+- Comparing copies by wall-clock timestamp instead of a version: clock skew across replicas can make an older copy compare as newer, and the read then discards the committed write it correctly retrieved.
+- Assuming a partially applied write is invisible: the coordinator crashed before collecting `W` acknowledgements, but the replicas that applied the value serve it to subsequent reads.

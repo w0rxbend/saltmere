@@ -1,8 +1,8 @@
 ---
-title: "Cache vs. database: the dual-write problem and how to actually solve it"
+title: "Cache versus database: the dual-write problem and its partial solutions"
 date: 2026-08-10
 track: distributed-systems
-summary: "Updating the database and the cache is two writes to two systems, and there is no transaction spanning them. That non-atomicity is the whole problem — here's the classic cache-aside stale-set race as a timeline, the standard fixes and their trade-offs, and why CDC is the most robust answer."
+summary: "Updating the database and the cache is two writes to two systems with no transaction spanning them. That non-atomicity is the whole problem: the cache-aside stale-set race as a timeline, the standard mitigations and their costs, and why change data capture derives invalidation from the authoritative log."
 reading_time: 7
 tags: [caching, consistency, dual-write, cdc, debezium, cache-invalidation]
 sources:
@@ -18,13 +18,13 @@ sources:
     url: "https://github.com/redis-developer/sql-cache-invalidation-debezium"
 ---
 
-A cache in front of a database is two copies of the truth. Keeping them agreed sounds like a caching problem, but it is really an instance of a more general one: the **dual-write problem**. You have to write to two independent systems — the database and the cache — and there is no transaction that spans both. Either write can succeed while the other fails or is delayed, and no amount of careful ordering makes the pair atomic. As Auth0's write-up puts it, once you must "write data to multiple systems atomically" but "can't use atomic transactions," any interleaving of failures leaves the two diverged. Everything below is a strategy for making that divergence *rare and self-healing* rather than *permanent*.
+**Gist.** A cache placed in front of a database holds a second copy of the truth, and keeping the two agreed requires writing to two independent systems with **no transaction spanning both** — the dual-write problem. The practical mechanism is not atomicity but convergence: invalidate rather than update, order the database commit before the invalidation, bound the residual staleness with a time-to-live (TTL), and derive the invalidation from the database's own replication log via change data capture (CDC). The cost is that consistency becomes eventual with a bounded staleness window, and every mitigation adds either extra cache traffic, extra write-path latency, or a whole asynchronous pipeline to operate.
 
-## The race that ruins cache-aside
+## The race that defeats cache-aside
 
-Cache-aside (lazy loading) is the default read pattern: read from cache; on a miss, read the database and populate the cache; on a write, update the database and then delete the cache key. It works almost always, which is exactly why the failure is so easy to miss.
+Cache-aside (lazy loading) is the default read pattern: read from the cache; on a miss, read the database and populate the cache; on a write, update the database and then delete the cache key. It behaves correctly under almost every interleaving, which is what makes the exception easy to overlook.
 
-The dangerous case is a **read miss that overlaps a write**. Here is the timeline for key `user:42`, currently *not* in cache, with DB value `v1`:
+The dangerous case is a **read miss that overlaps a write**. The timeline for key `user:42`, initially absent from the cache, with database value `v1`:
 
 ```
 t0  Reader R  : GET user:42            -> cache MISS
@@ -34,48 +34,39 @@ t3  Writer W  : DEL user:42            -> cache empty (nothing to delete)
 t4  Reader R  : SET user:42 = v1       -> cache now holds v1  (STALE)
 ```
 
-R read the database *before* W committed, then wrote its stale result into the cache *after* W's invalidation had already run. W did everything right and still lost. The cache now serves `v1` while the database says `v2`, and — critically — **nothing corrects it**. The next write might not touch this key for hours. This is the "multi-instance population race" Redis names as cache-aside's signature failure mode, and it is the same stale-set race the Facebook memcache team hit at scale and had to solve with leases.
+The reader loaded the database *before* the writer committed and stored its result *after* the writer's invalidation had already executed. The writer performed the prescribed sequence and still lost. The cache now serves `v1` while the database holds `v2`, and **no subsequent event corrects it**: the next write to that key may be hours away. This is the stale-set race that the Facebook memcache deployment addressed with leases: a token handed out on a miss, which the cache checks before accepting the corresponding set (Nishtala et al., NSDI 2013).
 
-Note what makes it lethal: the stale value is *durable*. Transient inconsistency is fine; a cache entry that is wrong until the heat death of the TTL is not.
+The property that makes it damaging is that **the stale entry is durable**. Transient divergence during the write is tolerable; an entry that stays wrong until its TTL expires — or indefinitely, if no TTL is set — is not.
 
-## Delete, don't update
+## Invalidate rather than update
 
-First rule: on a write, **delete the cache key rather than write the new value into it.** Two writers racing to `SET` the cache can commit to the DB in one order and to the cache in the opposite order, leaving the cache pinned to the loser's value. Deleting sidesteps that entirely — a delete is idempotent and order-independent, and the next reader repopulates from the database. Delete also avoids computing and caching a value nobody has asked for yet. Redis and most practitioners treat "invalidate, don't update" as the baseline.
+The first rule is that a write **deletes the cache key instead of storing the new value**. Two writers racing to `SET` the cache may commit to the database in one order and to the cache in the opposite order, leaving the cache pinned to the value of the transaction that lost at the database. Deletion removes that class of interleaving: **a delete is idempotent and order-independent**, and the next reader repopulates from the authoritative store. Deletion also avoids computing and caching a value no client has requested. Invalidation rather than update is the baseline the Redis cache-consistency guidance recommends.
 
-## Order: update DB, *then* delete cache
+## Ordering: commit the database, then delete
 
-Given you are deleting, which comes first — the DB write or the cache delete?
+Given deletion, the remaining choice is which operation precedes the other.
 
-**Delete-then-update is worse.** You delete the key, and in the window before your DB commit lands, a concurrent reader misses, reads the *old* DB value, and repopulates the cache — the stale value is back, and now it's durable. **Update-then-delete** shrinks the bad window to the gap between commit and delete, which is milliseconds. So: write the database, commit, *then* delete the key. It is not perfect (the timeline above is still update-then-delete), but it is strictly better and it is the standard cache-aside ordering.
+**Delete-then-commit is the worse order.** In the window between the delete and the commit, a concurrent reader misses, reads the *pre-commit* database value, and repopulates the cache; the stale value is restored and is durable. **Commit-then-delete** narrows the vulnerable window to the interval between commit and delete, which is a single cache round trip. It does not eliminate the race — the timeline above is already commit-then-delete — but it strictly dominates the alternative and is the standard cache-aside ordering.
 
 ## Delayed double delete
 
-The residual race survives because a slow reader can `SET` a stale value *after* your delete. The pragmatic patch is **delayed double delete**: delete the key, do the write, then schedule a *second* delete a short time later (say 500 ms–1 s).
+The residual race survives because a reader that started early can `SET` a stale value *after* the writer's delete. The common mitigation is **delayed double delete**: commit the write, delete the key, then schedule a *second* delete a short interval later. (Some descriptions add a further delete before the write; the load-bearing element is the delayed one.)
 
-```python
-def update_user(id, patch):
-    cache.delete(f"user:{id}")        # optional pre-delete
-    db.update(id, patch)              # commit
-    cache.delete(f"user:{id}")        # standard post-write delete
-    schedule_after(delay_ms=700,      # second delete evicts any
-        lambda: cache.delete(f"user:{id}"))   # stale set that snuck in
-```
+The second delete evicts whatever a lagging reader stored in the meantime. The delay is chosen to exceed the duration of a typical read, trading one additional eviction (and the miss it causes) for closure of the window. It is **probabilistic, not a proof**: a reader stalled for longer than the configured delay still leaves a stale entry behind.
 
-The second delete evicts whatever a lagging reader wrote in the meantime. The delay must exceed a typical read's DB-round-trip; you are trading a tiny extra eviction for closing the window. It is a probabilistic mitigation, not a proof — a reader stalled longer than your delay still loses — but it removes the common case cheaply.
+## TTL as a bound, not as the plan
 
-## TTL: the safety net, not the plan
+Every cached entry carries a TTL. A TTL does not prevent staleness; it **bounds its duration**. With a five-minute TTL the worst case is five minutes of incorrect data, after which the key expires and reloads from the database. The TTL is what makes the other mechanisms forgiving: if a delete is lost, a keyspace notification is missed, or a double delete races unfavourably, expiry still guarantees convergence within a bounded window. TTLs are segmented by volatility — longer for slowly changing reference data, shorter for rapidly changing data. A TTL used as the *only* consistency mechanism sets the staleness bound equal to the TTL itself.
 
-Give every cached entry a TTL. It does not prevent staleness; it *bounds* it. With a 5-minute TTL, the worst case is 5 minutes of wrong data, after which the key expires and reloads. TTL is the backstop that makes every other mechanism forgiving: if a delete is lost, a keyspace event is missed, or a double-delete races badly, the TTL guarantees convergence within a bounded window. Segment it by volatility — minutes for a product catalog, seconds (or a different pattern) for live inventory. Never rely on TTL as your *only* consistency mechanism; rely on it as the floor under everything else.
+## Write-through: cost moved to the write path
 
-## Write-through: pay on the write path
+Write-through routes writes through the cache, which synchronously updates itself and the database, so readers observe the new value immediately (read-after-write visibility). It does not escape the dual-write problem; it **relocates** it. The cache write and the database write remain two operations, and a failure between them leaves the pair inconsistent, with nothing in the pattern itself to reconcile them. Write-through also pays two-system latency on every write and populates entries no reader requests. It suits workloads where read-after-write visibility is required, such as balances and orders; it is not a consistency guarantee.
 
-Write-through routes writes through the cache, which synchronously updates itself and the database, so readers see the new value immediately (read-your-writes). But it does not escape the dual-write problem — it *relocates* it. The cache and DB writes are still two operations; a partial failure between them leaves them inconsistent and, as Redis notes, requires manual reconciliation. You also pay two-system latency on every write and warm cold data nobody reads. Good for balances and orders where read-your-writes matters; not a free consistency guarantee.
+## CDC: invalidation derived from the log
 
-## CDC: derive invalidation from the log (most robust)
+Every option above shares one defect: **the invalidation is a second write that the application must remember to issue**. If the application omits it, crashes between the two operations, or a batch job modifies the database directly, the cache is never informed.
 
-Every option above shares one flaw: **the invalidation is a second write the application must remember to make.** Forget it, crash between the two, or let a batch job update the DB directly with `psql`, and the cache never hears about it.
-
-Change Data Capture inverts this. Instead of the application telling the cache, a log-based connector like **Debezium** tails the database's replication log (Postgres WAL, MySQL binlog) and emits one event per *committed* row change. A consumer turns each event into a cache delete. The Debezium team's argument is the key one: "by capturing changes directly from the database log, no events will be missed," because invalidation is *derived from the authoritative source* rather than being a separate, forgettable write. It even catches out-of-band changes made straight to the database. This is the closest thing to escaping the dual-write problem — there is now only *one* write (to the DB), and the cache update is a downstream consequence of the DB's own durable commit record.
+Change data capture inverts the direction. A log-based connector such as **Debezium** tails the database's replication log — the PostgreSQL write-ahead log (WAL) or the MySQL binary log — and emits one event per *committed* row change; a consumer converts each event into a cache delete. Because the log is the record the database itself commits against, a change that is committed is a change the connector sees. The invalidation is **derived from the authoritative commit record** rather than issued as a separate, omissible write, so out-of-band modifications made straight against the database are captured as well. The application performs a single write, and the cache update becomes a downstream consequence of the database's own durable log.
 
 ```
                       ┌─────────────┐
@@ -94,22 +85,59 @@ Change Data Capture inverts this. Instead of the application telling the cache, 
                           Redis
 ```
 
-Two caveats to design for. CDC is **at-least-once**, so consumers must be idempotent — a delete trivially is. And events arrive *after* commit, so this is eventual, not synchronous: expect a lag of milliseconds to low seconds. Debezium orders changes per source table/key, which is what lets a `DEL` and a later `SET` apply in the right order. This is the same architecture as the [transactional outbox](/articles/microservices/2026-07-26-transactional-outbox-pattern) — write the change atomically inside the DB transaction, propagate it asynchronously — and it is exactly the pipeline [Debezium change data capture](/articles/microservices/2026-07-31-debezium-change-data-capture) is built for; the [redis-developer CDC reference project](https://github.com/redis-developer/sql-cache-invalidation-debezium) wires Postgres → Debezium → Redis end to end.
+Two properties constrain the design. Delivery is **at-least-once**, so consumers must be idempotent — a delete is. And events are emitted *after* commit, making the result eventual rather than synchronous, with a propagation lag. Events carry the row's primary key as the message key, and a log-backed transport preserves order within a partition, so changes to the same row reach the consumer in commit order. The architecture matches the [transactional outbox](/articles/microservices/2026-07-26-transactional-outbox-pattern) — record the change atomically inside the database transaction, propagate it asynchronously — and it is the pipeline [Debezium change data capture](/articles/microservices/2026-07-31-debezium-change-data-capture) implements; the [redis-developer CDC reference project](https://github.com/redis-developer/sql-cache-invalidation-debezium) wires Postgres to Debezium to Redis end to end.
 
-## Versioned keys / CAS
+## Versioned keys and compare-and-set
 
-When you *must* write values into the cache (not just delete), carry a version. Store `{value, version}` and only overwrite if the incoming version is greater — a compare-and-set, backed by the DB's monotonically increasing version column or transaction id. A stale reader trying to `SET v1` over `v2` is rejected because `1 < 2`. This directly kills the timeline race: the late write cannot win. The cost is a version on every row and CAS logic in the client (Redis Lua or `WATCH`/`MULTI`). It is the Facebook memcache "leases" idea in a simpler form — attach a token that lets the cache reject an out-of-order set.
+Where values must be written into the cache rather than only deleted, each entry carries a version. The cache stores `{value, version}` and accepts an overwrite only if the incoming version is greater — a compare-and-set (CAS) backed by a monotonically increasing version column or transaction identifier from the database. A stale reader attempting to store `v1` over `v2` is rejected because `1 < 2`, which removes the timeline race above: the late write cannot win. The costs are a version attribute on every row and CAS logic in the client, expressed in Redis as a Lua script or a `WATCH`/`MULTI` transaction. It plays the same role as the memcache lease token: a value the cache checks in order to reject an out-of-order set.
 
-## What consistency can you actually buy
+### Implementation sketch (Scala)
 
-You cannot get perfect consistency cheaply. Strong consistency between an independent cache and DB would need a distributed transaction across both on every write — the latency and availability cost is exactly why you added a cache in the first place. So the honest target is **eventual consistency with bounded staleness**:
+```scala
+final case class Versioned[A](value: A, version: Long)
 
-- **Delete (not update), update-DB-then-delete** — cuts the race window to milliseconds.
-- **Delayed double delete** — closes the common slow-reader case.
+// Compare-and-set population: a late reader cannot overwrite a newer entry.
+def populate[A](
+    cache: TrieMap[String, Versioned[A]],
+    key: String,
+    incoming: Versioned[A]
+): Boolean =
+  cache.get(key) match
+    case Some(current) if current.version >= incoming.version => false
+    case Some(current) =>
+      // replace only if nothing changed underneath between read and write
+      cache.replace(key, current, incoming) || populate(cache, key, incoming)
+    case None =>
+      cache.putIfAbsent(key, incoming).isEmpty || populate(cache, key, incoming)
+
+// Commit-then-delete, with a second delete after the reader round-trip window.
+def write[A](key: String, commit: () => Unit, delete: String => Unit,
+             schedule: (FiniteDuration, () => Unit) => Unit,
+             delay: FiniteDuration): Unit =
+  commit()                                   // database is authoritative first
+  delete(key)
+  schedule(delay, () => delete(key))         // evicts a stale set that arrived late
+```
+
+## What consistency is purchasable
+
+Strong consistency between an independent cache and a database requires a distributed transaction across both on every write; that latency and availability cost is the reason the cache exists. The attainable target is **eventual consistency with bounded staleness**:
+
+- **Delete rather than update, commit before deleting** — reduces the race window to one cache round trip.
+- **Delayed double delete** — closes the common lagging-reader case, probabilistically.
 - **TTL** — bounds worst-case staleness and guarantees convergence.
-- **CDC** — makes invalidation reliable and log-derived, not app-remembered.
-- **Versioned CAS** — rejects out-of-order writes when you cache values.
+- **CDC** — makes invalidation log-derived rather than application-remembered.
+- **Versioned CAS** — rejects out-of-order sets when values are cached.
 
-The production stance most sources converge on is *layered*: pick the read/write pattern for your workload, put a conservative TTL under it as a backstop, and add an event-driven freshness signal (CDC or keyspace notifications) on top. No single trick is airtight; the combination makes stale data rare, short-lived, and self-correcting — which is the realistic definition of "consistent" here.
+The stance the cited sources converge on is layered: select the read/write pattern for the workload, place a conservative TTL beneath it as a backstop, and add an event-driven freshness signal (CDC or keyspace notifications) above it. No single mechanism is airtight; the combination makes stale entries rare, short-lived and self-correcting.
 
-**Try next:** implement the delayed-double-delete around your existing cache-aside writes and measure the stale-hit rate before and after; then stand up the Postgres → Debezium → Redis pipeline from the redis-developer reference project and compare its convergence lag against your TTL floor.
+## Pitfalls
+
+- **Writing the new value into the cache instead of deleting it.** Symptom: the cache holds the value of a transaction that lost at the database. Cause: two writers commit in one order and set the cache in the reverse order.
+- **Deleting the key before the database commit.** Symptom: the stale value returns immediately and persists. Cause: a concurrent reader misses during the window, reads the pre-commit value, and repopulates.
+- **Treating delayed double delete as a proof.** Symptom: occasional durable stale entries despite the second delete. Cause: a reader stalled longer than the configured delay stores its value after both deletes.
+- **Caching without a TTL.** Symptom: a single lost invalidation produces an entry that is wrong indefinitely. Cause: no expiry exists to force convergence when the invalidation path fails.
+- **Assuming write-through removes the dual write.** Symptom: cache and database disagree after a partial failure, with no reconciliation path in the pattern. Cause: the cache write and database write remain two non-atomic operations.
+- **Non-idempotent CDC consumers.** Symptom: duplicated side effects on redelivery. Cause: CDC delivery is at-least-once; only operations such as delete tolerate repetition unchanged.
+- **Expecting CDC invalidation to be synchronous.** Symptom: a client reads its own write and receives the pre-write cached value. Cause: events are emitted after commit, so the cache converges with a propagation lag.
+- **Applying CAS without a monotonic version source.** Symptom: comparisons accept an older value. Cause: the version does not increase monotonically per row, so `<` no longer identifies the stale write.

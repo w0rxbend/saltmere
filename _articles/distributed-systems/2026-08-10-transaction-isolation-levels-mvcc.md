@@ -2,8 +2,8 @@
 title: 'Isolation levels & MVCC: the anomalies, not the names, are the spec'
 date: 2026-08-10
 track: distributed-systems
-summary: 'The ''I'' in ACID, defined properly. Isolation levels are named by which read phenomena they forbid — dirty read, non-repeatable read, phantom — but the SQL standard''s names are a trap: Postgres has no real read-uncommitted, its ''repeatable read'' is snapshot isolation, and MySQL InnoDB defaults to repeatable read. MVCC lets readers not block writers, but snapshot isolation still permits write skew and lost update. Here''s the anomaly/level matrix, a concrete write-skew example, and the SERIALIZABLE / SELECT FOR UPDATE fixes.'
-reading_time: 6
+summary: 'Isolation levels are defined by the read phenomena they forbid — dirty read, non-repeatable read, phantom — but the SQL standard''s names are not portable: PostgreSQL has no true read-uncommitted, its repeatable read is snapshot isolation, and MySQL InnoDB defaults to repeatable read. Multi-version concurrency control lets readers avoid blocking writers, yet snapshot isolation still permits write skew and lost update. Covers the anomaly/level matrix, a concrete write-skew case, and the SERIALIZABLE and SELECT FOR UPDATE remedies.'
+reading_time: 7
 tags:
 - transactions
 - isolation-levels
@@ -33,24 +33,24 @@ sources:
   url: https://vladmihalcea.com/write-skew-2pl-mvcc/
 ---
 
-Ask a candidate "what does the I in ACID mean" and you'll hear "transactions don't interfere." True but useless. Isolation is a *spectrum*, and the interview question underneath it is always: **which concurrency anomalies does this level allow, and what does that cost me?** Get the anomalies right and the four SQL isolation levels fall out for free — because the levels are literally *defined* by which anomalies they forbid.
+**Gist.** Concurrent transactions interleave, and the interleaving can produce results no serial execution would produce. Isolation levels are not a quality scale but a specification: each level is defined by the set of concurrency anomalies it forbids, and multi-version concurrency control (MVCC) implements the weaker levels by letting each transaction read from a consistent snapshot of committed versions instead of blocking on writers. The cost is that snapshot isolation — the level most engines call *repeatable read* — still admits write skew and lost update, so preserving an invariant that spans multiple rows requires either explicit row locks or a serializable level whose transactions can abort and must be retried.
 
 ## The read phenomena
 
-The ANSI SQL standard names three phenomena. They are the vocabulary; learn them precisely.
+The ANSI SQL standard names three phenomena. They are the vocabulary of the specification.
 
-- **Dirty read** — you read a row another transaction wrote but has not committed. If that transaction rolls back, you read data that never existed.
-- **Non-repeatable read** — you read a row, another transaction commits an *update* to it, you read it again in the *same* transaction and get a different value. The row changed under you.
-- **Phantom read** — you run a query with a predicate (`WHERE status = 'pending'`), another transaction *inserts* a row matching that predicate and commits, you re-run the query and a new row appears. Non-repeatable read is about a row's *value* changing; a phantom is about the *set of matching rows* changing.
+- **Dirty read** — a transaction reads a row another transaction has written but not committed. If the writer rolls back, the value read never existed in any committed state.
+- **Non-repeatable read** — a transaction reads a row, a second transaction commits an *update* to it, and a re-read within the *same* transaction returns a different value.
+- **Phantom read** — a transaction runs a predicate query (`WHERE status = 'pending'`), a second transaction *inserts* a matching row and commits, and re-running the query returns an additional row. A non-repeatable read concerns a row's *value*; a phantom concerns the *set of matching rows*.
 
-DDIA adds two the ANSI standard misses, and interviewers love them because they survive levels that "sound safe":
+Two further phenomena the ANSI list omits are named by Berenson et al. (as P4 *lost update* and A5B *write skew*) and treated at length in DDIA Ch. 7. Both survive levels whose names suggest safety:
 
-- **Lost update** — two transactions read a value, both modify it based on what they read, both write back. One write silently clobbers the other (the classic read-modify-write counter increment).
-- **Write skew** — a generalization of lost update. Two transactions read an overlapping set of rows, each makes a decision based on what it read, and each writes to a *different* row. Individually every write is legal; together they violate an invariant that spanned both reads. More on this below — it's the anomaly that breaks snapshot isolation.
+- **Lost update** — two transactions read a value, each modifies it based on what it read, and both write back. The second write overwrites the first, and the first update is lost. The read-modify-write counter increment is the canonical instance.
+- **Write skew** — the generalization of lost update. Two transactions read an overlapping set of rows, each decides based on what it read, and each writes to a *different* row. Each write is individually legal; jointly they violate an invariant that spanned both reads.
 
 ## The four levels, by what they forbid
 
-Each level is a strictly stronger promise: it forbids everything weaker forbids, plus one more phenomenon.
+Each level forbids everything the weaker levels forbid, plus one further phenomenon.
 
 | Isolation level | Dirty read | Non-repeatable read | Phantom read | Serialization anomaly (write skew) |
 | --- | --- | --- | --- | --- |
@@ -59,31 +59,31 @@ Each level is a strictly stronger promise: it forbids everything weaker forbids,
 | Repeatable read | Prevented | Prevented | Allowed* | Allowed |
 | Serializable | Prevented | Prevented | Prevented | Prevented |
 
-That's the textbook matrix. Now the nuance that separates a strong answer from a memorized one.
+The asterisk is the point at which the standard and real engines part company.
 
-## The names lie — real databases differ
+## The names are not portable
 
-The Berenson et al. 1995 paper ("A Critique of ANSI SQL Isolation Levels") is the key citation here. Its argument: the ANSI standard defines levels by prose descriptions of phenomena that are *ambiguous*, and worse, the phenomena as written don't capture snapshot isolation at all. Real engines diverged accordingly, so the level names are not portable across databases.
+Berenson et al., *A Critique of ANSI SQL Isolation Levels* (SIGMOD 1995), argues that the standard defines levels through prose descriptions of phenomena that are ambiguous, and that the phenomena as written do not characterise snapshot isolation. Implementations diverged accordingly, so a level name alone does not determine which anomalies are possible.
 
-**PostgreSQL** implements only three distinct levels internally:
+**PostgreSQL** exposes four level names but implements three distinct behaviours.
 
-- It has **no true read-uncommitted** — request it and you get read-committed. Under MVCC there is simply no way to read an uncommitted version, so "dirty read" is impossible in Postgres at *any* level.
-- Its **"repeatable read" is snapshot isolation**, which is *stronger* than the standard requires. The Postgres docs are explicit: its repeatable read "prevents all of the phenomena described... except for serialization anomalies," and it **does not allow phantom reads** — hence the asterisk in the matrix above. Providing a stronger guarantee than the standard mandates is legal, because the standard says which anomalies must *not* occur, not which *must*.
-- **Serializable** (since 9.1) uses Serializable Snapshot Isolation (SSI): snapshot isolation plus runtime monitoring of read/write dependencies, aborting a transaction with `could not serialize access due to read/write dependencies` when the interleaving has no equivalent serial order.
+- There is **no true read-uncommitted**: a request for it behaves as read committed. Under MVCC an uncommitted version is not visible to any other transaction, so a dirty read cannot occur at *any* level.
+- Its **repeatable read is snapshot isolation**, stronger than the standard requires. The documentation states that this level prevents all the described phenomena except serialization anomalies, and that it **does not allow phantom reads** — the asterisk in the matrix. A stronger guarantee is conforming, because the standard constrains which anomalies must *not* occur, not which must.
+- **Serializable** (since 9.1) is implemented by Serializable Snapshot Isolation (SSI): snapshot isolation plus runtime tracking of read/write dependencies, aborting a transaction with `could not serialize access due to read/write dependencies` when the observed interleaving has no equivalent serial order.
 
-**MySQL InnoDB** defaults to **repeatable read** (Postgres and most others default to read-committed — a real gotcha when porting). InnoDB's repeatable read uses consistent-read snapshots for plain `SELECT`, but for locking reads it applies **next-key locks** (row lock + gap lock) that lock the gaps between index records, which prevents phantoms for those locking statements. So "repeatable read" means materially different things in Postgres versus MySQL.
+**MySQL InnoDB** defaults to **repeatable read**, whereas PostgreSQL defaults to read committed — a behavioural difference that appears on migration. InnoDB serves plain `SELECT` from consistent-read snapshots, but for locking reads it applies **next-key locks** (a row lock combined with a gap lock on the space between index records), which prevents phantoms for those statements. "Repeatable read" therefore denotes materially different behaviour in the two engines, and the accurate formulation is in terms of anomalies: the standard permits phantoms at repeatable read; PostgreSQL's snapshot-isolation implementation forbids them; InnoDB blocks them for locking reads via next-key locks.
 
-The lesson for the interview: **never say "repeatable read prevents X" without naming the database.** Say "the standard permits phantoms at repeatable read, but Postgres's snapshot-isolation implementation forbids them and MySQL blocks them for locking reads via next-key locks."
+## MVCC: the visibility rule
 
-## MVCC: why readers don't block writers
+Rather than overwriting a row in place, MVCC retains **multiple committed versions**, each tagged with the transaction that created it. A write appends a new version; the prior version remains visible to transactions that began earlier.
 
-Multi-version concurrency control is the machinery under all of this. Instead of overwriting a row in place, the database keeps **multiple committed versions**, each tagged with the transaction that created it. On write, it appends a new version; the old one stays visible to transactions that started earlier.
+At the start of a transaction — or at its first read, depending on level — the engine captures a **snapshot**: the set of transaction identifiers committed as of that instant. Every read then filters the version chain to the latest version committed before the snapshot and not created by an in-flight transaction. The consequence is that **a reader never waits for a writer and a writer never waits for a reader**, because they address different versions of the same row; a long analytical scan can proceed against a live transactional database without blocking writes.
 
-When a transaction begins (or issues its first read, depending on level), it captures a **snapshot**: the set of transaction IDs committed as of that instant. Every read filters versions to "the latest committed before my snapshot, not created by an in-flight transaction." The payoff: a reader never waits for a writer and vice versa — they touch different versions, so analytics queries run against a live OLTP database without blocking writes. Read-committed takes a *fresh* snapshot per statement; snapshot isolation (repeatable read) takes *one* snapshot for the whole transaction, which is exactly what makes reads repeatable.
+The level determines snapshot lifetime. Read committed takes a **fresh snapshot per statement**, which is why a re-read can observe a newer value. Snapshot isolation takes **one snapshot for the whole transaction**, which is precisely what makes reads repeatable.
 
-## Where snapshot isolation breaks: write skew
+## Where snapshot isolation fails: write skew
 
-Snapshot isolation is powerful but **not serializable**. The canonical counterexample (DDIA's on-call doctors) shows why. Rule: at least one doctor must stay on call per shift. Two doctors, Alice and Bob, both on call, both feeling sick, both click "go off call" at the same instant.
+Snapshot isolation is not serializable. DDIA's on-call doctors example is the standard counterexample. The invariant: at least one doctor must remain on call per shift. Two doctors, both on call, concurrently request to go off call.
 
 ```sql
 -- Transaction A (Alice)              -- Transaction B (Bob), concurrent
@@ -97,11 +97,11 @@ UPDATE doctors SET on_call = false    UPDATE doctors SET on_call = false
 COMMIT;                               COMMIT;
 ```
 
-Both transactions read `count = 2` from their own snapshot — neither sees the other's uncommitted update. Both conclude the invariant holds, each updates a *different* row, both commit. Result: **zero doctors on call.** No dirty read, no non-repeatable read, no phantom, no lost update on a single row — every classic anomaly check passes, yet the invariant is destroyed. That's write skew, and it slips straight through snapshot isolation / repeatable read.
+Each transaction reads `count = 2` from its own snapshot and does not observe the other's uncommitted update. Each concludes the invariant holds, each updates a *different* row, and both commit. The resulting state has **zero doctors on call**. No dirty read, no non-repeatable read, no phantom and no single-row lost update occurred: every classic anomaly check passes while the invariant is destroyed. **The invariant spans rows that no single write touches, which is exactly the case snapshot isolation does not cover.**
 
 ### Fix 1: SELECT ... FOR UPDATE
 
-Take explicit locks on the rows your decision depends on, forcing the transactions to serialize:
+Explicit locks on the rows the decision depends on force the transactions to serialize.
 
 ```sql
 BEGIN;
@@ -112,26 +112,68 @@ SELECT * FROM doctors
 COMMIT;
 ```
 
-`FOR UPDATE` locks the rows the query returns, so the second transaction blocks until the first commits, then re-evaluates against the new state and correctly refuses. The caveat: it only protects when the conflict is over rows that **already exist**. If the write skew turns on the *absence* of rows (e.g. "no overlapping meeting-room booking exists, so insert one"), there are no rows to lock — that's a phantom-shaped conflict, and `FOR UPDATE` can't help.
+`FOR UPDATE` locks the rows the query returns, so the second transaction blocks until the first commits. What happens next depends on the level: at read committed PostgreSQL re-evaluates the locking clause against the newly committed row version, so the second transaction sees `count = 1` and correctly refuses; at repeatable read it instead aborts with a serialization failure, because the updated row is outside its snapshot. Either way the invariant survives, but the repeatable-read case still needs a retry. The limitation is structural: **only rows that already exist can be locked.** Where the invariant turns on the *absence* of rows — "no overlapping booking exists, therefore insert one" — the conflict is phantom-shaped and there is nothing for `FOR UPDATE` to lock.
 
 ### Fix 2: SERIALIZABLE
 
-The general fix. In Postgres, `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` runs SSI: it tracks the read/write dependency between the two transactions (each read a set the other wrote) and aborts one at commit with a serialization failure. You retry the aborted transaction; on retry its snapshot sees `count = 1` and it correctly refuses. SSI covers the phantom-shaped cases too, because it uses predicate locking rather than locking concrete rows. The cost is optimistic: under contention you pay in aborts and must wrap every transaction in retry logic.
+In PostgreSQL, `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` runs SSI. It records the read/write dependency between the two transactions — each read a set the other subsequently wrote — and aborts one with a serialization failure. On retry the aborted transaction's new snapshot reads `count = 1` and refuses. SSI covers the phantom-shaped cases because it locks predicates rather than concrete rows. The mechanism is optimistic, so contention is paid in aborts, and every transaction requires retry logic.
 
-The trade-off in one line: `FOR UPDATE` is targeted, pessimistic, and needs you to know exactly which rows matter; `SERIALIZABLE` is general, optimistic, and needs a retry loop. Retry loops are the same discipline you already need for idempotent consumers — see the [delivery-semantics writeup](/articles/distributed-systems/2026-08-10-delivery-semantics-exactly-once) on why "just retry" only works when the operation is safe to repeat.
+The trade-off: `FOR UPDATE` is targeted and pessimistic and requires knowing in advance which rows carry the invariant; `SERIALIZABLE` is general and optimistic and requires a retry loop. The retry discipline matches that of idempotent consumers — see the [delivery-semantics writeup](/articles/distributed-systems/2026-08-10-delivery-semantics-exactly-once) on why retrying is safe only when the operation tolerates repetition.
 
-## The interview answer, compressed
+## SSI: serializability without serial execution
 
-Levels are defined by anomalies, not by their names. Read committed stops dirty reads; repeatable read adds non-repeatable reads; serializable stops everything including write skew. But the names are per-database fiction: Postgres has no dirty reads at all, its repeatable read is snapshot isolation that also blocks phantoms, and MySQL InnoDB defaults to repeatable read while Postgres defaults to read committed. MVCC makes weak isolation cheap — snapshots let readers and writers pass each other — but snapshot isolation still permits write skew, which you fix with `SELECT ... FOR UPDATE` on the rows your invariant reads, or with true `SERIALIZABLE` plus a retry loop.
+PostgreSQL 9.1 and later implement Serializable Snapshot Isolation (Cahill's algorithm, productionized by Ports & Grittner, VLDB 2012). Transactions execute on ordinary snapshots, and reads are additionally tracked by non-blocking **SIREAD locks** — predicate locks recorded at tuple, page or relation granularity, and coarsened upward when too many accumulate. Because they cover ranges rather than only the rows a transaction wrote, phantom-shaped write skew is detected too. The engine watches for **rw-antidependencies**: T1 read something T2 subsequently wrote. The underlying theorem is that every cycle in the dependency graph of a snapshot-isolation execution contains two rw-antidependencies in sequence; on detecting that dangerous structure, SSI aborts one transaction with SQLSTATE `40001`.
 
-**Try next:** open two `psql` sessions, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` in both, and reproduce the doctors write skew end to end — watch both commit and the invariant break. Then rerun at `SERIALIZABLE` and confirm one aborts with `could not serialize access`; wrap it in a retry and prove the invariant holds.
+The obligation this places on application code follows directly: **a serializable transaction can be rejected without having written any row another transaction touched**, so every such transaction must be wrapped in a retry loop. The check is conservative, so false positives occur; the VLDB paper reports modest overhead relative to plain snapshot isolation, and no read blocks. The pessimistic alternative, two-phase locking, takes shared locks on everything read and blocks rather than aborting.
 
-## SSI: serializable without serial execution
+### Implementation sketch (Scala)
 
-Postgres 9.1+ implements **Serializable Snapshot Isolation** (Cahill's algorithm, productionized by Ports & Grittner). It runs transactions on plain snapshots but additionally tracks reads with non-blocking **SIREAD locks** (including predicate/index-range granularity, which is how phantoms and write skew through predicates get caught). It watches for **rw-antidependencies** — T1 read something T2 later wrote. Theory says every SI anomaly requires two consecutive rw-antidependencies in the conflict graph; when SSI sees that "dangerous structure," it aborts one transaction with `40001`.
+The retry loop is the load-bearing part of a serializable client: detect SQLSTATE `40001` and re-execute the *entire* transaction body, since the aborted snapshot is unusable.
 
-The contract this imposes on application code: *any* serializable transaction can be rejected even without touching the same rows as anyone else, so you must wrap them in a retry loop. False positives exist (the check is conservative), but there's no blocking and, per the VLDB paper, modest overhead versus plain SI. Compare that to the pessimistic alternative — 2PL takes shared locks on everything read and blocks instead of aborting.
+```scala
+import java.sql.{Connection, SQLException}
 
-Interview closer: "repeatable read in Postgres" and "repeatable read in MySQL/InnoDB" are different animals (InnoDB's uses next-key locking for writes and can still exhibit its own quirks), so always answer in terms of anomalies, not level names.
+final case class SerializationFailure(attempts: Int) extends Exception
 
-**Try next:** run the doctors demo in two psql terminals at REPEATABLE READ, then at SERIALIZABLE, and inspect the SIREAD locks mid-flight with `SELECT locktype, relation::regclass, mode FROM pg_locks WHERE mode = 'SIReadLock';`.
+/** Runs `body` at SERIALIZABLE, retrying on SQLSTATE 40001. `body` must be
+  * re-executable: nothing outside the transaction may have been committed. */
+def inSerializable[A](conn: Connection, maxAttempts: Int = 5)(body: Connection => A): A =
+  def attempt(n: Int): A =
+    conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE)
+    conn.setAutoCommit(false)
+    try
+      val a = body(conn)
+      conn.commit()
+      a
+    catch
+      // 40001 may surface at commit, not only at statement execution.
+      case e: SQLException if e.getSQLState == "40001" =>
+        conn.rollback()
+        if n >= maxAttempts then throw SerializationFailure(n)
+        Thread.sleep((1L << n) * 10)  // backoff: contention is the cause
+        attempt(n + 1)
+      case e: Throwable =>
+        conn.rollback(); throw e
+  attempt(1)
+
+// The doctors invariant needs no explicit locking under SSI:
+inSerializable(conn) { c =>
+  val ps = c.prepareStatement(
+    "SELECT count(*) FROM doctors WHERE on_call = true AND shift_id = ?")
+  ps.setInt(1, 1234)
+  val onCall = { val r = ps.executeQuery(); r.next(); r.getInt(1) }
+  if onCall > 1 then
+    val u = c.prepareStatement("UPDATE doctors SET on_call = false WHERE name = ?")
+    u.setString(1, "Alice"); u.executeUpdate()
+}
+```
+
+## Pitfalls
+
+- **Assuming a level name transfers between engines.** A schema tested on PostgreSQL repeatable read (snapshot isolation, phantom-free) can exhibit phantoms elsewhere, because the standard permits them at that level.
+- **Inheriting the default on migration.** PostgreSQL defaults to read committed and MySQL InnoDB to repeatable read; code moved between them silently changes snapshot lifetime — per statement versus per transaction — and re-reads that were stable start varying, or vice versa.
+- **Treating repeatable read as sufficient for a cross-row invariant.** The doctors case commits both transactions without any of the three ANSI phenomena occurring; the invariant breaks with no error raised anywhere.
+- **Using `SELECT ... FOR UPDATE` against an absence.** When the invariant depends on no matching row existing, the query returns no rows, locks nothing, and both transactions insert.
+- **Omitting the retry loop at SERIALIZABLE.** SSI aborts are not exceptional under contention, and an unhandled `40001` surfaces as a user-visible failure on a transaction that would succeed on re-execution.
+- **Retrying a transaction whose effects escaped it.** If the transaction body already sent an email or published a message, re-execution repeats that effect; only work confined to the transaction is safe to replay.
+- **Reading `count(*)` and writing a different row.** This shape — decision from an aggregate, write to one member — is write skew by construction and passes every single-row conflict check.

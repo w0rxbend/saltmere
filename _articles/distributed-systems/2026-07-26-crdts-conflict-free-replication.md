@@ -2,8 +2,8 @@
 title: "CRDTs: merging without meeting — conflict-free replication for real"
 date: 2026-07-26
 track: distributed-systems
-summary: "Quorums avoid conflicts by making writes overlap; vector clocks detect conflicts after the fact. CRDTs skip both problems by making merge mathematically incapable of disagreeing. Here's the join-semilattice trick, four concrete types, and why the merge function is the whole design."
-reading_time: 5
+summary: "Quorums avoid conflicts by making writes overlap; vector clocks detect conflicts after the fact. CRDTs remove both problems by making merge mathematically incapable of disagreeing: the join-semilattice property, four concrete types, and why the merge function is the whole design."
+reading_time: 6
 tags: [crdt, replication, eventual-consistency, semilattice, distributed-data, van-steen]
 sources:
   - title: "Shapiro, Preguiça, Baquero, Zawirski — A comprehensive study of Convergent and Commutative Replicated Data Types (INRIA RR-7506, 2011)"
@@ -18,72 +18,34 @@ sources:
     url: "https://doc.akka.io/libraries/akka-core/current/typed/distributed-data.html"
 ---
 
-Quorum replication (see the previous article) avoids conflicts by forcing read and write sets to overlap. Vector clocks detect conflicts once they've already happened, and hand you two concurrent versions to reconcile by hand. CRDTs take a third path: design the data type so that *any* two replica states can be combined into a correct result, no coordination and no human tie-breaker required. This is the core idea behind Shapiro et al.'s 2011 INRIA report, which coined the term and gave it a rigorous foundation in order theory.
+**Gist.** Replicas that accept writes independently will end up in divergent states, and the usual remedies either coordinate every write (quorums) or defer the conflict to an application-level reconciler (vector clocks). A conflict-free replicated data type (CRDT) removes the decision point by constraining the data type itself, so that combining any two replica states yields a correct result regardless of order, grouping or duplication. The cost is paid in the type system and in space: only operations expressible as a monotone lattice join are allowed, and the metadata that makes them monotone — per-replica slots, unique tags, tombstones — grows and must be reclaimed separately.
+
+Quorum replication avoids conflicts by forcing read and write sets to overlap. Vector clocks detect conflicts after they have happened and surface two concurrent versions for manual reconciliation. CRDTs take a third path, formalised in Shapiro, Preguiça, Baquero and Zawirski's 2011 INRIA report, which established the term and grounded it in order theory.
 
 ## Two families, one property
 
-The property both families aim for is **strong eventual consistency (SEC)**: once two replicas have seen the same set of updates — in any order, with any duplicates — they hold identical state. No consensus round, no leader, no blocking.
+Both families target **strong eventual consistency (SEC)**: once two replicas have delivered the same set of updates — in any order, with any duplicates — their states are identical. No consensus round, no leader, no blocking read or write.
 
-- **CvRDT (state-based, "Convergent")** — replicas exchange their entire current state. Convergence comes from a `merge(x, y)` function that computes the *least upper bound* of `x` and `y` in a join-semilattice. Simple to reason about (merge is just "combine and take the max"), but you ship whole states, so garbage collection and payload size matter.
-- **CmRDT (operation-based, "Commutative")** — replicas broadcast individual operations (e.g. "increment", "add element e"). Convergence requires that *concurrent* operations commute with each other, and typically needs a reliable causal-order broadcast channel (delivery must respect happens-before, which is exactly the ordering vector clocks give you). Cheaper on the wire, but the delivery layer has to do more work.
+- **CvRDT (state-based, "convergent")** — replicas exchange entire current states. Convergence follows from a `merge(x, y)` that computes the **least upper bound** of `x` and `y` in a join-semilattice. Reasoning is local, but whole states travel on the wire, so payload size and garbage collection dominate the engineering.
+- **CmRDT (operation-based, "commutative")** — replicas broadcast individual operations ("increment", "add element e"). Convergence requires that **concurrent operations commute**, and typically a reliable causal-order broadcast channel: delivery must respect happens-before, the ordering vector clocks supply. Wire cost is lower; the delivery layer carries the burden.
 
-Shapiro et al. prove the two are equivalent in expressive power — anything you can build op-based you can build state-based and vice versa — so the choice is an engineering trade-off, not a correctness one.
+Shapiro et al. show the two families are equivalent in expressive power — any op-based type has a state-based counterpart and conversely — so the choice between them is an engineering trade-off rather than a correctness one.
 
 ## Why merge must be a join-semilattice
 
-For CvRDT, `merge` is only safe if it is:
+For a CvRDT, `merge` is safe only if it is:
 
-- **Commutative** — `merge(x, y) = merge(y, x)`. Replicas that see updates from different peers first must still agree.
-- **Associative** — `merge(merge(x, y), z) = merge(x, merge(y, z))`. Gossip fans out through arbitrary topologies; grouping can't matter.
-- **Idempotent** — `merge(x, x) = x`. Gossip protocols retransmit; the same state arriving twice must not double-count.
+- **Commutative** — `merge(x, y) = merge(y, x)`. Replicas that receive peer states in different orders must still agree.
+- **Associative** — `merge(merge(x, y), z) = merge(x, merge(y, z))`. Gossip fans out through arbitrary topologies; grouping cannot matter.
+- **Idempotent** — `merge(x, x) = x`. Gossip retransmits, and the same state arriving twice must not be counted twice.
 
-Together these three properties are exactly the definition of a **join-semilattice**: a partial order where every pair of elements has a unique least upper bound, and `merge` computes that upper bound. Payload state can only move *up* the lattice — this is what "convergent" formally means. If your merge function violates any one property, replicas can permanently disagree depending on message order, which defeats the entire point.
+These three properties are the definition of a **join-semilattice**: a partial order in which every pair of elements has a unique least upper bound, with `merge` computing it. Payload state can therefore only move *up* the order, which is the formal content of "convergent". **A merge that violates any one of the three permits permanent divergence conditioned on message order** — the exact failure the type was introduced to eliminate.
 
-## G-Counter: the simplest CvRDT
+## G-Counter and PN-Counter
 
-A grow-only counter keeps one slot per replica and sums them:
+A grow-only counter (G-Counter) holds one slot per replica; a replica increments only its own slot, the observed value is the sum of all slots, and merge takes the **pointwise maximum**. Maximum is commutative, associative and idempotent by construction: it is the join on the product order of per-replica counts. No slot ever decreases, so the state vector only ascends the lattice.
 
-```python
-class GCounter:
-    def __init__(self, replica_id, replica_ids):
-        self.id = replica_id
-        self.counts = {r: 0 for r in replica_ids}
-
-    def increment(self, n=1):
-        self.counts[self.id] += n
-
-    def value(self):
-        return sum(self.counts.values())
-
-    def merge(self, other):
-        merged = {r: max(self.counts[r], other.counts[r])
-                  for r in self.counts}
-        self.counts = merged
-        return self
-```
-
-`max` per slot is commutative, associative, and idempotent by construction — it's the join on the semilattice of per-replica counts ordered pointwise. No replica's slot ever decreases, so the vector only moves up.
-
-## PN-Counter: adding decrements
-
-A single counter can't support decrement without breaking monotonicity, so you run two G-Counters and subtract:
-
-```python
-class PNCounter:
-    def __init__(self, replica_id, replica_ids):
-        self.p = GCounter(replica_id, replica_ids)  # increments
-        self.n = GCounter(replica_id, replica_ids)  # decrements
-
-    def increment(self, k=1): self.p.increment(k)
-    def decrement(self, k=1): self.n.increment(k)
-    def value(self):          return self.p.value() - self.n.value()
-    def merge(self, other):
-        self.p.merge(other.p)
-        self.n.merge(other.n)
-        return self
-```
-
-Each half is still grow-only and mergeable; the observable value is a derived read, not a merged field.
+Decrement breaks that monotonicity directly, so a positive-negative counter (PN-Counter) is built from **two G-Counters**, one accumulating increments and one accumulating decrements, merged independently. The observable value is the difference of the two sums — a derived read, not a merged field. Each half remains grow-only, so the lattice argument is unchanged.
 
 ## LWW-Register and OR-Set
 
@@ -92,28 +54,58 @@ Each half is still grow-only and mergeable; the observable value is a derived re
 | G-Counter | vector of per-replica counts | pointwise max | none (monotone by design) |
 | PN-Counter | two G-Counters | merge each half | none |
 | LWW-Register | (value, timestamp) | keep higher timestamp | concurrent writes silently drop one — a real write can vanish |
-| OR-Set | set of (element, unique-tag) pairs, plus a tombstone set of removed tags | union adds, subtract observed-removed tags | none for causal ops, but tag set grows unboundedly without GC |
+| OR-Set | set of (element, unique-tag) pairs, plus a tombstone set of removed tags | union adds, subtract observed-removed tags | none for causal ops, but the tag set grows without bound absent garbage collection |
 
-**LWW-Register** resolves every conflict by timestamp, which is trivially a total order — easy, but it means concurrent writes have a *loser* whose update is silently discarded. It's only "conflict-free" in the sense that it always terminates in agreement, not that it preserves intent.
+**A last-writer-wins register (LWW-Register)** resolves every conflict by timestamp, a total order, so merge is trivially a join. The consequence is that **concurrent writes have a loser whose update is discarded without any record of the loss**. The type is conflict-free in the sense that it always terminates in agreement, not in the sense that it preserves intent.
 
-**OR-Set** (observed-remove set) is the type that most resembles vector-clock machinery: every `add(e)` mints a fresh unique tag `(e, tag)`, and `remove(e)` only removes the tags for `e` that *this replica has already observed*, storing them in a tombstone set. That "only remove what you've seen" rule is what makes concurrent add/remove commute correctly — a concurrent `add(e)` carries a tag the remover never observed, so it survives the merge (add-wins semantics):
+**An observed-remove set (OR-Set)** most resembles vector-clock machinery. Every `add(e)` mints a fresh unique tag, producing a pair `(e, tag)`; `remove(e)` deletes only the tags for `e` that **this replica has already observed**, recording them in a tombstone set. That restriction is what makes concurrent add and remove commute: **a concurrent `add(e)` carries a tag the remover never observed, so it survives the merge** — add-wins semantics. The mechanism is structurally the same as a version vector: tag each event with its origin so that causality, not arrival order, decides the outcome.
 
-```js
-function mergeORSet(a, b) {
-  const elements = new Map(); // element -> Set of live tags
-  for (const [e, tags] of [...a.elements, ...b.elements]) {
-    const live = new Set([...tags].filter(
-      t => !a.tombstones.has(t) && !b.tombstones.has(t)));
-    if (live.size) elements.set(e, live);
-  }
-  return { elements, tombstones: new Set([...a.tombstones, ...b.tombstones]) };
-}
+### Implementation sketch (Scala)
+
+```scala
+final case class GCounter(counts: Map[String, Long]):
+  def increment(id: String, n: Long = 1): GCounter =
+    GCounter(counts.updated(id, counts.getOrElse(id, 0L) + n))
+
+  def value: Long = counts.values.sum
+
+  // join on the pointwise order: commutative, associative, idempotent
+  def merge(other: GCounter): GCounter =
+    GCounter((counts.keySet ++ other.counts.keySet).map { r =>
+      r -> math.max(counts.getOrElse(r, 0L), other.counts.getOrElse(r, 0L))
+    }.toMap)
+
+final case class ORSet[A](live: Map[A, Set[String]], tombstones: Set[String]):
+  def add(e: A, tag: String): ORSet[A] =
+    copy(live = live.updated(e, live.getOrElse(e, Set.empty) + tag))
+
+  // removes only tags this replica has already observed
+  def remove(e: A): ORSet[A] =
+    val seen = live.getOrElse(e, Set.empty)
+    ORSet(live - e, tombstones ++ seen)
+
+  def merge(other: ORSet[A]): ORSet[A] =
+    val graves = tombstones ++ other.tombstones
+    val union  = (live.keySet ++ other.live.keySet).flatMap { e =>
+      val tags = live.getOrElse(e, Set.empty) ++ other.live.getOrElse(e, Set.empty)
+      val kept = tags -- graves
+      Option.when(kept.nonEmpty)(e -> kept)
+    }.toMap
+    ORSet(union, graves)
+
+  def elements: Set[A] = live.keySet
 ```
 
-This is structurally the same trick as a version vector: tag every event with its origin so causality, not arrival order, decides the outcome.
+## Where this ships
 
-## Where this actually ships
+Riak's data types present an operation-based interface at the client application programming interface (API) and converge through state-based logic underneath (`riak_dt`), applying add-wins semantics for sets and maps and PN-Counter semantics for counters. Akka Distributed Data ships `GCounter`, `PNCounter`, `GSet`, `ORSet`, `ORMap` and `LWWRegister` as replicated data usable without a cluster leader. The workloads these target — multi-datacentre counters, shopping-cart sets — are ones where availability under partition is preferred to agreement on every write.
 
-Riak's data types are operation-based on the client API but converge via state-based logic underneath (`riak_dt`), applying add-wins for sets and maps and PN-Counter semantics for counters. Akka Distributed Data ships `GCounter`, `PNCounter`, `GSet`, `ORSet`, `ORMap`, and `LWWRegister` directly as replicated data usable without a cluster leader. Both exist because coordinating every write through Raft or a quorum is sometimes the wrong trade — multi-datacenter counters and shopping-cart sets are exactly the workloads where "always available, eventually correct" beats "sometimes unavailable, always agreed."
+## Pitfalls
 
-**Try next:** implement the OR-Set above with three simulated replicas, feed them `add("x")`, `remove("x")`, and a concurrent `add("x")` in random delivery orders, and confirm every ordering converges to the same live set — then swap in a plain LWW-Register for the same scenario and watch a write silently disappear.
+- **A merge function that is not idempotent double-counts under gossip retransmission.** Summing per-replica slots instead of taking their maximum inflates the G-Counter every time a peer state is redelivered.
+- **An LWW-Register loses writes silently.** Two concurrent updates with distinct timestamps converge to the higher one, and the discarded value leaves no trace in the state, so the loss is invisible to monitoring and to the application.
+- **LWW timestamps taken from unsynchronised wall clocks make the winner a function of clock skew,** not of write order: a replica whose clock runs ahead wins every conflict it participates in.
+- **OR-Set tombstones grow monotonically.** Each `remove` retains the observed tags permanently, so a set with high add/remove churn accumulates metadata far exceeding the live payload unless a separate reclamation mechanism runs.
+- **Reusing a tag across `add` calls breaks add-wins.** A tag already in a tombstone set causes a later, causally unrelated add to be filtered out on merge, so the element disappears without any remove having been issued.
+- **CmRDTs deployed over a channel that does not guarantee causal-order delivery diverge.** Commutativity is required only of *concurrent* operations; operations that are causally related but delivered out of order violate the precondition and the convergence proof no longer applies.
+- **Non-monotone operations cannot be retrofitted.** Adding a decrement path to a G-Counter's single slot breaks the lattice property, which is why the PN-Counter carries two counters rather than allowing slots to fall.

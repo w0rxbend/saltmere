@@ -2,8 +2,8 @@
 title: "Rollback Recovery: Checkpointing, the Domino Effect, and Message Logging"
 date: 2026-07-31
 track: distributed-systems
-summary: "Saving a process's state is easy; saving a set of states you can actually restart from is not. The recovery line, the domino effect, and why message logging lets you checkpoint whenever you like — with a live CRIU demo."
-reading_time: 6
+summary: "Saving one process's state is easy; saving a set of states the system can restart from is not. The recovery line, the domino effect, and why message logging decouples checkpoint timing from consistency — with a CRIU demonstration."
+reading_time: 7
 tags: [fault-tolerance, checkpointing, recovery, message-logging, criu, snapshots]
 sources:
   - title: "A Survey of Rollback-Recovery Protocols in Message-Passing Systems — Elnozahy, Alvisi, Wang, Johnson (ACM Computing Surveys, 2002)"
@@ -18,47 +18,82 @@ sources:
     url: "https://github.com/dmtcp/dmtcp/blob/main/QUICK-START.md"
 ---
 
-You can snapshot one process's memory to disk in a few milliseconds. The hard part of fault tolerance isn't taking a checkpoint — it's making sure that the set of checkpoints you took across N processes describes a state the system could actually have been in. Restart from a bad set and you get a message that was *received* by one process but was never *sent* by another. That's not a crash bug; it's a violation of causality baked into your recovery images.
+**Gist.** Snapshotting a single process's memory is a local operation, but a set of independently taken snapshots across N processes need not describe any state the system ever occupied: one process's image may record receiving a message no other image records sending. Rollback-recovery protocols restore this consistency either by coordinating checkpoints or by logging the nondeterministic events needed to replay execution deterministically. Coordination costs a global barrier and constrains when checkpoints may be taken; logging costs stable-storage writes or larger messages on the failure-free path.
 
 ## The recovery line
 
-A global state is **consistent** if, for every message recorded as received in some checkpoint, the matching send is also recorded. The **recovery line** is the most recent consistent set of checkpoints across all processes — the newest point you can safely roll back to. This is exactly the consistent global snapshot from Chandy–Lamport, viewed from the recovery side: a coordinated checkpoint protocol is essentially the marker-based snapshot algorithm run to produce a guaranteed-restartable line.
+A global state is **consistent** if, for every message recorded as received in some checkpoint, the matching send is also recorded. The **recovery line** is the most recent consistent set of checkpoints across all processes — the newest point the system can be rolled back to. The consistency condition is the same one a distributed-snapshot algorithm establishes, viewed from the recovery side rather than the observation side: coordinated checkpoint protocols and marker-based snapshot algorithms both exist to produce a cut with no orphan message across it.
 
-The enemy is the **orphan message**: received-but-not-sent. Its mirror image, the in-flight message (sent-but-not-yet-received), is fine — that's just a message the channel still owes you, and reliable delivery handles it.
+The failure mode is the **orphan message**: recorded as received, not recorded as sent. Its mirror image, the in-flight message (sent but not yet received), does not violate consistency — it is a message the channel still owes the receiver, and reliable delivery covers it. The asymmetry is the whole reason the recovery line exists as a concept: missing sends are unrecoverable from the images alone, missing receives are not.
 
 ## Uncoordinated checkpointing and the domino effect
 
-The tempting design is to let every process checkpoint whenever it's convenient — no coordination, no blocking. The price is the **domino effect**. Suppose P1 rolls back to a checkpoint taken *before* it sent message `m` to P2. Now P2's state records receiving `m`, but P1 has no record of sending it — orphan. So P2 must also roll back to before it received `m`. But that rollback may un-send a message P2 sent to P3... and the cascade can run all the way back to the initial states, throwing away every bit of work.
+Letting every process checkpoint whenever local conditions favour it removes coordination and blocking entirely. The price is the **domino effect**. Suppose P1 rolls back to a checkpoint taken *before* it sent message `m` to P2. P2's checkpoint records the receipt of `m` while P1 has no record of the send, so `m` is an orphan and P2 must also roll back to a state preceding that receipt. That rollback may un-send a message P2 had sent to P3, and the cascade propagates. In the worst case it reaches the processes' initial states, discarding all computed work despite every process holding recent checkpoints.
 
-To even have a chance of finding a recovery line, uncoordinated checkpointing forces you to keep *multiple* checkpoints per process and garbage-collect the ones that can never be part of any consistent line ("useless checkpoints"). **Incarnation numbers** — a version tag per run-between-failures — let you identify and discard obsolete checkpoints and messages from a process's previous life.
+Because no single checkpoint per process is guaranteed to lie on a consistent line, uncoordinated checkpointing requires **multiple retained checkpoints per process** plus garbage collection of those that can never belong to any consistent line — the *useless checkpoints*. Recovery protocols that must tell a process's current life apart from a previous one tag each run-between-failures with an **incarnation number**, so state and messages belonging to a superseded incarnation can be identified and discarded; the survey introduces the device in the context of optimistic message logging.
 
-**Coordinated checkpointing** pays a coordination cost up front (a two-phase, snapshot-style protocol) and in return is immune to the domino effect and needs to keep only **one** permanent checkpoint per process. Simpler recovery, simpler GC. **Communication-induced checkpointing** is the middle path: mostly-autonomous local checkpoints, plus *forced* checkpoints triggered by information piggybacked on application messages, which keeps the recovery line advancing without a global barrier.
+**Coordinated checkpointing** pays the coordination cost up front with a two-phase, snapshot-style protocol. In return it is immune to the domino effect and needs to retain only **one permanent checkpoint per process**, which collapses both recovery and garbage collection to a single case. **Communication-induced checkpointing** occupies the middle: processes take mostly autonomous local checkpoints, but information piggybacked on application messages can *force* an additional checkpoint, advancing the recovery line without a global barrier.
 
-## Message logging: checkpoint whenever, replay the rest
+## Message logging: checkpoint freely, replay the rest
 
-There's a second lever. If you **log the messages** a process receives, you don't need a consistent set of checkpoints at all — a recovered process replays its logged inputs and deterministically re-computes the state it lost. That's what breaks the domino effect: rollback stops at the failed process because its peers' effects can be *reconstructed* rather than undone.
+Logging the messages a process receives removes the requirement that checkpoints be mutually consistent at all. A recovered process restarts from any checkpoint and replays its logged inputs, recomputing the state it lost. Rollback then stops at the failed process, because the effects its peers observed are **reconstructed rather than undone**.
 
-The whole thing rests on the **piecewise-deterministic (PWD) assumption**: execution is a sequence of deterministic intervals, each started by one nondeterministic event (usually a message receipt). Capture each event's **determinant** — the data needed to replay it — and you can re-run from a checkpoint to exactly the pre-failure state. A surviving process whose state depends on a determinant that was lost is an **orphan process**, and eliminating orphans is the entire game. The three protocols trade off *when* you make the determinant durable:
+The correctness of replay rests on the **piecewise-deterministic (PWD) assumption**: execution is a sequence of deterministic intervals, each begun by a single nondeterministic event, typically a message receipt. For each such event the protocol captures a **determinant** — the data needed to replay that event, identifying which message was delivered and where in the receive order it fell. Given the checkpoint plus every determinant after it, replay reproduces the pre-failure state exactly. A surviving process whose state depends on a determinant that did not survive the crash is an **orphan process**; eliminating orphans is what the three protocol families differ over, and they differ only in *when* a determinant is made durable.
 
-- **Pessimistic** — log the determinant *synchronously* to stable storage before sending any message that depends on it. No orphans, ever; recovery only touches the failed process. Highest failure-free overhead (a stable-storage write on the critical path).
-- **Optimistic** — buffer determinants in volatile memory and flush asynchronously. Cheap when nothing fails, but a crash before a flush creates orphans, so recovery must track dependencies (vector-clock style) and roll them back too.
-- **Causal** — piggyback not-yet-stable determinants on outgoing messages, so every determinant lives either on stable storage or in the memory of all processes causally downstream of it. Optimistic's low overhead with pessimistic's no-orphan guarantee, at the cost of fatter messages.
+- **Pessimistic logging** writes the determinant **synchronously** to stable storage before the process sends any message that depends on it. No orphan can exist, and recovery touches only the failed process. The cost is a stable-storage write on the critical path of the failure-free execution.
+- **Optimistic logging** buffers determinants in volatile memory and flushes them asynchronously. Failure-free overhead is low, but a crash before a flush loses determinants and creates orphans, so recovery must track inter-process dependencies (vector-clock style) and roll orphans back as well.
+- **Causal logging** piggybacks not-yet-stable determinants on outgoing messages, maintaining the invariant that **every determinant resides either on stable storage or in the volatile memory of every process causally downstream of it**. That yields the no-orphan property without a synchronous write, at the cost of larger messages.
 
-## Try it: the primitive under all of this
+### Implementation sketch (Scala)
 
-The local "freeze a consistent process state, restore it later" operation is a live demo away with **CRIU**:
+The load-bearing structure is the determinant and the check that no message leaves a process before the determinants it depends on are durable — the pessimistic rule.
 
-```bash
-# Given a running process with PID 2221:
-criu dump    -t 2221 -vvv -o dump.log      # freeze + write memory/thread/fd images
-criu restore -d       -vvv -o restore.log  # -d: detach and resume from the image
+```scala
+final case class Determinant(
+    source: String,      // sending process
+    seq: Long,           // sender sequence number
+    receiver: String,
+    deliveryIndex: Long  // position in the receiver's delivery order
+)
 
-# For a process attached to a terminal (a shell job):
-criu dump    -t 2621 --shell-job -vvvv -o dump.log
-criu restore       --shell-job -vvvv -o restore.log
+trait StableStorage:
+  def append(d: Determinant): Unit   // returns only after the write is durable
+
+final class PessimisticReceiver(id: String, store: StableStorage):
+  private var delivered = 0L
+  private var pending: List[Determinant] = Nil
+
+  /** Records the delivery order before the application observes the message. */
+  def deliver(source: String, seq: Long, payload: Array[Byte]): Array[Byte] =
+    val d = Determinant(source, seq, id, delivered)
+    delivered += 1
+    pending = d :: pending
+    payload
+
+  /** Pessimistic invariant: nothing dependent on a volatile determinant escapes. */
+  def send(to: String, payload: Array[Byte])(transmit: (String, Array[Byte]) => Unit): Unit =
+    pending.reverse.foreach(store.append)
+    pending = Nil
+    transmit(to, payload)
 ```
 
-For a whole application without recompiling, **DMTCP** wraps launch and restart:
+Replay after a crash re-executes from the checkpoint, feeding messages back in `deliveryIndex` order; any receive whose determinant is absent from stable storage marks the boundary beyond which the state cannot be reconstructed.
+
+## The local primitive
+
+The single-process operation underneath all of this — freeze a process state, restore it later — is directly observable with **CRIU** (Checkpoint/Restore In Userspace):
+
+```bash
+# $PID is the target process; images land in the current directory:
+criu dump    -t $PID -vvvv -o dump.log     # freeze + write memory/thread/fd images
+criu restore -d      -vvvv -o restore.log  # -d: detach and resume from the images
+
+# For a process attached to a terminal (a shell job):
+criu dump    -t $PID --shell-job -vvvv -o dump.log
+criu restore -d      --shell-job -vvvv -o restore.log
+```
+
+**DMTCP** (Distributed MultiThreaded Checkpointing) wraps launch and restart for a whole application without recompilation:
 
 ```bash
 dmtcp_coordinator &            # coordination point
@@ -67,6 +102,13 @@ dmtcp_command --checkpoint     # writes ckpt_*.dmtcp + a restart script
 ./dmtcp_restart_script.sh      # resume
 ```
 
-Scale that idea up and you get Apache Flink's exactly-once state: distributed snapshots via stream *barriers* — the Chandy–Lamport recovery line, applied to a running dataflow.
+Applied to a running dataflow rather than a set of operating-system processes, the same recovery line appears as Apache Flink's exactly-once state: distributed snapshots driven by stream *barriers*.
 
-**Try next:** Write two processes that ping-pong messages and each checkpoint on a timer with no coordination. Log every send/receive with a logical clock, force one to roll back to its previous checkpoint, and print the chain of peers that must roll back with it — you'll watch the domino effect propagate. Then add a receive-log and a replay step, and confirm the cascade stops at the failed process.
+## Pitfalls
+
+- **Retaining one checkpoint per process under uncoordinated checkpointing leaves no recovery line.** With a single image each, the only consistent set may be the initial states, so a single failure discards all work.
+- **Treating in-flight messages as inconsistency.** A send recorded without the matching receive is a legitimate state; deleting or re-sending such messages during recovery produces duplicates instead of fixing anything.
+- **Replay under a violated PWD assumption diverges silently.** Reading a clock, a random source, a thread-scheduling order or an uncaptured signal introduces a nondeterministic event with no determinant, so the replayed state differs from the lost one without any error being raised.
+- **Omitting incarnation numbers admits messages from a previous life.** A restarted process can receive messages addressed to its pre-failure incarnation and apply them to replayed state, and no checkpoint content reveals the mistake.
+- **Optimistic logging without dependency tracking loses orphans.** Determinants buffered in volatile memory vanish on crash, and surviving peers that consumed the corresponding messages remain in states no replay can justify unless recovery rolls them back too.
+- **Checkpointing a process whose external resources are not captured.** Open sockets, file descriptors to deleted files, and terminal attachments are part of the process state; restoring an image without them fails at restore time rather than at dump time.

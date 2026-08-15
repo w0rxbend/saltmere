@@ -1,9 +1,9 @@
 ---
-title: "Dolev–Strong: Byzantine broadcast in f+1 rounds, and why you can't do it faster"
+title: "Dolev–Strong: Byzantine broadcast in f+1 rounds, and why no protocol is faster"
 date: 2026-08-03
 track: distributed-systems
-summary: "The 1983 Dolev–Strong protocol solves synchronous Byzantine broadcast against any number of Byzantine faults — even a dishonest majority — using digital signatures and exactly f+1 rounds. The whole thing reduces to one rule: grow a chain of distinct signatures, and only trust values whose chain is long enough to guarantee an honest link."
-reading_time: 5
+summary: "The 1983 Dolev–Strong protocol solves synchronous Byzantine broadcast against any number of Byzantine faults — even a dishonest majority — using digital signatures and exactly f+1 rounds. The protocol reduces to one rule: grow a chain of distinct signatures, and accept only values whose chain is long enough to guarantee an honest link."
+reading_time: 6
 tags: [byzantine, consensus, dolev-strong, broadcast, signatures, synchrony]
 sources:
   - title: "Dolev & Strong — Authenticated Algorithms for Byzantine Agreement (SIAM J. Comput. 12(4):656–666, 1983)"
@@ -18,11 +18,11 @@ sources:
     url: "https://homes.cs.washington.edu/~jrl/cse422wi24/notes/blockchain_3.pdf"
 ---
 
-Most Byzantine fault-tolerance results you meet — PBFT, HotStuff, Bracha — buy safety with a quorum bound like `n > 3f`. Dolev–Strong is the strange, wonderful exception. Given digital signatures and a synchronous network, it solves Byzantine broadcast against **any** number of faults `f`, up to `n−1` of the `n` nodes. A single honest node surrounded by liars still ends up agreeing with every other honest node. The price is rounds: exactly `f+1` of them, and van Steen & Tanenbaum's fault-tolerance chapter and the original 1983 paper both make the same point — that round count is not slack, it is optimal.
+**Gist.** Byzantine broadcast requires every honest node to output the same value even when the sender itself lies, and quorum-based protocols buy that property with the bound `n > 3f`. Dolev–Strong replaces the quorum with **unforgeable digital signatures under lock-step synchrony**, tolerating any `f ≤ n−1` faults by accepting a value only when it carries a chain of `r` distinct signatures in round `r`. The cost is latency and bandwidth: **exactly `f+1` rounds**, matching the classical lower bound for deterministic synchronous protocols, and chains that fan out across the network.
 
 ## The problem: broadcast, not agreement
 
-Fix the terminology, because two nearby problems get muddled.
+Two nearby problems are routinely conflated, so the terminology is fixed first.
 
 **Byzantine Broadcast (BB).** One distinguished *sender* holds an input `v`. Every node must decide an output such that:
 
@@ -30,64 +30,88 @@ Fix the terminology, because two nearby problems get muddled.
 - **Validity** — if the sender is honest, that common output is exactly its input `v`.
 - **Termination** — every honest node eventually halts.
 
-**Byzantine Agreement (BA)** instead gives *every* node an input and asks them to agree (with validity meaning: if all honest nodes start equal, they stay equal). BB and BA are inter-reducible in the authenticated synchronous model — run one BB per sender to get BA — so Dolev–Strong is usually stated for broadcast, and so is this piece.
+**Byzantine Agreement (BA)** instead gives *every* node an input and asks the nodes to agree, with validity meaning that if all honest nodes start equal they stay equal. BB and BA are inter-reducible in the authenticated synchronous model — running one BB instance per sender yields BA — so Dolev–Strong is customarily stated for broadcast, as it is here.
 
-The adversary is Byzantine: faulty nodes can lie, stay silent, equivocate (tell different nodes different things), and collude. What they *cannot* do is forge a signature. That single restriction is the whole game.
+The adversary is Byzantine: faulty nodes may lie, stay silent, equivocate (send different values to different nodes), and collude. The one capability withheld is **forging a signature of a node they do not control**. That single restriction carries the entire protocol.
 
 ## Signature chains
 
 The protocol's only data structure is a **chain of distinct signatures over a value**.
 
-- The sender starts it: `⟨v, sig_sender(v)⟩` is a length-1 chain.
-- Anyone who accepts a length-`k` chain and wants to relay it appends *their own* signature, producing a length-`k+1` chain.
+- The sender opens the chain: `⟨v, sig_sender(v)⟩` has length 1.
+- A node that accepts a length-`k` chain and relays it appends *its own* signature, yielding length `k+1`.
 
-A chain is **valid for value `v`** if the sender signed first, every signature verifies, and all signers are *distinct*. The distinctness rule is what makes chain length meaningful: a length-`k` chain is a proof that `k` different identities vouched for `v`, in order, starting with the sender. A Byzantine node controlling several identities still cannot make a chain longer than the number of distinct keys it holds — and it can never omit or fake the sender's opening signature.
+A chain is **valid for value `v`** when the sender signed first, every signature verifies over `v`, and all signers are **distinct**. Distinctness is what makes length meaningful: a length-`k` chain is evidence that `k` different identities vouched for `v`, in order, beginning with the sender. A Byzantine coalition cannot lengthen a chain on its own beyond the number of distinct private keys it holds, and cannot produce any chain at all without the sender's opening signature — so a sender that never signs `v'` makes `v'` unacceptable to every honest node, forever.
 
 ## The one rule: accept-set update
 
-Each node keeps an **accept set** of values it has been convinced of. The core loop is small enough to write out. Rounds run `r = 1 … f+1`.
+Each node maintains an **accept set** of values it has been convinced of. Rounds run `r = 1 … f+1`, and the round number is part of the validity test: **in round `r`, only chains of length exactly `r` are admissible**. That coupling is what forces a value to make progress every round or die.
 
-```python
-# node i, tolerating up to f Byzantine faults among n nodes
-accepted = set()          # values i is convinced of
-outbox   = []             # chains to send next round
+The state machine per node is three transitions:
 
-def on_round(r, incoming):        # r in 1..f+1
-    for chain in incoming:
-        v = chain.value
-        # valid_at(chain, r): sender signed first, all sigs verify,
-        # signers distinct, and length(chain) == r
-        if valid_at(chain, r) and v not in accepted:
-            accepted.add(v)
-            if r < f + 1:                     # no point relaying after the last round
-                outbox.append(chain.append_sig(i))   # length becomes r+1
-    return outbox
+1. **Receive** the round's messages.
+2. For each chain valid at round `r` whose value is not already in the accept set: **add the value**, and if `r < f+1`, append the node's own signature and send the length-`(r+1)` chain to all nodes in round `r+1`. A value already accepted is never relayed again, which bounds each node to one relay per value.
+3. After round `f+1`, **decide**: exactly one value accepted → output it; zero or two-or-more accepted → output `⊥`.
 
-def decide():                     # after round f+1
-    return accepted.pop() if len(accepted) == 1 else BOT   # ⊥ = "sender is faulty"
+Two distinct accepted values are possible only if the sender signed two values, so `⊥` is the honest verdict "the sender is Byzantine", and it is a common output, which satisfies agreement.
+
+### Implementation sketch (Scala)
+
+```scala
+// `sign` and `verify` are the underlying signature primitives, omitted here.
+final case class Chain(value: String, signers: List[NodeId], sigs: List[Array[Byte]])
+
+final class Node(id: NodeId, sender: NodeId, f: Int, pki: Map[NodeId, PublicKey]):
+  private var accepted: Set[String] = Set.empty
+
+  // Length is checked against the round: a chain that arrives late is worthless.
+  private def validAt(c: Chain, r: Int): Boolean =
+    c.signers.length == r &&
+      c.signers.headOption.contains(sender) &&
+      c.signers.distinct.length == c.signers.length &&
+      c.signers.zip(c.sigs).forall((s, sig) => verify(pki(s), c.value, sig))
+
+  // Folded rather than filtered: `accepted` must grow as the batch is scanned, so a
+  // second chain for the same value in the same round is not relayed twice.
+  def onRound(r: Int, incoming: Seq[Chain]): Seq[Chain] =
+    incoming.foldLeft(Vector.empty[Chain]) { (out, c) =>
+      if !validAt(c, r) || accepted.contains(c.value) then out
+      else
+        accepted += c.value
+        if r == f + 1 then out // relaying after the final round changes no decision
+        else out :+ c.copy(signers = c.signers :+ id, sigs = c.sigs :+ sign(id, c.value))
+    }
+
+  def decide(): Option[String] =
+    if accepted.sizeIs == 1 then accepted.headOption else None // None encodes ⊥
 ```
-
-Round 0: the sender signs `v` and sends the length-1 chain to everyone. Then for each round `r`, a node accepts a value the first time it sees a valid chain of the right length for it, appends its signature, and forwards. At the end: **exactly one value accepted → output it; zero or two-or-more → output `⊥`.** Two distinct accepted values can only happen if the sender equivocated, so `⊥` is the honest verdict of "the sender is Byzantine."
 
 ## Why validity and agreement hold
 
-**Validity (honest sender).** An honest sender signs one value `v` and nothing else. No one can forge its signature, so no valid chain exists for any `v' ≠ v`. Every honest node accepts `v` in round 1 and never accepts a second value, so all output `v`. ✓
+**Validity (honest sender).** An honest sender signs one value `v` and nothing else. Signatures are unforgeable, so no valid chain exists for any `v' ≠ v`. Every honest node accepts `v` in round 1 and never accepts a second value, so every honest node outputs `v`.
 
-**Agreement** is the subtle half, and it is where `f+1` earns its keep. Suppose some honest node `i` accepts value `v`. We must show every other honest node `j` also accepts `v` by the end. Two cases:
+**Agreement** is the subtle half, and it is where `f+1` earns its keep. Suppose an honest node `i` accepts `v`; every other honest node `j` must accept `v` before the deadline. Two cases exhaust the possibilities:
 
-- `i` accepts `v` in some round `r ≤ f`. Then `i` appends its signature and broadcasts the length-`(r+1)` chain in round `r+1 ≤ f+1`. That chain is valid at round `r+1`, so every honest `j` receives it and accepts `v` on time. ✓
-- `i` accepts `v` in the *last* round, `r = f+1`. Then `i` saw a valid length-`(f+1)` chain — `f+1` **distinct** signers. There are at most `f` Byzantine nodes, so at least one signer in that chain is **honest**. Call it `h`. An honest `h` only signs a value when it first accepts it, in some round `< f+1`, and by the argument above an honest node that accepts early relays to everyone. So `h` already broadcast `v` to all honest nodes before the deadline, and `j` accepted it. ✓
+- `i` accepts `v` in a round `r ≤ f`. Then `i` appends its signature and sends the length-`(r+1)` chain in round `r+1 ≤ f+1`. Synchrony delivers it, the chain is valid at round `r+1`, so `j` accepts `v` in time.
+- `i` accepts `v` in the final round `r = f+1`. Then `i` observed a valid chain with **`f+1` distinct signers**. At most `f` nodes are Byzantine, so at least one signer `h` is **honest**. An honest node signs a value only in the round it first accepts it, necessarily some round `< f+1`, and by the previous case an honest node that accepts before the last round relays to everyone. So `h` already delivered `v` to `j` in time.
 
-The length-`(f+1)` requirement is a certificate that *an honest node touched this value in time*. That is the entire trick.
+The length-`(f+1)` requirement is therefore a certificate that **an honest node touched this value early enough to have relayed it**. That is the whole mechanism.
 
 ## Why f+1 rounds is optimal
 
-Stop one round early — decide after round `f`. Now the last-round certificate has length `f`, `f` distinct signers, and the adversary can make **all** of them faulty. A Byzantine sender colludes with `f−1` friends to hand-craft a length-`f` chain for `v` and deliver it to exactly one honest node in the final round — too late for that node to relay. It accepts `v`; everyone else does not. Agreement breaks.
+Deciding one round early makes the final certificate length `f`, that is `f` distinct signers, and an adversary controlling `f` nodes can supply all of them. A Byzantine sender and `f−1` colluders hand-craft a length-`f` chain for `v` and deliver it to exactly one honest node in the final round — too late for that node to relay. It accepts `v`; no other honest node does. Agreement breaks.
 
-This matches the classic lower bound: any deterministic synchronous Byzantine agreement protocol tolerating `f` faults needs at least `f+1` rounds (Fischer–Lynch, and the round-reduction arguments in the Dolev–Strong lineage). Dolev–Strong meets the bound exactly. The cost is communication, not rounds: chains fan out, giving `O(n²·f)` message words in the naive version — practical work since has focused on trimming that, not the round count.
+This matches the classical lower bound: a deterministic synchronous protocol tolerating `f` faults requires at least `f+1` rounds, and Dolev–Strong meets it exactly. The residual cost is communication rather than latency: every accepted value is relayed to all `n` nodes, and each chain carries up to `f+1` signatures, so bandwidth grows with both the network size and the fault bound. Subsequent work has targeted that volume, not the round count.
 
 ## Where it sits
 
-Dolev–Strong is the canonical answer to "what does authentication buy you?" Lamport–Shostak–Pease's *unauthenticated* oral-message algorithm needs `n > 3f`; add unforgeable signatures and that bound vanishes — you tolerate any `f < n`. The catch is the model: it assumes **lock-step synchrony** (a known bound on message delay defining each round) and a **PKI** (everyone knows everyone's public key). Drop synchrony and FLP-style impossibilities return; drop signatures and the `3f` bound returns. Real systems that want a dishonest minority *and* asynchrony (PBFT, HotStuff) pay for it with the `n > 3f` quorum that Dolev–Strong gets to skip.
+Dolev–Strong is the canonical answer to the question of what authentication buys. The unauthenticated oral-message algorithm of Lamport, Shostak and Pease requires `n > 3f`; adding unforgeable signatures removes that bound entirely and admits any `f < n`. The price is model assumptions: **lock-step synchrony**, meaning a known upper bound on message delay that defines each round, and a **public-key infrastructure (PKI)** in which every node knows every other node's public key. Without synchrony, asynchronous impossibility results return; without signatures, the `3f` bound returns. Protocols that want both a dishonest minority and partial synchrony, such as PBFT and HotStuff, pay for it with the `n > 3f` quorum Dolev–Strong avoids.
 
-**Try next:** Implement the accept-set loop for `n=4, f=2` with a Byzantine sender that equivocates — sends a length-1 chain for `A` to node 1 and for `B` to node 2 in round 0 — then let one colluder inject a hand-built length-2 chain to a single honest node in round 2. Confirm that with the full `f+1 = 3` rounds every honest node lands on `⊥`, then rerun deciding after round 2 and watch agreement shatter.
+## Pitfalls
+
+- **Omitting the length-equals-round check.** A node that accepts any valid chain regardless of length can be fed a stale length-1 chain in the final round by a colluding sender; it accepts a value it can no longer relay, and honest nodes diverge.
+- **Accepting duplicate signers.** If distinctness is not enforced, a single Byzantine node with one key can pad a chain to length `f+1` by signing repeatedly, and the certificate stops implying that an honest node ever saw the value.
+- **Deciding on a non-empty accept set instead of a singleton.** With an equivocating sender, honest nodes hold two values; picking one deterministically (for example, the smallest) still diverges unless every honest node holds the *same* two, which the protocol does not guarantee until the final round completes.
+- **Halting after the first accepted value.** A node that stops relaying because it "already knows the answer" withholds the chain that carries the honest link, breaking the last-round argument for agreement.
+- **Running under partial synchrony.** The agreement proof uses the assumption that a message sent in round `r` arrives before round `r+1` begins; if the round timeout is shorter than the real delay bound, a late chain arrives out of round, is rejected on length, and honest nodes disagree.
+- **Treating `f` as the observed fault count.** The round count and the certificate length are both fixed by the *tolerated* `f` chosen in advance; lowering `f` at runtime to save rounds shortens the certificate and reintroduces the one-round-early attack.

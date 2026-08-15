@@ -2,8 +2,8 @@
 title: "Edge-chasing: detecting distributed deadlock without ever building the graph"
 date: 2026-07-31
 track: distributed-systems
-summary: "The Chandy–Misra–Haas AND-model algorithm finds a cycle in a wait-for graph that no single node can see. Blocked processes chase probes along their wait edges; if a probe comes home, there's a deadlock — and you never assemble the full graph."
-reading_time: 5
+summary: "The Chandy–Misra–Haas AND-model algorithm finds a cycle in a wait-for graph that no single node can see. Blocked processes chase probes along their wait edges; a probe that returns to its initiator proves a deadlock, and the full graph is never assembled."
+reading_time: 6
 tags: [deadlock-detection, edge-chasing, chandy-misra-haas, wait-for-graph, coordination, distributed-systems]
 sources:
   - title: "Chandy, Misra, Haas — Distributed Deadlock Detection (ACM TOCS, 1983)"
@@ -18,68 +18,85 @@ sources:
     url: "https://www.distributed-systems.net/index.php/books/ds3/"
 ---
 
-A deadlock is a cycle in the **wait-for graph** (WFG): process P1 blocked on a resource held by P2, P2 blocked on P3, ..., Pn blocked on P1. On one machine this is easy — the OS holds the whole graph and runs a cycle check. Spread the processes across nodes and the graph is spread with them: each node knows only its local slice of the edges. Nobody has the full picture, and the naive fix — ship everyone's edges to a coordinator — is worse than it looks.
+**Gist.** A distributed deadlock is a cycle in a wait-for graph whose edges are scattered across nodes, so no participant can inspect the graph and no coordinator can assemble a consistent copy of it. The Chandy–Misra–Haas (CMH) edge-chasing algorithm replaces the graph with messages: a blocked process sends a small **probe** along each of its wait-for edges, other blocked processes forward it, and a probe arriving back at its own initiator proves a cycle. The cost is that detection is per-initiator and reactive — the cycle is discovered only after a process has already blocked and a hunt has been started, and the probe traffic is paid again for every initiator.
 
-## Why you can't just build the graph centrally
+## The wait-for graph and its distribution
 
-Send every local WFG to a coordinator and let it look for cycles. The problem is that the slices arrive at different times over links with "finite and unpredictable delay," and there is no global clock to line them up. The coordinator is always reasoning about a *stale* union of snapshots taken at different instants.
+A deadlock is a cycle in the **wait-for graph** (WFG): process P1 is blocked on a resource held by P2, P2 on P3, …, Pn on P1. On a single machine the operating system holds the entire graph and runs a cycle check over it. When the processes are spread across nodes, the graph is spread with them: **each node holds only the outgoing edges of the processes it hosts**. No participant holds a cycle, and the direct remedy — shipping every local slice to a coordinator — introduces a different defect.
 
-That produces **phantom (false) deadlocks**. Suppose the coordinator has an old edge P1→P2 (P1 waiting on P2) and a fresh edge P2→P1. In reality P2 released its resource and the P1→P2 edge is gone — no cycle ever existed simultaneously. But the coordinator's inconsistent snapshot contains both edges, sees a cycle, and aborts a process for nothing. A correct detector must never report deadlocks that don't exist, and stitching snapshots together across an asynchronous network can't guarantee that.
+## Why centralised collection fails
 
-The same missing global clock kills **prevention** and **avoidance**. Prevention (grab all resources at once, or preempt) is wildly inefficient across a network; avoidance needs an accurate, real-time global state to test each grant for safety — exactly the thing you can't cheaply have. So in practice you let deadlocks happen and *detect* them.
+Local WFG slices reach the coordinator over links with finite but unpredictable delay, and no global clock exists to align the instants at which the slices were taken. The coordinator therefore reasons over a **union of snapshots captured at different times**.
 
-## The model: AND requests
+That union admits **phantom (false) deadlocks**. Suppose the coordinator holds a stale edge P1→P2 together with a fresh edge P2→P1. If P2 released its resource before P1's edge was reported, the two edges never existed simultaneously and no cycle ever formed; the coordinator nevertheless observes a cycle and aborts a process that was not deadlocked. **A detector must report only cycles that hold simultaneously**, and a union of unsynchronised snapshots cannot establish simultaneity.
 
-Chandy–Misra–Haas targets the **AND model**: a process may request several resources at once and stays blocked until *all* of them are granted. So a blocked process has an outgoing wait-for edge to every process it's waiting on, and it's stuck until every one of those clears. That's the common database-transaction case.
+The absent global clock also constrains the other two strategies. Prevention — acquiring all resources in one step, or preempting holders — is expensive across a network. Avoidance requires accurate global state at each grant decision to test whether the grant leaves the system in a safe state, which is precisely the state that cannot be obtained cheaply. What remains in practice is to permit deadlocks and detect them.
 
-## Edge-chasing with probes
+## The AND request model
 
-Instead of collecting the graph, CMH walks it with tiny messages called **probes**. A probe is a triple:
+CMH as described here targets the **AND model**: a process may request several resources at once and remains blocked until *all* of them are granted. Consequently a blocked process has an outgoing wait-for edge to **every** process it awaits, and it stays blocked until every one of those edges clears. This is the request shape of a database transaction holding some locks and queuing for several more.
+
+## Probes and the detection invariant
+
+Rather than collecting edges, CMH traverses them with messages called **probes**. A probe carries three process identifiers:
 
 ```
 probe(i, j, k)   # i = initiator, j = sender, k = receiver
 ```
 
-Read it as: "the deadlock hunt started by Pi has reached Pj, who is forwarding it to Pk because Pj is blocked waiting on Pk." Probes travel *only along wait-for edges*, and only *blocked* processes forward them — a running process isn't part of any cycle, so the chase stops there.
+The reading is: the hunt initiated by Pi has reached Pj, which forwards it to Pk because Pj is blocked waiting on Pk. Two restrictions make the traversal sound. **Probes travel only along wait-for edges**, and **only blocked processes forward them** — a running process lies on no cycle, so the chase terminates at it.
 
-The detection rule is the whole trick: **when a process receives a probe whose initiator equals itself (`k == i`), the probe has traveled a full cycle of wait-for edges back to where it began — that cycle is a deadlock.** No node ever holds the cycle; the cycle reveals itself by the message coming home.
+The detection rule is the invariant of the algorithm: **when a process receives a probe whose initiator field equals its own identifier, the probe has traversed a closed chain of wait-for edges, every hop of which was blocked at the moment it forwarded, so that chain is a deadlock.** No node ever materialises the cycle; the cycle is witnessed by the message returning.
 
-Here is the logic a blocked process runs on receiving a probe:
+The state each blocked process keeps is small: the set of processes it waits on, and a **`dependent` set of initiators already forwarded**. The second set is what bounds the traffic and guarantees termination — a blocked process propagates a given initiator's probe at most once per outgoing edge, so a probe cannot circulate indefinitely around a cycle. The published bound for the resource model is **at most `m(n − 1)/2` messages to detect a deadlock, for `m` processes spread over `n` nodes**, with a detection delay of O(n). What is never paid is a transfer of the graph itself.
 
-```python
-class Process:
-    def __init__(self, pid):
-        self.pid = pid
-        self.blocked = False
-        self.waits_for = set()      # pids this process is blocked on (AND: all must clear)
-        self.dependent = set()      # initiators we've already forwarded, to avoid re-sending
+### Implementation sketch (Scala)
 
-    def initiate(self):
-        # Controller starts a hunt for a blocked process, using itself as initiator.
-        if self.blocked:
-            for k in self.waits_for:
-                send(k, probe(self.pid, self.pid, k))
+```scala
+final case class Probe(initiator: Int, sender: Int, receiver: Int)
 
-    def on_probe(self, i, j, k):     # k == self.pid: this probe was sent to us
-        if not self.blocked:
-            return                    # running process: chase dies here, no cycle through us
+final class Process(val pid: Int, send: (Int, Probe) => Unit):
+  private var blocked: Boolean = false
+  private var waitsFor: Set[Int] = Set.empty   // AND model: all must clear
+  private var dependent: Set[Int] = Set.empty  // initiators already forwarded
 
-        if i == self.pid:
-            declare_deadlock(i)       # probe came home -> cycle -> deadlock
-            return
+  def blockOn(targets: Set[Int]): Unit =
+    blocked = true
+    waitsFor = targets
 
-        if i in self.dependent:
-            return                    # already propagated this initiator; prune duplicates
-        self.dependent.add(i)
+  def release(): Unit =
+    blocked = false
+    waitsFor = Set.empty
+    dependent = Set.empty
 
-        for k2 in self.waits_for:     # forward along every outgoing wait-for edge
-            send(k2, probe(i, self.pid, k2))
+  /** Started by the local controller for a process that has been blocked
+    * long enough to be worth investigating. */
+  def initiate(): Unit =
+    if blocked then waitsFor.foreach(k => send(k, Probe(pid, pid, k)))
+
+  def onProbe(p: Probe): Option[Int] =
+    if !blocked then None                       // running: chase dies here
+    else if p.initiator == pid then Some(pid)   // probe came home: deadlock
+    else if dependent.contains(p.initiator) then None
+    else
+      dependent += p.initiator
+      waitsFor.foreach(k => send(k, Probe(p.initiator, pid, k)))
+      None
 ```
 
-The `dependent` set is what makes this cheap and terminating: each blocked process forwards a given initiator's probe at most once per outgoing edge. The whole detection costs **at most `e` messages**, where `e` is the number of communicating (waiting) process pairs — for a chain of `n` blocked processes you send `O(n)` probes, never `O(n^2)`, and never the whole graph.
+The forwarding branch is O(1) work plus one message per outgoing edge, and `dependent` prunes every repeat of the same hunt.
 
-## Why not building the graph is the point
+## What the absence of a graph buys
 
-Edge-chasing sidesteps the coordinator's two failures at once. There's no central snapshot to go stale, so no phantom cycle from mismatched timestamps: a probe returns home *only if* a chain of currently-blocked processes actually links back to the initiator. And there's no bulk transfer of state — the "graph traversal" is distributed across the very nodes that own the edges, each doing an O(1) local step and passing a 3-tuple along. The algorithm reads a global property (a cycle) purely through local decisions and small messages, which is the recurring move in coordination: don't centralize the state, walk it.
+Edge-chasing removes both defects of the coordinator at once. There is no central snapshot that can go stale, so no cycle can be inferred from edges that never coexisted: a probe returns to its initiator only if a chain of processes, each blocked when it forwarded, links back to that initiator. There is also no bulk transfer of state — the traversal runs on the nodes that own the edges, each performing a local step and passing a three-field message onward. A global property, the existence of a cycle, is decided through local decisions and small messages.
 
-**Try next:** implement the `Process` class above for 4 nodes and wire a cycle (P1→P2→P3→P4→P1). Confirm P1's probe returns to P1. Then, before it returns, have P4 "release" and drop the P4→P1 edge, and watch the chase die with no false alarm — the exact phantom deadlock a stale centralized snapshot would have wrongly reported.
+One consequence deserves naming: **detection is initiator-scoped**. The algorithm reports the deadlock to the process whose probe returned, and a cycle containing several initiators can be detected several times, once per initiator whose hunt completes. Choosing which participant to abort, and ensuring only one is aborted, is a separate decision the algorithm does not make.
+
+## Pitfalls
+
+- Forwarding probes from a **running** process reintroduces phantom deadlocks: the chain is then no longer a chain of simultaneously blocked processes, and a returned probe no longer proves a cycle.
+- Omitting the `dependent` set leaves probes circulating around a cycle indefinitely and inflates the message count past the published bound, because every lap re-forwards the same initiator on every edge.
+- Failing to clear `dependent` when a process unblocks suppresses later hunts: a subsequent, genuine deadlock involving the same initiator is silently not forwarded, and the probe dies at the stale entry.
+- Treating the AND-model rule as universal misdetects under OR-style requests, where a process needs any one of several resources; a returned probe there does not imply that every member of the cycle is permanently stuck.
+- Reporting the deadlock without a deterministic victim rule lets multiple detections of the same cycle abort several processes instead of the one needed to break it.
+- Starting a hunt for every process the instant it blocks makes probe traffic scale with ordinary lock contention rather than with deadlock frequency, since most blocked processes are waiting on progress rather than on a cycle.

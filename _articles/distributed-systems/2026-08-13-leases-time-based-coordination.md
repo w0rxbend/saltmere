@@ -2,8 +2,8 @@
 title: "Leases: time-bound ownership as a coordination primitive"
 date: 2026-08-13
 track: distributed-systems
-summary: "A lease is ownership with an expiry date: hold it, renew it, and if you crash, the system heals itself when the clock runs out. From Gray & Cheriton's 1989 paper through Chubby's master leases and etcd TTLs to Raft leader leases that serve reads without a network round trip."
-reading_time: 5
+summary: "A lease grants ownership for a bounded term: the holder renews it, and a crashed holder's grant lapses without any reconciliation protocol. From Gray & Cheriton's 1989 paper through Chubby's master and session leases to etcd time-to-live (TTL) objects and Raft leader leases that serve reads without a network round trip."
+reading_time: 6
 tags: [leases, coordination, etcd, chubby, raft]
 sources:
   - title: "Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency — Gray & Cheriton (SOSP 1989)"
@@ -18,21 +18,27 @@ sources:
     url: "https://arxiv.org/abs/2512.15659"
 ---
 
-Every "who owns this right now?" problem — cache validity, leader election, work-queue assignment — has the same failure mode: the owner dies holding the grant. Permanent grants block forever; the fix is to make ownership **expire**. A *lease* is a grant of authority for a bounded term, renewable by the holder, and reclaimable by everyone else once the term lapses. It is the primitive under half the systems you'll be asked about in interviews. (This article is about leases as renewable time-based ownership; the enforcement side — fencing tokens, the Redlock debate — is covered in [distributed locking done right](/articles/sys-patterns/2026-08-11-distributed-locking-fencing-tokens).)
+**Gist.** Every "who owns this right now?" problem — cache validity, leader election, work-queue assignment — shares one failure mode: the owner dies while holding a grant that never lapses. A *lease* bounds the grant in time, making it renewable by the holder and reclaimable by everyone else once the term ends, so recovery needs no failure detector and no reconciliation protocol. The cost is that correctness is transferred onto the clock: the term must be sized against a drift bound, and every process pause between checking the lease and acting on it is a window in which two parties believe they own the same thing.
 
-## The original idea: Gray & Cheriton, 1989
+This article treats leases as renewable time-based ownership. The enforcement side — fencing tokens and the Redlock debate — is covered in [distributed locking done right](/articles/sys-patterns/2026-08-11-distributed-locking-fencing-tokens).
 
-The lease paper is about file caches, but the mechanism is general. A server grants a client a lease over some data for term *T*. While the lease is valid, the client may serve cached reads locally, and the server promises to contact the client before accepting a conflicting write. The magic is what happens on failure: **nothing**. If the client crashes, the server just waits out the remaining term and proceeds. If the network partitions, same. No failure detector, no reconciliation protocol — time itself is the recovery mechanism.
+## The original mechanism: Gray & Cheriton, 1989
 
-The term is a tuning knob. Short leases (the paper analyzed terms around 10 s) mean fast recovery after a crash but constant renewal traffic; long leases amortize renewals but make writers wait longer when a lease holder vanishes. Crucially, the paper's correctness argument needs only **bounded clock drift rate** — both sides measure the same duration on their own clocks — never synchronized wall clocks.
+The lease paper addresses file cache consistency, but the mechanism generalises. A server grants a client a lease over some data for term *T*. While the lease is valid, the client may serve cached reads locally, and **the server promises to contact the holder before accepting a conflicting write**. That promise is what makes the local read safe.
 
-## Chubby: leases all the way down
+The design's distinguishing property is its behaviour on failure: **nothing happens**. If the client crashes, the server waits out the remaining term and proceeds. If the network partitions, the same. Time is the recovery mechanism, so the protocol contains no failure detector to tune and no state to reconcile afterwards.
 
-Google's Chubby lock service (Burrows, OSDI 2006) is leases stacked three deep. The elected master holds a **master lease**: the replicas promise not to elect anyone else while it lasts, and the master keeps extending it by winning quorum votes — so clients can trust one address without a consensus round per request. Clients, in turn, hold **session leases** extended by KeepAlive RPCs (12 s default); every lock and cached file handle a client holds is scoped to that session. When a master dies, clients enter a *grace period* (about 45 s) in which their session is "in jeopardy" but not dead, long enough for the new master to take over and honor old sessions. The whole design is the Gray–Cheriton trade dressed up for planet scale: renewable time-bound promises instead of perfect failure detection.
+The term is the tuning knob, and the trade is symmetric. Short terms shorten the interval a writer must wait after a holder vanishes, at the price of renewal traffic proportional to 1/*T*. Long terms amortise renewals and lengthen that wait. Crucially, the correctness argument requires only a **bound on clock drift rate** — both sides measure the same duration on their own clocks — and never synchronised wall clocks.
 
-## etcd leases in practice
+## Chubby: leases at two levels
 
-etcd exposes the primitive directly: a lease is an object with a TTL; keys are attached to it; if keepalives stop, the keys vanish atomically. This is how Kubernetes leader election and service registration work underneath.
+Google's Chubby lock service (Burrows, OSDI 2006) applies the primitive twice. The elected master holds a **master lease**: the replicas undertake not to elect another master while it lasts, and the master extends it by winning quorum votes. Clients therefore address one node without a consensus round per request.
+
+Clients hold **session leases**, extended by KeepAlive remote procedure calls, with a default duration of 12 s. Every lock and every cached file handle a client holds is scoped to its session, so session expiry invalidates the whole set at once rather than key by key. When a master fails, clients enter a *grace period* of about 45 s during which the session is in jeopardy rather than dead, giving a newly elected master time to take over and honour existing sessions.
+
+## etcd: the primitive exposed directly
+
+etcd represents a lease as an object with a time-to-live (TTL). Keys are attached to it, and **when keepalives stop, every attached key is removed atomically**. etcd's own lock and leader-election APIs are built on this behaviour.
 
 ```console
 $ etcdctl lease grant 60
@@ -42,7 +48,7 @@ $ etcdctl lease keep-alive 694d77aa9e38260f    # blocks, renews periodically
 $ etcdctl lease timetolive 694d77aa9e38260f --keys
 ```
 
-The same flow in Go with `clientv3` — the client library renews at roughly TTL/3 intervals for you:
+The equivalent flow in Go with `clientv3`; the client library renews in the background at roughly TTL/3 intervals:
 
 ```go
 cli, _ := clientv3.New(clientv3.Config{Endpoints: []string{"localhost:2379"}})
@@ -52,20 +58,60 @@ ch, _ := cli.KeepAlive(ctx, lease.ID) // background renewal channel
 // if this process stalls or dies, /leader/api disappears within 10 s
 ```
 
-Kill the keepalive and the key evaporates when the TTL runs out — cleanup with no janitor process.
+Stopping the keepalive removes the key once the TTL elapses, which is cleanup without a janitor process.
 
 ## Leader leases: reads without a round trip
 
-The subtlest use of leases is a *read optimization* in Raft-family systems. A Raft leader can't just answer reads from local state — it might have been deposed and not know it, which is exactly a stale read. The safe default (ReadIndex) confirms leadership with a heartbeat round trip per read batch. A **leader lease** removes that round trip: each successful heartbeat also grants the leader a lease slightly shorter than the election timeout. While the lease is unexpired *by the leader's own clock*, no rival can have won an election, so local reads are linearizable — zero extra network cost. [TiKV](https://tikv.org/blog/lease-read/) and YugabyteDB both ship this, and YugabyteDB leans on it for low-latency reads in geo-distributed clusters.
+The subtler use of a lease is as a *read optimisation* in Raft-family systems. A Raft leader cannot answer a read from local state unconditionally, because it may have been deposed without yet learning so; the result would be a stale read. The safe default, ReadIndex, confirms leadership with a heartbeat round trip per read batch.
 
-The catch: correctness now depends on the clock-drift bound actually holding. If the leader's clock runs slow (or the followers' run fast) beyond the assumed bound, the lease "expires" later on the leader than in reality, a new leader gets elected, and the old one serves stale reads — a real linearizability violation, not a theoretical one. The LeaseGuard work (2026) audits how production Raft systems implement leases, shows several are unsafe under clock anomalies or leader pauses, and proposes a design that stays safe even then. If an interviewer asks "what breaks leases?", this is the answer they want.
+A **leader lease** removes that round trip. Each successful heartbeat round also grants the leader a lease **shorter than the election timeout**. The invariant is that while the lease is unexpired *by the leader's own clock*, no rival can have completed an election, so a local read is linearizable at zero additional network cost. [TiKV](https://tikv.org/blog/lease-read/) and YugabyteDB both implement this, and YugabyteDB applies it to low-latency reads in geo-distributed clusters.
 
-## Clock skew: sizing the term honestly
+The exposure is that correctness now depends on the assumed drift bound holding. If the leader's clock runs slow, or followers' clocks run fast, beyond that bound, the lease expires later on the leader than in real time; a new leader is elected while the old one still considers its lease valid, and the old leader serves stale reads. This is a linearizability violation. The LeaseGuard work examines lease safety in Raft implementations and proposes a lease design intended to hold under clock anomalies and leader pauses.
 
-Practical rules that fall out of the drift-bound assumption:
+## Sizing the term against drift
 
-- **Measure conservatively on both ends.** The holder starts its lease timer when it *sent* the request; the grantor starts when it *granted*. The holder's view is strictly shorter, so both agree the lease is dead before anyone else acts.
-- **Budget for drift.** With max drift rate ρ (a few ms/s is a sane engineering bound), a holder should treat a lease of term *T* as expiring at *T*·(1 − ρ), and a grantor should wait *T*·(1 + ρ) before reassigning.
-- **Pauses beat clocks.** A GC or VM pause between "check lease valid" and "do the write" defeats any term math. Keep guarded operations short, re-check the deadline with margin — and for writes to external resources, have the resource enforce a fencing token, as covered in the [locking article](/articles/sys-patterns/2026-08-11-distributed-locking-fencing-tokens). Lease says when *you* must stop; the token makes stopping enforceable.
+Three consequences follow from the drift-bound assumption.
 
-**Try next:** grant a 5-second etcd lease with a key attached, run `etcdctl lease keep-alive` in one terminal, then hit Ctrl-Z to SIGSTOP it — watch the key vanish, then `fg` and see the renewal fail: that's a GC pause killing a lease in miniature.
+- **Measure conservatively at both ends.** The holder starts its timer when it *sent* the request; the grantor starts when it *granted*. The holder's view of the term is strictly shorter, so the holder considers the lease dead before the grantor reassigns it.
+- **Budget for the drift rate.** With maximum drift rate ρ, a holder should treat a term *T* as expiring at *T*·(1 − ρ) and a grantor should wait *T*·(1 + ρ) before reassigning.
+- **Pauses defeat term arithmetic.** A garbage-collection or virtual-machine pause between "lease checked valid" and "write issued" invalidates the check regardless of how the term was sized. Guarded operations must stay short and re-check the deadline with margin; for writes to an external resource, the resource itself must enforce a fencing token, as described in the [locking article](/articles/sys-patterns/2026-08-11-distributed-locking-fencing-tokens). The lease states when the holder must stop; the token makes stopping enforceable.
+
+### Implementation sketch (Scala)
+
+The holder-side view of a lease: a deadline read from a monotonic clock, discounted by the drift bound, with a guard that refuses to run an action whose completion cannot be shown to fall inside the term.
+
+```scala
+// requestSentAtNanos, not the reply time: the request's flight time is the holder's loss.
+final case class Lease(id: Long, requestSentAtNanos: Long, termNanos: Long):
+  /** Holder-side expiry, shortened by the drift rate rho. */
+  def expiresAtNanos(rho: Double): Long =
+    requestSentAtNanos + (termNanos * (1.0 - rho)).toLong
+
+final class LeaseHolder(rho: Double, guardMarginNanos: Long):
+  @volatile private var current: Option[Lease] = None
+
+  def onRenewed(lease: Lease): Unit = current = Some(lease)
+
+  /** Runs f only if the whole call is expected to finish inside the term.
+    * The deadline is re-read after f, so a pause during f is detected. */
+  def guarded[A](budgetNanos: Long)(f: => A): Option[A] = current match
+    case None => None
+    case Some(lease) =>
+      val deadline = lease.expiresAtNanos(rho) - guardMarginNanos
+      if System.nanoTime() + budgetNanos > deadline then None
+      else
+        val a = f
+        if System.nanoTime() > deadline then None // paused past expiry: discard
+        else Some(a)
+```
+
+Discarding the result rather than publishing it is the only local remedy: by the time the pause is observed, another holder may already own the grant, and only the external resource can reject the late write.
+
+## Pitfalls
+
+- **Renewing at the expiry instead of a fraction of the term.** A single lost renewal round trip then loses the lease; renewing at roughly TTL/3 tolerates two consecutive losses within one term.
+- **Starting the holder's timer on the grant reply rather than on the request.** The network delay of the request is then unaccounted for, and the holder believes the lease is live after the grantor has reassigned it.
+- **A leader lease longer than the election timeout.** A rival can win an election while the incumbent's lease is still valid by its own clock, and the incumbent's local reads become stale.
+- **Wall-clock timers for lease deadlines.** An administrator or Network Time Protocol (NTP) step adjustment moves the deadline, shortening or extending the term arbitrarily; a monotonic clock is not subject to the step.
+- **Checking the lease and then performing an unbounded operation.** The check is valid only at the instant it is taken; any pause or slow call afterwards can carry the operation past expiry.
+- **Treating lease expiry as proof the holder has stopped.** Expiry only revokes authority; a partitioned or paused holder may still issue writes, which is why the resource must reject them by fencing token.

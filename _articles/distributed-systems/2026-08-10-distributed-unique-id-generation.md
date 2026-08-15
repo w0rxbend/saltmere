@@ -1,9 +1,9 @@
 ---
-title: "Designing a Distributed ID Generator: Snowflake, UUIDv7, and the Bit Math"
+title: "Distributed ID Generation: Snowflake, UUIDv7, and the Bit Math"
 date: 2026-08-10
 track: distributed-systems
-summary: "The classic design-a-unique-ID-generator interview question broken down by requirement — unique, roughly time-sortable, high-throughput, no single point of failure — and the approaches that trade off against each other: UUIDv4 vs the modern UUIDv7 (RFC 9562), ULID/KSUID, database ticket servers, and Twitter Snowflake's 41/10/12 bit layout, with a 40-line generator, the clock-skew hazards, and why time-sortable keys keep B-tree inserts cheap."
-reading_time: 6
+summary: "The design of a unique-ID generator broken down by requirement — unique, roughly time-sortable, high-throughput, no single point of failure — and the approaches that trade off against each other: UUIDv4 vs UUIDv7 (RFC 9562), ULID/KSUID, database ticket servers, and Twitter Snowflake's 41/10/12 bit layout, with a generator sketch, the clock-skew hazards, and the effect of time-sortable keys on B-tree inserts."
+reading_time: 7
 tags:
   - unique-ids
   - snowflake
@@ -23,118 +23,120 @@ sources:
     url: "https://github.com/sony/sonyflake/blob/master/README.md"
 ---
 
-## The question behind the question
+**Gist.** A system that must mint identifiers on many nodes at once cannot ask a central counter for each one without making that counter both a bottleneck and a single point of failure. The prevailing designs remove per-identifier coordination by **coordinating once** — each generator receives a distinct identity — and then packing a timestamp in the high bits, that identity in the middle, and a per-tick counter in the low bits, so that uniqueness and approximate time ordering fall out of the layout. The cost is that correctness now depends on the wall clock: **if the clock moves backwards, a node can re-mint a triple it has already issued**.
 
-"Design a system that hands out unique IDs at scale" is a system-design staple because it forces you to name your requirements precisely and then watch them fight each other. Write them down first — this is half the interview:
+## The requirements, and why they conflict
 
-1. **Unique** — no two IDs ever collide, across all generators, forever.
-2. **Roughly time-sortable** — newer IDs sort after older ones, so a range scan is a time window and the primary key stays append-mostly.
-3. **High-throughput** — tens of thousands of IDs per second per node, with no network round-trip per ID.
-4. **No single point of failure** — no central sequence server whose outage stops all writes.
+Four requirements are usually stated together:
 
-You cannot maximize all four with one design. A central counter gives you dense, perfectly ordered IDs but is a SPOF. Pure randomness is trivially decentralized and collision-free but destroys ordering. Everything interesting lives in between, and the "in between" is mostly about how you slice a 64- or 128-bit integer into a timestamp, a machine identity, and a per-tick counter.
+1. **Unique** — no two identifiers collide, across all generators.
+2. **Roughly time-sortable** — newer identifiers sort after older ones, so a range scan over the key is a time window and the primary key stays append-mostly.
+3. **High throughput** — no network round-trip per identifier.
+4. **No single point of failure** — no central sequence server whose outage halts all writes.
 
-## The naive baselines and why they fall over
+No single design maximizes all four. A central counter yields dense, perfectly ordered identifiers and is a single point of failure. Pure randomness needs no coordination at all and, at 122 random bits, is collision-free in practice, but carries no ordering. The interesting designs sit between the two, and the space between them is largely a question of how a 64- or 128-bit integer is sliced into a timestamp, a machine identity, and a per-tick counter.
 
-**Database auto-increment.** `BIGSERIAL` in one Postgres box is dense, sortable, and dead simple — and it's a bottleneck and a SPOF the moment you shard. Every insert contends on one sequence.
+## The naive baselines
 
-**Ticket servers (the Flickr approach).** Run two MySQL boxes, one handing out odd numbers, one even, via `REPLACE INTO` on a single-row table. This removes the single SPOF and ordering stays roughly monotonic, but throughput is capped at what a couple of databases can do, and adding a third server means re-partitioning the number space. It buys time, not scale.
+**Database auto-increment.** A `BIGSERIAL` column on one Postgres instance is dense and sortable. It becomes a bottleneck and a single point of failure as soon as the data is sharded, because every insert contends on one sequence.
 
-The lesson: **coordination per ID is the enemy.** Good designs coordinate *once* — assign each node a distinct identity — then let every node mint IDs locally with zero chatter.
+**Ticket servers (the Flickr approach).** Two MySQL instances, one issuing odd numbers and one even, via `REPLACE INTO` against a single-row table. This removes the single point of failure and keeps ordering roughly monotonic, but throughput is bounded by what those two databases sustain, and adding a third server requires re-partitioning the number space. The technique buys time rather than scale.
 
-## UUIDs: v4 vs the v7 you should actually use
+The common lesson: **per-identifier coordination is the constraint**. The designs that scale coordinate exactly once, to assign each node a distinct identity, and thereafter generate locally with no further exchange.
 
-A UUID is 128 bits. **UUIDv4** (RFC 9562) is 122 bits of randomness plus a 4-bit version and 2-bit variant. Collisions are astronomically unlikely, generation is embarrassingly parallel, and there's no coordination at all — it nails requirements 1, 3, and 4. It fails requirement 2 completely: consecutive IDs land at random positions in the key space.
+## UUIDv4 and UUIDv7
 
-That randomness has a real cost at the storage layer. Insert random keys into a B-tree index and every insert hits a random leaf page, causing page splits, cache misses, and write amplification — the index never stays hot at the tail. Time-sortable keys, by contrast, keep inserting into the *same* rightmost page, so the tree grows append-mostly and splits are rare. (This is exactly the index-locality argument in the companion piece on [LSM-trees vs B-trees](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees).)
+A universally unique identifier (UUID) is 128 bits. **UUIDv4**, specified in **RFC 9562**, is 122 bits of randomness plus a 4-bit version and a 2-bit variant. Generation is embarrassingly parallel and requires no coordination, satisfying requirements 1, 3 and 4. It fails requirement 2 outright: consecutive identifiers land at unrelated positions in the key space.
 
-**UUIDv7**, standardized in **RFC 9562 (2024)**, fixes this and is the modern default. Its layout:
+That randomness has a cost at the storage layer. Inserting random keys into a B-tree index directs each insert to an arbitrary leaf page, producing page splits, cache misses and write amplification; the working set at the tail of the index is never small. Time-sortable keys instead direct successive inserts to the **same rightmost page**, so the tree grows append-mostly and splits are rarer. This is the index-locality argument developed in the companion piece on [LSM-trees vs B-trees](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees).
 
-- **48 bits** — `unix_ts_ms`, big-endian Unix time in milliseconds (the most-significant bits)
+**UUIDv7**, also standardized in RFC 9562, places the timestamp first:
+
+- **48 bits** — `unix_ts_ms`, big-endian Unix time in milliseconds (most significant)
 - **4 bits** — version (`0b0111`)
 - **12 bits** — `rand_a`, random
 - **2 bits** — variant (`0b10`)
 - **62 bits** — `rand_b`, random
 
-Because the millisecond timestamp sits in the top bits, byte-wise lexicographic order equals time order. You get UUIDv4's zero-coordination decentralization *and* time-locality, in a drop-in 128-bit value your database already knows how to store. If someone asks "UUID or Snowflake?", the honest 2026 answer usually starts with "UUIDv7, unless you specifically need 64 bits."
+Because the millisecond timestamp occupies the top bits, **two identifiers minted in different milliseconds sort byte-wise in time order**; identifiers minted within the same millisecond are ordered by their random bits, so RFC 9562 describes the ordering as monotonic only at millisecond granularity unless one of its optional counter methods is used. UUIDv7 therefore retains UUIDv4's zero-coordination property while adding time locality, in a 128-bit value that existing UUID columns already store.
 
-**ULID** and **KSUID** predate UUIDv7 with nicer string encodings. A **ULID** is 128 bits — 48-bit ms timestamp + 80-bit randomness — as 26 Crockford base32 characters, with a monotonic mode that *increments the random field* for same-millisecond IDs so they stay ordered. A **KSUID** is 20 bytes — a 32-bit *second*-granularity timestamp (custom epoch 2014-05-13) plus 128 random bits — as 27 base62 characters. All three share one idea: timestamp on the left, entropy on the right.
+**ULID** and **KSUID** predate UUIDv7 and use different string encodings. A **ULID** is 128 bits — a 48-bit millisecond timestamp plus 80 bits of randomness — rendered as 26 Crockford base32 characters, with a monotonic mode that **increments the random field** for identifiers generated in the same millisecond so that they remain ordered. A **KSUID** is 20 bytes — a 32-bit *second*-granularity timestamp with a custom epoch of 2014-05-13 plus 128 random bits — rendered as 27 base62 characters. All three share one structural idea: timestamp on the left, entropy on the right.
 
-## Twitter Snowflake: 64 bits, no coordinator per ID
+## Twitter Snowflake
 
-When you need a compact **64-bit integer** (half the storage of a UUID, and it fits a native `bigint` column and CPU register), Snowflake is the canonical answer. Twitter's original layout packs a signed 64-bit int as **1 + 41 + 10 + 12**:
+Where a compact **64-bit integer** is required — half the storage of a UUID, and a fit for a native `bigint` column — Snowflake is the canonical layout. It packs a signed 64-bit integer as **1 + 41 + 10 + 12**:
 
 | Bits | Field | Meaning |
 |-----:|-------|---------|
-| 1 | sign | unused, kept 0 so the int stays positive |
-| 41 | timestamp | ms since a **custom epoch** (Twitter used `1288834974657`, i.e. 2010-11-04) |
-| 10 | machine id | which node minted this — **1,024** distinct workers |
-| 12 | sequence | per-millisecond counter — **4,096** IDs/ms/node |
+| 1 | sign | unused, held at 0 so the integer stays positive |
+| 41 | timestamp | milliseconds since a **custom epoch** (Twitter used `1288834974657`, i.e. 2010-11-04) |
+| 10 | machine id | which node minted the identifier — **1,024** distinct workers |
+| 12 | sequence | per-millisecond counter — **4,096** identifiers per millisecond per node |
 
-The bit math is the whole point, so make it explicit in the interview. 41 bits of milliseconds is 2^41 ms ≈ **69 years** from the custom epoch (a custom epoch buys you those years instead of burning them on time since 1970). 10 machine bits means 1,024 nodes; 12 sequence bits means each node can mint 4,096 IDs *per millisecond* — roughly **4 million IDs/sec/node** — before it must spin-wait for the clock to tick. Coordination happens exactly once: something (ZooKeeper, etcd, config, or the pod ordinal) assigns each node a unique 10-bit id. After that, every node generates locally, offline, forever. That's requirement 4 satisfied without a per-ID round-trip.
+The arithmetic is the substance of the design. 2^41 milliseconds is approximately **69 years** measured from the custom epoch rather than from 1970. Ten machine bits admit 1,024 nodes. Twelve sequence bits allow each node 4,096 identifiers **per millisecond**, on the order of **4 million per second per node**, after which the generator must wait for the clock to advance. Coordination occurs exactly once: some external mechanism — ZooKeeper, etcd, static configuration, or a StatefulSet pod ordinal — assigns each node a unique 10-bit identity. Thereafter every node generates offline.
 
-Here's the generator — the bit-packing is the load-bearing part:
+The invariant that makes the scheme correct is that the triple **(timestamp, machine id, sequence)** is never repeated. The machine id is unique by assignment; the sequence is unique within a millisecond by the counter; the timestamp is assumed non-decreasing.
 
-```python
-import time, threading
+### Implementation sketch (Scala)
 
-class Snowflake:
-    EPOCH = 1288834974657          # custom epoch (ms)
-    MACHINE_BITS  = 10
-    SEQUENCE_BITS = 12
-    MAX_MACHINE  = (1 << MACHINE_BITS)  - 1   # 1023
-    MAX_SEQUENCE = (1 << SEQUENCE_BITS) - 1   # 4095
+```scala
+final class Snowflake(machineId: Long):
+  require(machineId >= 0 && machineId <= Snowflake.MaxMachine)
 
-    def __init__(self, machine_id: int):
-        if not 0 <= machine_id <= self.MAX_MACHINE:
-            raise ValueError("machine_id out of range")
-        self.machine_id = machine_id
-        self.seq = 0
-        self.last_ts = -1
-        self.lock = threading.Lock()
+  private var lastTs: Long = -1L
+  private var seq: Long    = 0L
 
-    def _now(self) -> int:
-        return int(time.time() * 1000)
+  def nextId(): Long = synchronized:
+    var ts = System.currentTimeMillis()
+    if ts < lastTs then
+      throw IllegalStateException(s"clock moved back ${lastTs - ts} ms")
+    if ts == lastTs then
+      seq = (seq + 1) & Snowflake.MaxSequence
+      if seq == 0 then ts = waitNextMs()   // 4096 exhausted in this millisecond
+    else seq = 0L
+    lastTs = ts
+    ((ts - Snowflake.Epoch) << (Snowflake.MachineBits + Snowflake.SequenceBits)) |
+      (machineId << Snowflake.SequenceBits) | seq
 
-    def next_id(self) -> int:
-        with self.lock:
-            ts = self._now()
-            if ts < self.last_ts:                 # clock went backwards
-                raise RuntimeError(f"clock moved back {self.last_ts - ts}ms")
-            if ts == self.last_ts:                 # same ms: bump sequence
-                self.seq = (self.seq + 1) & self.MAX_SEQUENCE
-                if self.seq == 0:                  # 4096 exhausted this ms
-                    ts = self._wait_next_ms(ts)
-            else:
-                self.seq = 0
-            self.last_ts = ts
-            return (((ts - self.EPOCH) << (self.MACHINE_BITS + self.SEQUENCE_BITS))
-                    | (self.machine_id << self.SEQUENCE_BITS)
-                    | self.seq)
+  private def waitNextMs(): Long =
+    var ts = System.currentTimeMillis()
+    while ts <= lastTs do ts = System.currentTimeMillis()
+    ts
 
-    def _wait_next_ms(self, ts: int) -> int:
-        while ts <= self.last_ts:
-            ts = self._now()
-        return ts
+object Snowflake:
+  val Epoch: Long        = 1288834974657L
+  val MachineBits: Int   = 10
+  val SequenceBits: Int  = 12
+  val MaxMachine: Long   = (1L << MachineBits) - 1    // 1023
+  val MaxSequence: Long  = (1L << SequenceBits) - 1   // 4095
 ```
 
-## The hazard everyone under-tests: the clock going backwards
+The masking `& MaxSequence` is the overflow detector: the counter wrapping to zero is the signal that the millisecond's 4,096 slots are spent and the generator must block until the clock ticks.
 
-Snowflake's uniqueness rests on one assumption — **the wall clock never moves backward**. But NTP corrections, leap-second smearing, and VM live-migration all let `time()` jump back. If it does, a node can re-mint a `(timestamp, machine, sequence)` triple it already used, silently producing a **duplicate primary key**. The snippet above refuses to issue IDs while `ts < last_ts` — the standard defensive move. Production systems go further: reject for small skews, or better, persist `last_ts` and only serve time from a monotonic source. Twitter's guidance was blunt — run NTP in *slew* mode, never *step* mode, so the clock is nudged rather than yanked. (For why "one true time" is so hard, see [clock synchronization: Cristian & NTP](/articles/distributed-systems/2026-07-30-clock-synchronization-cristian-ntp).)
+## The clock moving backwards
 
-**Sonyflake** (Sony's variant) re-slices the same 63 bits to change these trade-offs: **39 bits of time in 10ms units** (~174 years of life), **8 sequence bits**, and **16 machine bits** — so 65,536 nodes but only 256 IDs per 10ms per node. It trades single-node burst rate for far more machines and a longer horizon. **Instagram** took a different tack entirely, folding the *shard* into the ID: their PL/pgSQL function builds a 64-bit id from **41 bits ms timestamp + 13 bits logical shard id + 10 bits per-shard sequence** (mod 1024). The shard bits mean the ID itself tells you which database holds the row — ID generation and [data partitioning](/articles/distributed-systems/2026-08-10-data-partitioning-sharding) become the same decision. Same 64-bit budget, three different ways to spend it.
+Snowflake's uniqueness rests on the assumption that **the wall clock never moves backward**. Network Time Protocol (NTP) corrections, leap-second smearing and virtual-machine live migration can each move it back. When that happens, a node can re-issue a `(timestamp, machine, sequence)` triple it has already used, producing a **duplicate primary key** with no error at the point of generation. The sketch above refuses to issue identifiers while `ts < lastTs`, which converts silent duplication into a visible failure; it does not prevent the skew. Persisting `lastTs` extends the protection across process restarts. The usual mitigation is to run NTP in **slew** mode rather than **step** mode, so that a correction is spread over many small adjustments to the clock rate instead of a single jump that can land in the past. The difficulty of establishing a common time is treated separately in [clock synchronization: Cristian & NTP](/articles/distributed-systems/2026-07-30-clock-synchronization-cristian-ntp).
 
-## Choosing under pressure
+**Sonyflake** re-slices the same 63 bits: **39 bits of time in 10 ms units** (roughly 174 years), **8 sequence bits** and **16 machine bits** — 65,536 nodes, but 256 identifiers per 10 ms per node. It exchanges single-node burst rate for node count and horizon. **Instagram** folded the shard into the identifier instead: a PL/pgSQL function builds a 64-bit value from **41 bits of millisecond timestamp, 13 bits of logical shard id, and 10 bits of per-shard sequence** (modulo 1024). The shard bits make the identifier itself indicate which database holds the row, merging identifier generation with [data partitioning](/articles/distributed-systems/2026-08-10-data-partitioning-sharding). The same 64-bit budget, spent three ways.
 
-| Approach | Bits | Sortable? | Coordination | Best when |
-|----------|-----:|-----------|--------------|-----------|
-| DB auto-increment | 64 | yes (dense) | central SPOF | single node / low scale |
-| Ticket server (Flickr) | 64 | roughly | 2+ DBs | mid-scale, want ints |
-| UUIDv4 | 128 | **no** | none | scattered keys OK |
-| UUIDv7 / ULID / KSUID | 128/160 | yes | none | **modern default** |
-| Snowflake | 64 | yes | once (node id) | compact ints, high burst |
+## Choosing
+
+| Approach | Bits | Sortable | Coordination | Applicable when |
+|----------|-----:|----------|--------------|-----------------|
+| DB auto-increment | 64 | yes (dense) | central, single point of failure | single node, low scale |
+| Ticket server (Flickr) | 64 | roughly | 2+ databases | mid-scale, integer keys required |
+| UUIDv4 | 128 | **no** | none | scattered keys acceptable |
+| UUIDv7 / ULID / KSUID | 128/160 | yes | none | general case |
+| Snowflake | 64 | yes | once (node id) | compact integers, high burst |
 | Sonyflake | 64 | yes | once (node id) | many nodes, long horizon |
 
-The through-line: decentralize by giving each generator a distinct identity, put the timestamp in the high bits so ordering falls out for free, and treat the clock as the adversary. If you can afford 128 bits, reach for UUIDv7; if you must have 64, reach for Snowflake and guard the clock.
+The through-line: decentralize by giving each generator a distinct identity, put the timestamp in the high bits so that ordering follows from the encoding, and treat the clock as the adversary.
 
-**Try next:** implement the monotonic-within-a-millisecond guarantee for UUIDv7 (increment `rand_a` on same-ms collisions, per RFC 9562 Method 1) and measure B-tree insert throughput for UUIDv4 vs UUIDv7 keys on a table of 10M rows.
+## Pitfalls
+
+- **Two nodes assigned the same machine id mint colliding identifiers indefinitely.** The collisions surface as duplicate-key errors at insert time, far from the misconfigured node; the cause is a machine id derived from something non-unique, such as a hash of a hostname that repeats after a redeploy.
+- **A backwards clock step re-issues an already-used triple.** The generator has no record of which timestamps it has served unless `lastTs` is persisted, so a process restart after a backwards step reopens a window that was already consumed.
+- **A node sustaining more than 4,096 identifiers per millisecond spins in the wait loop.** The symptom is a busy-wait consuming a core with latency pinned to the millisecond boundary; the cause is burst rate exceeding the sequence field, not a lock.
+- **UUIDv4 primary keys degrade B-tree insert throughput as the index outgrows memory.** Each insert targets a random leaf page, so the buffer pool cannot hold the working set and every insert becomes a read; the effect is absent while the index still fits in memory, which is why it appears only after growth.
+- **Timestamps embedded in identifiers are readable by anyone holding one.** UUIDv7, ULID, KSUID and Snowflake all expose creation time in the high bits, and Instagram-style layouts additionally expose the shard.
+- **A custom epoch is a permanent commitment.** Changing it re-maps every future identifier into a range that may overlap already-issued values, and identifiers stored earlier can no longer be decoded with the new epoch.

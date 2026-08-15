@@ -2,8 +2,8 @@
 title: "Phi accrual failure detection: suspicion as a number, not a yes/no"
 date: 2026-07-25
 track: distributed-systems
-summary: "A binary heartbeat timeout forces one threshold to serve every network. The phi accrual detector outputs a rising suspicion level computed from past inter-arrival times, so callers pick their own risk. Here's the math and a compact Python detector."
-reading_time: 5
+summary: "A binary heartbeat timeout forces one threshold to serve every network. The phi accrual detector outputs a rising suspicion level computed from past inter-arrival times, so each caller selects its own tolerance for false positives."
+reading_time: 6
 tags: [failure-detection, heartbeats, cassandra, akka]
 sources:
   - title: "Hayashibara et al., The φ Accrual Failure Detector (IEEE SRDS 2004)"
@@ -16,74 +16,81 @@ sources:
     url: "https://docs.datastax.com/en/cassandra-oss/3.x/cassandra/architecture/archDataDistributeFailDetect.html"
 ---
 
-Every heartbeat-based detector faces the same question: how long do I wait for a beat before declaring the node dead? A binary timeout hard-codes one answer. Set it low and a GC pause or a jittery link convicts a healthy node; set it high and you're slow to react to a real crash. Worse, that single number has to be right for the datacenter *and* the cross-region link *and* the noisy VM. Chapter on fault tolerance in van Steen & Tanenbaum frames failure detection as fundamentally unreliable; Hayashibara et al. (2004) made it *tunable per caller* by replacing the boolean with a continuous suspicion level, phi.
+**Gist.** A heartbeat-based detector must decide how long silence may last before a peer is declared dead, and a binary timeout hard-codes one answer for every link in the system. The phi accrual detector of Hayashibara et al. (2004) replaces the boolean with a continuous suspicion value, phi, computed from the distribution of previously observed inter-arrival times, so that each caller applies its own threshold. The cost is state and statistics: a per-peer sliding window of samples, a distributional assumption that must hold, and a variance floor without which a steady link produces pathological suspicion.
+
+## The problem a single timeout cannot express
+
+A binary timeout collapses two independent quantities — the observed silence and the plausibility of that silence — into one configured constant. Set it low and a garbage-collection pause or a jittery link convicts a live node; set it high and detection of a genuine crash is correspondingly slow. The same constant must then serve an intra-datacenter link, a cross-region link, and a noisy virtual machine, whose inter-arrival distributions differ by orders of magnitude in both mean and spread. Failure detection over an asynchronous network is unreliable in principle: no finite silence distinguishes a crashed process from a slow one. **The accrual formulation does not remove that impossibility; it exposes the trade-off as a tunable parameter rather than hiding it inside a timeout.**
 
 ## From timeout to accrual
 
-Instead of "up" or "down", the detector outputs phi: a number that rises the longer it's been since the last heartbeat, scaled by how *surprising* that silence is given past behavior. Formally,
+Rather than emitting "up" or "down", the detector emits phi, a value that grows with elapsed silence and is scaled by how improbable that silence is given past behaviour:
 
 ```
 phi(t) = -log10( P_later(t - last_heartbeat) )
 ```
 
-where `P_later(x)` is the probability, under the distribution of previously observed inter-arrival times, that the *next* heartbeat is still more than `x` later than the previous one. If beats normally arrive every 1s and it's been 1s, silence is unremarkable — `P_later` is near 1 and phi is near 0. If it's been 10s on a 1s cadence, `P_later` is tiny and phi shoots up.
+`P_later(x)` is the probability, under the distribution fitted to previously observed inter-arrival times, that the next heartbeat arrives more than `x` after the previous one. When beats normally arrive every second and one second has elapsed, the silence is unremarkable: `P_later` is near 1 and phi is near 0. When ten seconds have elapsed on a one-second cadence, `P_later` is small and phi rises sharply.
 
-The log base 10 gives phi a clean operational meaning: **phi = k roughly means a `10^-k` chance you're wrong to suspect right now.** phi=1 is a ~10% chance of a mistaken conviction, phi=8 is ~10^-8. So a caller doesn't inherit someone's timeout — it picks the phi threshold matching its own tolerance for false positives.
+The base-10 logarithm gives phi an operational reading: **phi = k corresponds approximately to a 10^-k probability that a decision to suspect now is mistaken.** phi = 1 is roughly a 10 % chance of a mistaken conviction, phi = 8 roughly 10^-8. A caller therefore does not inherit another component's timeout; it selects the phi threshold matching its own tolerance for false positives, and two callers watching the same peer may legitimately disagree.
 
-## Who runs it, and at what threshold
+The estimate is adaptive in a second respect. **The width of the fitted distribution, not only its mean, enters the calculation.** On a link with wide jitter the learned variance is large, `P_later` decays slowly, and the detector is correspondingly forgiving. On a metronome-steady link the variance is small and phi turns sharp for the same absolute lateness.
 
-- **Cassandra** feeds gossip heartbeats into this detector; `phi_convict_threshold` in `cassandra.yaml` defaults to **8**, which lets a node go quiet for roughly 18 seconds before it's convicted. Cloud/cross-DC deploys bump it to 10–12 to survive jitter.
-- **Akka** uses it for cluster DeathWatch. The default threshold is **8**, heartbeat interval 1s, and the docs explicitly recommend **12** on platforms like AWS EC2 where the network is less predictable.
+## Deployed thresholds
 
-Same algorithm, same knob, different value per environment — which is exactly the point a binary timeout can't express.
+- **Apache Cassandra** feeds gossip heartbeats into the detector; `phi_convict_threshold` in `cassandra.yaml` defaults to **8**. The corresponding tolerated silence is not a fixed number of seconds: it follows from the gossip interval and the observed spread, so the same threshold yields different absolute patience on different links. The DataStax documentation notes that the value is raised in cloud environments to absorb their wider jitter.
+- **Akka** uses the detector for cluster DeathWatch. The default threshold is **8** with a heartbeat interval of 1 s, and the documentation recommends **12** on platforms such as AWS EC2 where the network is less predictable.
 
-## A compact detector in Python
+The same algorithm and the same knob take different values per environment — the degree of freedom a binary timeout cannot represent.
 
-Keep a sliding window of recent intervals, assume they're roughly normal (what the paper and Akka both do), and compute phi from the normal tail:
+## The variance floor
 
-```python
-import math
-from collections import deque
+The load-bearing implementation detail is a lower bound on the standard deviation of the fitted distribution. **As the observed variance approaches zero, the tail probability `P_later` collapses immediately past the mean, and phi diverges after a single millisecond of lateness, convicting every peer on a well-behaved link.** Imposing a minimum standard deviation keeps a healthy margin of tolerance around the mean regardless of how regular the samples are. Akka's `PhiAccrualFailureDetector` carries such a guard; the detector is unusable without one.
 
-def _cdf(x, mean, std):                       # Normal(mean, std) CDF
-    return 0.5 * (1 + math.erf((x - mean) / (std * math.sqrt(2))))
+A second guard is arithmetic: `P_later` underflows to zero for large elapsed times, and `log10(0)` is undefined, so the probability is clamped to a small positive value before the logarithm is taken. The clamp bounds the maximum reportable phi, which is harmless because every practical threshold lies far below that bound.
 
-class PhiAccrualDetector:
-    def __init__(self, window=1000, min_std_ms=50.0):
-        self.intervals = deque(maxlen=window) # recent inter-arrival gaps
-        self.min_std_ms = min_std_ms          # floor so a steady link
-        self.last = None                      #   still tolerates jitter
+### Implementation sketch (Scala)
 
-    def heartbeat(self, now_ms):
-        if self.last is not None:
-            self.intervals.append(now_ms - self.last)
-        self.last = now_ms
+The sketch keeps a bounded window of recent inter-arrival gaps, fits a normal distribution to them — the assumption made by both the paper and Akka — and reads phi off the normal tail. Sample storage, clock injection and concurrency control are omitted.
 
-    def phi(self, now_ms):
-        if self.last is None or len(self.intervals) < 2:
-            return 0.0
-        elapsed = now_ms - self.last
-        mean = sum(self.intervals) / len(self.intervals)
-        var = sum((x - mean) ** 2 for x in self.intervals) / len(self.intervals)
-        std = max(math.sqrt(var), self.min_std_ms)
-        p_later = 1.0 - _cdf(elapsed, mean, std)      # P(next beat even later)
-        return -math.log10(max(p_later, 1e-18))       # clamp avoids log(0)
+```scala
+final class PhiAccrual(window: Int = 1000, minStdMs: Double = 50.0):
+  private var gaps: Vector[Double] = Vector.empty
+  private var last: Option[Long] = None
+
+  def heartbeat(nowMs: Long): Unit =
+    last.foreach(prev => gaps = (gaps :+ (nowMs - prev).toDouble).takeRight(window))
+    last = Some(nowMs)
+
+  /** Normal(mean, std) CDF via an externally supplied error function `erf`. */
+  private def cdf(x: Double, mean: Double, std: Double): Double =
+    0.5 * (1.0 + erf((x - mean) / (std * math.sqrt(2.0))))
+
+  def phi(nowMs: Long): Double = last match
+    case Some(t) if gaps.sizeIs >= 2 =>
+      val elapsed = (nowMs - t).toDouble
+      val mean    = gaps.sum / gaps.size
+      val varc    = gaps.map(g => (g - mean) * (g - mean)).sum / gaps.size
+      // floor prevents a metronome-steady link from producing infinite phi
+      val std     = math.max(math.sqrt(varc), minStdMs)
+      val later   = 1.0 - cdf(elapsed, mean, std)
+      -math.log10(math.max(later, 1e-18))          // clamp avoids log10(0)
+    case _ => 0.0
 ```
 
-The `min_std_ms` floor matters: on a metronome-steady link the variance collapses toward zero, and without a floor phi would explode on the first millisecond of lateness and convict everything. Akka's implementation carries the same guard.
+`erf` is not in the Scala standard library and must be supplied — for example by an Apache Commons Math `NormalDistribution`, or by a series approximation. Akka's implementation avoids the issue by evaluating a logistic approximation to the normal tail directly rather than calling a CDF.
 
-## Watch it move
+## Reading a phi trace
 
-```python
-import random
-d, t = PhiAccrualDetector(), 0.0
-for _ in range(200):                      # beats ~1s apart, real jitter
-    t += random.gauss(1000, 150)
-    d.heartbeat(t)
-for gap in (900, 1200, 1600, 2200, 3000): # ms of silence since last beat
-    print(gap, round(d.phi(t + gap), 2))
-```
+Under beats averaging one second with realistic jitter, phi stays near 0 for gaps around the expected interval, passes 1 once the silence becomes mildly surprising, and crosses 8 as the gap stretches well beyond the mean. **Recording the phi trace rather than only the conviction event turns a membership incident into a measurement:** a garbage-collection pause appears as a spike that rises and then decays as beats resume, and its peak states directly how much threshold headroom remained. A cluster whose peaks routinely reach 7 with a threshold of 8 is one pause away from spurious conviction, and no boolean detector surfaces that margin.
 
-phi stays near 0 around the expected 1s gap, passes 1 as the silence gets mildly surprising, and crosses 8 as it stretches past ~2s — cross the threshold you chose and you act. The jitter matters: on a noisy link the learned variance is wide, so `P_later` collapses more slowly and the detector is automatically more forgiving. On a metronome-steady link the variance is tiny and phi turns sharp — which is why the `min_std_ms` floor exists.
+The composition used by Cassandra and Akka follows from this: one detector instance per monitored peer, heartbeats fed from the gossip or cluster-heartbeat loop, and a periodic sweep that compares each peer's current phi against the configured threshold.
 
-**Try next:** wire this into a gossip loop — one detector per peer, a background sweep that convicts any peer whose phi exceeds a configurable threshold, and log the phi trace so you can *see* a GC pause spike suspicion without tripping it. That's the shape of Cassandra's and Akka's membership.
+## Pitfalls
+
+- **A shared threshold across heterogeneous links reintroduces the problem the detector solves.** One global `phi_convict_threshold` tuned for an intra-datacenter link convicts cross-region peers whose inter-arrival spread is far wider.
+- **Omitting the variance floor makes a healthy, regular link the worst case.** Variance near zero drives `P_later` to zero immediately past the mean, so phi diverges on the first millisecond of lateness and every peer is convicted.
+- **A window that spans a network regime change poisons the estimate.** Samples collected before a routing change or a link degradation keep the fitted mean and variance low, so phi rises faster than the new normal warrants until the old samples age out.
+- **Missing heartbeats are not recorded as long intervals.** The window holds gaps between beats that arrived; a peer that was silent and then recovered contributes one very long sample that inflates the variance and blunts subsequent detection, unless the sample is filtered.
+- **Suspicion is not a decision.** phi rising past a threshold makes a peer suspect, not dead; a system that acts irreversibly on the first crossing — evicting state, reassigning ownership — cannot recover from a transient pause that the same detector would have reported as decaying.
+- **Normality is an assumption, not a measurement.** Inter-arrival times shaped by retransmission or scheduler quantisation are multi-modal, and a normal fit to a multi-modal sample misstates the tail in both directions.

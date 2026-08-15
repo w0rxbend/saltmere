@@ -3,7 +3,7 @@ title: "Hybrid Logical Clocks: timestamps that stay close to the wall clock and 
 date: 2026-07-26
 track: distributed-systems
 summary: "Lamport clocks capture causality but mean nothing on a wall; NTP-synced clocks mean something but can go backwards relative to causal order. HLC is the O(1)-size fix both CockroachDB and MongoDB ship in production."
-reading_time: 5
+reading_time: 6
 tags: [hybrid-logical-clocks, logical-clocks, ntp, causality, cockroachdb, mongodb, coordination]
 sources:
   - title: "Kulkarni, Demirbas, Madappa, Avva, Leone — Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases (2014)"
@@ -18,67 +18,70 @@ sources:
     url: "https://sookocheff.com/post/time/hybrid-logical-clocks/"
 ---
 
-The vector-clocks article here covered the classic answer to "did A happen before B?": attach `O(N)` counters and compare vectors. That answer is exact but tells you nothing about *when*, in the wall-clock sense, anything happened, and it doesn't scale to the number of nodes in a database cluster. HLC solves a narrower, more practical problem: give every event a timestamp that (1) is close to physical time, (2) respects happens-before, and (3) costs one 64-bit-ish word, not a vector. It's the clock CockroachDB and MongoDB actually run.
+**Gist.** A distributed database needs event timestamps that both respect the happens-before relation and can be read as approximate wall-clock time; a Lamport clock supplies the first property and a Network Time Protocol (NTP) disciplined physical clock supplies the second, and neither supplies both. A hybrid logical clock (HLC) stores a pair `(l, c)` — a physical-time component and a tie-breaking counter — updated on every local event, send and receive, so that comparison is lexicographic and causality-respecting. The cost is that HLC inherits the Lamport clock's blindness: it totally orders events but cannot distinguish concurrency from causal order, so detecting concurrent writes still requires vector-clock-sized state.
+
+The vector-clocks article covered the exact answer to "did A happen before B?": attach `O(N)` counters and compare vectors. That answer is precise but carries no information about *when*, in the wall-clock sense, an event occurred, and its state grows with the number of nodes in a cluster. HLC targets a narrower problem: give every event a timestamp that stays close to physical time, respects happens-before, and occupies constant space rather than a per-node vector.
 
 ## Two failing baselines
 
-**Pure Lamport clocks.** A single integer per process, bumped on every event and on message receipt (`max(local, received) + 1`), guarantees `A → B ⟹ L(A) < L(B)`. But `L(A)` has no relationship to real time — you cannot look at `L(A) = 47` and ask "was this within my 10-second read window?" or compare it to a timestamp from a system that never saw a Lamport message. It's causally correct and temporally useless.
+**Pure Lamport clocks.** A single integer per process, advanced on every event and on message receipt as `max(local, received) + 1`, guarantees `A → B ⟹ L(A) < L(B)`. The value has no relation to real time. `L(A) = 47` cannot be tested against a ten-second read window, and it cannot be compared with a timestamp produced by any system that never exchanged a Lamport message. The clock is causally correct and temporally meaningless.
 
-**Pure physical clocks (NTP).** `time.Now()` on every node is meaningful (roughly synced to UTC, usually within milliseconds via NTP) but breaks causality guarantees. Clock skew — NTP drift, virtualization jitter, leap-second handling — means a later event can legitimately get an *earlier* timestamp than a causally preceding one from another node. Snapshot reads and "give me everything before T" queries silently miss data, and last-writer-wins resolution picks the wrong writer.
+**Pure physical clocks (NTP).** A per-node reading of the system clock is meaningful — roughly synchronised to Coordinated Universal Time (UTC) through NTP — but breaks the causality guarantee. Clock skew from NTP drift, virtualization jitter, or leap-second handling means **a later event can receive an earlier timestamp than a causally preceding event on another node**. Snapshot reads and "everything before T" queries then omit data silently, and last-writer-wins conflict resolution selects the wrong writer.
 
-HLC (Kulkarni, Demirbas, Madappa, Avva, and Leone, 2014) fuses the two: it is provably isomorphic to a Lamport clock (so it captures causality exactly the way Lamport clocks do) while staying within a bounded distance of physical time.
+HLC (Kulkarni, Demirbas, Madappa, Avva, and Leone, 2014) combines the two. The paper proves that HLC satisfies the Lamport-clock condition — `A → B ⟹ HLC(A) < HLC(B)` — so it can be used wherever a Lamport clock is used, while remaining within a bounded distance of physical time.
 
-## The HLC algorithm
+## The algorithm and its invariant
 
-Each node keeps a pair `(l, c)`: `l` is the highest physical time it has observed (from itself or from a message), and `c` is a logical counter that only advances when two events tie on `l`. `pt` is the node's local NTP-disciplined physical clock.
+Each node keeps `(l, c)`. **`l` is the highest physical time the node has observed, from its own clock or from an inbound message; `c` is a logical counter that advances only when two events tie on `l`.** `pt` denotes the node's local NTP-disciplined physical clock.
 
 | Event | Rule |
 |---|---|
 | Local / send | `l' = l; l = max(l, pt); c = c+1 if l == l' else 0` |
-| Receive `(l_m, c_m)` from message | `l' = l; l = max(l, l_m, pt)`; then: if all three of `l, l', l_m` tie, `c = max(c, c_m)+1`; if only `l == l'`, `c = c+1`; if only `l == l_m`, `c = c_m+1`; else `c = 0` |
+| Receive `(l_m, c_m)` | `l' = l; l = max(l, l_m, pt)`; then: if `l`, `l'` and `l_m` all tie, `c = max(c, c_m)+1`; if only `l == l'`, `c = c+1`; if only `l == l_m`, `c = c_m+1`; otherwise `c = 0` |
 
-The invariant the paper proves is `l.e ≥ pt.e` for every event `e`: the logical part never falls behind the physical clock, and it only runs ahead by the amount of clock skew actually observed in messages — bounded, in practice, by NTP's own error bars (single-digit milliseconds in a well-run cluster, though the paper's bound is stated in terms of the maximum clock skew `ε` between any two nodes). Comparisons are lexicographic on `(l, c)`, giving a single 64-ish-bit value that sorts the same way a `(timestamp, tie-breaker)` pair would, but with a causality guarantee attached.
+The state machine has one branch per way the new `l` can have been produced. When the physical clock supplies a strictly larger value than both the previous `l` and the message's `l_m`, no tie exists and the counter resets to zero — **this reset is what keeps `c` bounded rather than growing without limit like a Lamport counter.** When the maximum comes from the previous local `l`, from the message, or from both, the counter is advanced past whichever source produced the tie, preserving strict increase along every causal edge.
 
-```python
-import time
+The invariant proved in the paper is `l.e ≥ pt.e` for every event `e`: **the logical component never falls behind the local physical clock, and it runs ahead only by the clock skew observed in received messages.** The paper states the bound in terms of the maximum skew `ε` between any two nodes; the realised excess in a deployment is therefore whatever skew NTP leaves between the participating nodes, not an unbounded quantity.
 
-class HLC:
-    def __init__(self):
-        self.l = 0   # highest physical time observed (ms)
-        self.c = 0   # logical counter for ties
+Comparison is lexicographic on `(l, c)`. The result is a constant-size value that sorts the way a `(timestamp, tie-breaker)` pair sorts, with a happens-before guarantee attached. Every outbound message carries the pair; every inbound message is merged before the receive event is stamped.
 
-    def _pt(self):
-        return int(time.time() * 1000)
+### Implementation sketch (Scala)
 
-    def send_or_local(self):
-        pt = self._pt()
-        l_prev = self.l
-        self.l = max(self.l, pt)
-        self.c = self.c + 1 if self.l == l_prev else 0
-        return (self.l, self.c)
+```scala
+final case class Hlc(l: Long, c: Long) extends Ordered[Hlc]:
+  def compare(that: Hlc): Int =
+    val byPhysical = java.lang.Long.compare(l, that.l)
+    if byPhysical != 0 then byPhysical else java.lang.Long.compare(c, that.c)
 
-    def recv(self, l_msg, c_msg):
-        pt = self._pt()
-        l_prev = self.l
-        self.l = max(self.l, l_msg, pt)
-        if self.l == l_prev == l_msg:
-            self.c = max(self.c, c_msg) + 1
-        elif self.l == l_prev:
-            self.c = self.c + 1
-        elif self.l == l_msg:
-            self.c = c_msg + 1
-        else:
-            self.c = 0
-        return (self.l, self.c)
+final class HlcClock(physicalMillis: () => Long):
+  private var state = Hlc(0L, 0L)
+
+  /** Stamps a local event or an outbound message. */
+  def tick(): Hlc = synchronized:
+    val prev = state
+    val l = math.max(prev.l, physicalMillis())
+    // Counter resets whenever the physical clock supplies a strictly larger value.
+    state = Hlc(l, if l == prev.l then prev.c + 1 else 0L)
+    state
+
+  /** Merges an inbound timestamp, then stamps the receive event. */
+  def receive(msg: Hlc): Hlc = synchronized:
+    val prev = state
+    val l = math.max(math.max(prev.l, msg.l), physicalMillis())
+    val c =
+      if l == prev.l && l == msg.l then math.max(prev.c, msg.c) + 1
+      else if l == prev.l then prev.c + 1
+      else if l == msg.l then msg.c + 1
+      else 0L
+    state = Hlc(l, c)
+    state
 ```
 
-Send a `(l, c)` pair on every outbound message, merge on every inbound one, and any two timestamps you compare give you both an approximate wall-clock reading and a correct happens-before order — the same guarantee a Lamport clock gives, plus a real-time anchor.
+## What the construction buys a database
 
-## What this buys a database
+**CockroachDB** stamps every transaction with an HLC timestamp and uses it as the multi-version concurrency control (MVCC) version and as the transaction's read and commit timestamp. Because `l` is always at least the physical clock reading, a node can bound its uncertainty about what is concurrent with it using the configured `max_offset`, which defaults to 500 ms. That bound is the basis of the **uncertainty interval**: a read that encounters a value timestamped inside the uncertainty window pushes its own timestamp forward instead of returning a result that looks stale. CockroachDB treats skew as correctness-critical — **a node that detects skew exceeding 80% of `max_offset` against a majority of its peers terminates itself** rather than risk violating single-key linearizability.
 
-**CockroachDB** stamps every transaction with an HLC timestamp and uses it as the MVCC version and the transaction's read/commit timestamp. Because `l` is always ≥ physical time, a node can bound "how uncertain am I about what's concurrent with me right now" by its configured `max_offset` (500ms by default) — this is the basis of CockroachDB's *uncertainty interval*: a read that finds a value timestamped within the uncertainty window pushes its own timestamp forward instead of silently returning a stale-looking result. CockroachDB also treats clock skew as a correctness-critical parameter — a node that detects skew exceeding 80% of `max_offset` against a majority of peers crashes itself rather than risk violating single-key linearizability.
-
-**MongoDB** (since 3.6) uses a cluster-wide logical clock for causal consistency: every op gets a `ClusterTime`, and the value returned to a client after a write, `operationTime`, is passed back on subsequent reads so a secondary can wait until it has replicated at least that far before answering. It's Lamport-clock causality tracking bound to physical time the same HLC way, which is what makes "read-your-own-writes across a replica set, without pinning to the primary" possible via causally consistent sessions plus `majority` read/write concerns.
+**MongoDB** has used a cluster-wide logical clock for causal consistency since version 3.6. Every operation carries a `ClusterTime`, and the `operationTime` returned to a client after a write is supplied on subsequent reads, so a secondary can wait until it has replicated at least that far before answering. This is Lamport causality tracking anchored to physical time in the HLC manner, and it is what makes a session able to read its own writes across a replica set without pinning the session to the primary, using causally consistent sessions together with `majority` read and write concerns.
 
 ## Comparing the three
 
@@ -88,8 +91,15 @@ Send a `(l, c)` pair on every outbound message, merge on every inbound one, and 
 | Close to wall-clock time | No | Yes | Yes (bounded by skew) |
 | Size | O(1) | O(1) | O(1) |
 | Detects concurrency exactly | No (vector clocks do) | No | No (same limit as Lamport) |
-| Used by | textbook algorithms | naive `LWW` systems | CockroachDB, MongoDB |
+| Used by | textbook algorithms | naive last-writer-wins systems | CockroachDB, MongoDB |
 
-Note the row that doesn't change: HLC is exactly as bad as a Lamport clock at telling concurrent events apart from causally-ordered ones — it inherits that limitation. If you need to *detect* concurrent writes (not just order all events consistently), you still want a vector clock or a dotted version vector layered on top, at O(N) cost. HLC's whole pitch is being the practical middle ground for total ordering plus timestamps that mean something, at a price a database can actually afford to attach to every row.
+The row that does not improve is concurrency detection. **HLC is exactly as weak as a Lamport clock at separating concurrent events from causally ordered ones**: the Lamport-clock condition is one-directional, so `HLC(A) < HLC(B)` carries no implication about whether `A → B`. Detecting concurrent writes, as opposed to ordering all events consistently, still requires a vector clock or a dotted version vector layered above, at `O(N)` cost. HLC's position is the middle ground: a total order plus a timestamp with physical meaning, at a size a database can attach to every row.
 
-**Try next:** wire the `HLC` class above into two toy "nodes" exchanging messages over a socket or queue, deliberately skew one node's system clock, and watch `recv()` absorb the skew into `c` instead of producing an out-of-order timestamp.
+## Pitfalls
+
+- **Treating an HLC value as a UTC instant.** The `l` component can exceed the local physical clock by the observed skew, so exporting it as a wall-clock reading reports times slightly in the future relative to the node's own clock.
+- **Comparing `l` alone and dropping `c`.** Two causally ordered events that share a physical millisecond differ only in the counter; discarding `c` collapses them into a tie and destroys the happens-before guarantee.
+- **Omitting the merge on receive.** A node that stamps inbound work with `tick()` instead of `receive(msg)` never absorbs the sender's `l`, so a message from a node ahead in physical time yields a receive timestamp below the send timestamp.
+- **Assuming an ordered pair implies causal dependence.** `a < b` under HLC holds for concurrent events as well; inferring that `a` influenced `b` from the timestamps alone is unsound.
+- **Running with clock discipline disabled or badly configured.** Skew is bounded only by what NTP achieves; in CockroachDB, skew past 80% of `max_offset` against a majority of peers causes the node to terminate itself, which surfaces as unexplained node loss rather than as a clock alert.
+- **Persisting `c` in a narrower field than the deployment produces.** The counter resets only when the physical clock advances past every observed `l`; under a stalled or backward-stepping physical clock it keeps incrementing, and a field sized for a handful of ties overflows.

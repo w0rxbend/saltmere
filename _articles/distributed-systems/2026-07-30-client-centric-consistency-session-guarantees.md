@@ -1,9 +1,9 @@
 ---
-title: "Session guarantees: the four promises that keep a user's own timeline straight"
+title: "Session guarantees: the four promises that keep a single client's timeline straight"
 date: 2026-07-30
 track: distributed-systems
-summary: "Data-centric consistency argues about what all clients see together. Session guarantees flip the question: within one user's session, the system must never appear to run backwards. Here are the four guarantees from the Bayou paper, why they matter, and how MongoDB, Cassandra, and DynamoDB actually deliver (or quietly break) them."
-reading_time: 6
+summary: "Data-centric consistency argues about what all clients see together. Session guarantees narrow the question: within one client's session, the store must never appear to run backwards. This article states the four guarantees from the Bayou paper, the version-vector mechanism that enforces them, and how MongoDB, DynamoDB and Cassandra deliver or drop them."
+reading_time: 7
 tags: [consistency, session-guarantees, causal-consistency, replication, mongodb, cassandra]
 sources:
   - title: "Session Guarantees for Weakly Consistent Replicated Data (Terry, Demers, Petersen, Spreitzer, Theimer, Welch — PDIS 1994)"
@@ -18,79 +18,97 @@ sources:
     url: "https://issues.apache.org/jira/browse/CASSANDRA-2494"
 ---
 
-Data-centric consistency models (linearizability, sequential, causal) argue about what *all* clients see *together* — one global agreement everyone shares. That's expensive, and often more than a single user needs. **Client-centric consistency** asks a narrower, cheaper question: within *one* client's ongoing **session**, does the system ever appear to run backwards? A user who posts a comment and then reloads to find it gone, or refreshes a feed that loses items it just showed, experiences a system that violates causality *in their own timeline* — even if the global state is perfectly fine. The four **session guarantees** from the 1994 Bayou paper by Terry et al. are exactly the promises that prevent this.
+**Gist.** In a weakly consistent replicated store, replicas hold different subsets of the write history, and a client whose successive requests land on different replicas can observe its own past disappear. The four **session guarantees** of Terry et al. (PDIS 1994) constrain only what *one* session may observe, and are enforced by carrying a **version vector** with each request and refusing to serve from a replica that does not dominate it. The cost is a liveness one: when no reachable replica dominates the required vector, the request must block, redirect, or escalate to a stronger read.
 
-## The setup: replicas that disagree, and a client that moves
+## The setting: replicas that disagree, and a client that moves
 
-Assume a weakly-consistent replicated store: many servers, writes propagate lazily (gossip, anti-entropy), and any two replicas may hold different subsets of writes at any instant. A client is not pinned to one replica — a load balancer may route request 1 to replica A and request 2 to replica B. That mobility is where the anomalies come from.
+Data-centric models — linearizability, sequential consistency, causal consistency — constrain what *all* clients observe *together*. **Client-centric consistency** constrains one session in isolation and therefore never requires replicas to agree with each other. Van Steen & Tanenbaum present the family this way in the consistency-and-replication chapter: defined from the client's viewpoint rather than the data's.
 
-The Bayou model gives each write a globally unique **WID** (write identifier) and tracks two sets per session:
+Assume many servers, writes propagating lazily by gossip or anti-entropy, and no pinning of a client to a replica: a load balancer may route request 1 to replica A and request 2 to replica B. **That client mobility is the sole source of the anomalies below** — a client that never moves and never loses its replica sees a history that only grows.
 
-- the **write-set** — WIDs of writes this session performed;
-- the **read-set** — WIDs of writes *relevant* to this session's reads.
+The Bayou model gives each write a globally unique **write identifier (WID)** and tracks two sets per session:
 
-`DB(S,t)` denotes the set of writes server `S` has applied at time `t`. The guarantees are constraints relating these sets. In practice you don't ship WID sets around — you summarize them with a **version vector** (a `<server, logical-clock>` map), which is the compact form the paper proposes.
+- the **write-set** — WIDs of the writes this session performed;
+- the **read-set** — WIDs of the writes *relevant* to this session's reads.
+
+`DB(S,t)` denotes the set of writes that server `S` has applied at time `t`. The guarantees are constraints relating these sets to `DB`. WID sets are not transmitted literally; the paper proposes summarizing them as a **version vector**, a map from server identifier to logical clock value.
 
 ## The four guarantees
 
-| Guarantee | Plain-English promise | Formal constraint (Bayou) |
+| Guarantee | Promise | Formal constraint (Bayou) |
 |---|---|---|
-| **Read Your Writes** | You always see your own past writes. | If read `R` follows write `W` in the session, then `W ∈ DB(S,t)` when `R` runs on `S`. |
-| **Monotonic Reads** | Reads never lose data a previous read showed. | If `R1` precedes `R2`, then `RelevantWrites(R1) ⊆ DB(S2,t2)` when `R2` runs. |
-| **Monotonic Writes** | Your writes apply in the order you issued them. | If `W1` precedes `W2` in the session, every server that has `W2` also has `W1`, ordered `W1 → W2`. |
-| **Writes Follow Reads** | A write lands *after* the writes it was based on. | If `R1` precedes `W2`, then any server holding `W2` also holds the writes `R1` read, ordered before `W2`. |
+| **Read Own Writes (RYW)** | A session observes its own past writes. | If read `R` follows write `W` in the session, then `W ∈ DB(S,t)` when `R` runs on `S`. |
+| **Monotonic Reads (MR)** | A read never loses data an earlier read showed. | If `R1` precedes `R2`, then `RelevantWrites(R1) ⊆ DB(S2,t2)` when `R2` runs. |
+| **Monotonic Writes (MW)** | A session's writes apply in issue order. | If `W1` precedes `W2` in the session, every server holding `W2` also holds `W1`, ordered `W1 → W2`. |
+| **Writes Follow Reads (WFR)** | A write lands after the writes it was based on. | If `R1` precedes `W2`, any server holding `W2` also holds the writes `R1` read, ordered before `W2`. |
 
-Two are about **reads not regressing** (RYW, MR), two are about **write ordering being respected** (MW, WFR). Concrete failures each one rules out:
+Two guarantees forbid reads from regressing (RYW, MR); two constrain write ordering (MW, WFR). The anomaly each one excludes:
 
-- **Read Your Writes** — You change your email in settings, the confirmation page reads from a stale replica, and it still shows the old address. RYW forbids this.
-- **Monotonic Reads** — You scroll a timeline (replica A, has 100 posts), the next page hits replica B (has 60), and 40 posts vanish. MR forbids a read from seeing *fewer* writes than an earlier read.
-- **Monotonic Writes** — You save a document, then save again; a replica applies save-2 but not save-1, so the "latest" version is missing your first edit's content. MW forbids reordering your own writes.
-- **Writes Follow Reads** — You read a comment and reply to it; the reply propagates to a replica that doesn't yet have the original comment, so people see the reply before the thing it answers. WFR preserves the read→write causal edge. This is the guarantee that makes threaded discussions coherent.
+- **RYW** — an address change is written, and the confirmation page reads from a replica that has not yet received the write, displaying the old value.
+- **MR** — page 1 of a timeline is served by a replica holding 100 posts, page 2 by a replica holding 60, and 40 posts vanish. MR forbids a later read from reflecting *fewer* writes than an earlier one.
+- **MW** — save-1 and save-2 are issued in that order; a replica applies save-2 without save-1, so the newest version omits the first edit's content.
+- **WFR** — a comment is read and a reply written; the reply reaches a replica that lacks the original, so the reply is visible before what it answers. WFR preserves the read→write causal edge, which is what makes threaded discussion coherent.
 
-Stack all four within a session and you get **causal consistency** as observed by that one client. That's not a coincidence — it's precisely how MongoDB frames its causally-consistent sessions.
+Holding all four within a session gives that client a **causally ordered view of its own operations**, which is the framing MongoDB uses for its causally consistent sessions.
 
-## Why "client-centric" is cheaper than "data-centric"
+## The enforcement mechanism
 
-The key difference: session guarantees never require replicas to *agree with each other*. They only constrain what *this client* is allowed to observe, given what it has already observed. You can enforce them entirely at the client (or a session-sticky proxy) by carrying a little state. Van Steen & Tanenbaum present them this way in the consistency-and-replication chapter — as a family of guarantees defined from the client's viewpoint rather than the data's.
+The invariant is one line: **a replica may serve a request only if its `DB` version vector dominates the vector the session requires**, where dominance means component-wise `≥`. The session maintains two vectors, one summarizing relevant writes for its reads (serving MR and WFR) and one summarizing its own writes (serving RYW and MW), and merges observed vectors into them component-wise by `max`, so neither vector ever decreases.
 
-The mechanism, in ~20 lines: the client keeps a version vector summarizing writes it must not fall behind, sends it with each request, and a replica must be **caught up to** that vector before serving.
+**Sticky sessions are the degenerate case of this mechanism**: pinning a client to one replica makes RYW and MR nearly free, because that replica's `DB` set only grows. The guarantees become interesting exactly when stickiness is lost — failover, rebalancing, a client roaming between regions.
 
-```python
-class Session:
-    def __init__(self):
-        self.read_vv  = {}   # summarizes RelevantWrites for reads (MR, WFR)
-        self.write_vv = {}   # summarizes this session's writes  (RYW, MW)
+### Implementation sketch (Scala)
 
-    @staticmethod
-    def _merge(a, b):
-        return {s: max(a.get(s, 0), b.get(s, 0)) for s in a | b.keys()}
+```scala
+type ServerId  = String
+type VV        = Map[ServerId, Long]   // server -> logical clock
 
-    def read(self, key, replicas):
-        # MR + RYW: need a replica that has seen everything we depend on
-        need = self._merge(self.read_vv, self.write_vv)
-        r = pick_replica_dominating(replicas, need)   # else block / redirect
-        val, val_vv = r.read(key)
-        self.read_vv = self._merge(self.read_vv, val_vv)   # never regress
-        return val
+def merge(a: VV, b: VV): VV =
+  (a.keySet | b.keySet).view.map(s => s -> (a.getOrElse(s, 0L) max b.getOrElse(s, 0L))).toMap
 
-    def write(self, key, val, replicas):
-        # WFR: the new write must causally follow what we've read
-        dep = self._merge(self.write_vv, self.read_vv)
-        r = pick_replica_dominating(replicas, dep)
-        wid_vv = r.write(key, val, depends_on=dep)         # MW via dep on prior writes
-        self.write_vv = self._merge(self.write_vv, wid_vv)
-        return wid_vv
+def dominates(have: VV, need: VV): Boolean =
+  need.forall((s, c) => have.getOrElse(s, 0L) >= c)
+
+trait Replica:
+  def version: VV
+  def read(key: String): (String, VV)                       // value and its dependency vector
+  def write(key: String, v: String, dependsOn: VV): VV      // returns the new write's vector
+
+final class Session(private var readVV: VV = Map.empty, private var writeVV: VV = Map.empty):
+
+  // RYW + MR: the serving replica must have every write this session depends on.
+  def read(key: String, replicas: Seq[Replica]): Option[String] =
+    val need = merge(readVV, writeVV)
+    replicas.find(r => dominates(r.version, need)).map { r =>
+      val (value, valueVV) = r.read(key)
+      readVV = merge(readVV, valueVV)   // monotone: readVV never decreases
+      value
+    }   // None means no replica is caught up: block, redirect, or escalate
+
+  // WFR (dependency on prior reads) + MW (dependency on prior writes).
+  def write(key: String, value: String, replicas: Seq[Replica]): Option[VV] =
+    val dep = merge(writeVV, readVV)
+    replicas.find(r => dominates(r.version, dep)).map { r =>
+      val wrote = r.write(key, value, dependsOn = dep)
+      writeVV = merge(writeVV, wrote)
+      wrote
+    }
 ```
 
-`pick_replica_dominating` is the crux: a replica may serve only if its `DB` vector **dominates** the required vector. If none does, you wait, trigger anti-entropy, or fall back to a stronger read. **Sticky sessions** are the degenerate optimization of this: pin the client to one replica and RYW/MR come almost for free, because that replica's `DB` only grows.
+The `find` returning `None` is the cost the mechanism imposes: **the guarantees are safety properties, and enforcing them can only be paid for in availability or latency**, never in weaker replica agreement.
 
-## How real systems map onto this
+## How deployed systems map onto the model
 
-- **Bayou / session tokens.** The original design: the client holds the version vectors above; any server can serve a request as long as it dominates the token. Move servers freely, guarantees hold.
-- **MongoDB causal consistency.** A causally-consistent session tags reads with `afterClusterTime` and advances an `operationTime`/cluster time on every reply — the same version-vector idea, specialized to a hybrid logical clock. The docs list exactly these four guarantees, but with a sharp caveat: you only get *all four with durability* when reads use `readConcern: "majority"` **and** writes use `writeConcern: "majority"`. Weaker concerns silently drop guarantees.
-- **DynamoDB.** Eventually-consistent reads give none of these across replicas; a *strongly* consistent read gives read-your-writes for that item. There's no cross-request session token, so you get RYW per strongly-consistent read, not automatic monotonic reads across a mobile session — you carry that yourself.
-- **Cassandra `LOCAL_QUORUM`.** The classic trap: people assume `R + W > RF` (e.g. quorum reads and writes) buys monotonic reads. It doesn't by itself. **CASSANDRA-2494** documents the scenario — a value written at `ONE` can be returned by a quorum read *before* read-repair is acknowledged on a second replica, so a later read can go backwards. It was fixed (1.0) by making the coordinator wait for a read-repair ack before returning. The lesson stands: quorum intersection guarantees you *can* see the latest write, not that successive reads are *monotonic*.
+- **Bayou.** The client holds the version vectors; any server may serve a request provided it dominates the session's token. Servers may be switched freely without violating the guarantees.
+- **MongoDB causal consistency.** A causally consistent session tags reads with `afterClusterTime` and advances an `operationTime`/cluster time on each reply — the version-vector idea specialized to a hybrid logical clock. The documentation lists these four guarantees and attaches a condition: all four hold **with durability** only when reads use `readConcern: "majority"` and writes use `writeConcern: "majority"`. Weaker concerns drop guarantees without an error.
+- **DynamoDB.** Eventually consistent reads provide none of the four across replicas. A strongly consistent read provides read-own-writes for that item. No cross-request session token is exposed, so monotonic reads across a session must be maintained by the caller.
+- **Cassandra `LOCAL_QUORUM`.** A quorum configuration satisfying `R + W > RF` does not by itself provide monotonic reads. **CASSANDRA-2494** documents the case: a quorum read could return a newest value that the coordinator had not yet confirmed on enough replicas, so a later quorum read reaching a different replica set could return an older value. The fix made the coordinator wait for the read-repair acknowledgement before returning the value. Quorum intersection guarantees that the latest write *can* be observed, not that successive reads are monotonic.
 
-Session guarantees are the cheapest consistency that still feels correct to a human. If you only ship one thing, ship **read-your-writes + monotonic reads** — they kill the two anomalies users notice fastest.
+## Pitfalls
 
-**Try next:** Take the `Session` class above and build three in-memory replicas that gossip at random intervals. Write a value through the session, then force the *next* read to a replica that hasn't received the gossip yet. First confirm the naive version (no version vectors) returns stale data — a read-your-writes violation — then wire in `pick_replica_dominating` and assert the read either blocks or redirects until a replica dominates your `write_vv`. Finally, add a monotonic-reads test: read from a fresh replica, then from a *staler* one, and prove the guard rejects the regression.
+- **Treating `R + W > RF` as monotonic reads.** Symptom: a second read returns an older value than the first under an unchanged workload. Cause: quorum intersection constrains a single read against the write set, not two reads against each other; CASSANDRA-2494 is the recorded instance.
+- **Relying on sticky sessions for RYW without a fallback.** Symptom: the anomaly appears only during failover or rebalancing. Cause: stickiness supplies the guarantee implicitly, so the loss of stickiness silently removes it; no version vector is carried to detect the regression.
+- **Enabling a MongoDB causally consistent session while leaving read or write concern below `majority`.** Symptom: the four guarantees hold in testing and break after a replica-set election. Cause: the documented guarantees are conditioned on `readConcern: "majority"` with `writeConcern: "majority"`; a rollback of non-majority writes is not excluded.
+- **Discarding the session vectors between requests.** Symptom: read-own-writes holds within a request handler and fails across a page transition. Cause: the vectors are the entire session state; a stateless client that does not persist and resend them has no session in the model's sense.
+- **Merging version vectors by replacement rather than component-wise `max`.** Symptom: a read regresses after a request served by a lagging-but-dominating replica returns a sparser vector. Cause: replacement allows a component to decrease, breaking the monotonicity the guarantees rest on.
+- **Assuming a strongly consistent single-item read composes into a session guarantee.** Symptom: DynamoDB read-own-writes works per item and monotonic reads still fail across a sequence. Cause: the guarantee is scoped to one read of one item, and nothing carries the observed position forward to the next request.

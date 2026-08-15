@@ -1,9 +1,9 @@
 ---
-title: "Chord: finding any key in O(log N) hops, no directory required"
+title: "Chord: finding any key in O(log N) hops without a directory"
 date: 2026-07-26
 track: distributed-systems
-summary: "The consistent hash ring tells you who owns a key. Chord tells you how to find that owner without every node knowing every other node: finger tables, the find_successor lookup, and the stabilization protocol that keeps it all correct while nodes join and leave."
-reading_time: 5
+summary: "The consistent hash ring states who owns a key. Chord states how to locate that owner without every node knowing every other node: finger tables, the find_successor lookup, and the stabilization protocol that preserves correctness while nodes join and leave."
+reading_time: 6
 tags: [chord, dht, finger-table, p2p, naming, stabilization, distributed-systems]
 sources:
   - title: "Stoica, Morris, Karger, Kaashoek, Balakrishnan — Chord: A Scalable Peer-to-peer Lookup Service for Internet Applications (SIGCOMM 2001)"
@@ -16,13 +16,13 @@ sources:
     url: "https://web.mit.edu/6.033/2001/wwwdocs/handouts/dp2-chord.html"
 ---
 
-The [consistent hash ring](/distributed-systems/2026-07-25-consistent-hashing-ring) answers "who owns this key" with a rule: walk clockwise from `hash(key)` to the first node. That rule is easy to state and cheap to prove correct — but it silently assumes every node already knows the position of every other node, so it can just compute the answer locally. In a peer-to-peer network with thousands of nodes churning constantly, nobody has that global picture. Chord (Stoica, Morris, Karger, Kaashoek, Balakrishnan, SIGCOMM 2001) is the protocol for finding a key's owner when each node only knows a handful of others — in O(log N) messages, with correctness maintained automatically as nodes join and leave.
+**Gist.** The [consistent hash ring](/distributed-systems/2026-07-25-consistent-hashing-ring) resolves ownership by walking clockwise from `hash(key)` to the first node, a rule that presupposes each node already holds the position of every other node. Chord (Stoica, Morris, Karger, Kaashoek, Balakrishnan, SIGCOMM 2001) removes that presupposition: each node keeps **O(log N) pointers** — a finger table whose entries double in reach — and resolves any key in **O(log N) expected hops** by forwarding the query. The cost is that routing state is only eventually correct, so a background stabilization protocol must run continuously, and during convergence a lookup can be slow or, in the window before successor pointers settle, wrong.
 
 ## The ring, minimally
 
-Chord hashes both nodes and keys into the same m-bit identifier space (SHA-1, so typically m = 160), arranged as a circle of size 2^m — this part is exactly the consistent-hashing idea. A key `k` is owned by its **successor**: the first node whose identifier is ≥ `k` going clockwise. Every node stores two pointers into this ring: `successor` (next node clockwise) and `predecessor` (previous node counter-clockwise).
+Chord hashes both nodes and keys into the same m-bit identifier space (SHA-1, so typically m = 160), arranged as a circle of size 2^m. A key `k` is owned by its **successor**: the first node whose identifier is ≥ `k` going clockwise. Every node stores two pointers into this ring: `successor` (next node clockwise) and `predecessor` (previous node counter-clockwise).
 
-With only successor pointers, a lookup is a linear walk around the ring — correct, but O(N) hops. Chord's contribution is a routing table, the **finger table**, that turns that walk into a binary search.
+With successor pointers alone, a lookup is a linear walk around the ring: correct, but **O(N) hops**. The finger table converts that walk into a binary search.
 
 ## Finger tables
 
@@ -33,7 +33,7 @@ finger[i].start  = (n + 2^(i-1)) mod 2^m        for i = 1 .. m
 finger[i].node   = successor(finger[i].start)
 ```
 
-So `finger[1]` is just `successor`. `finger[2]` points roughly a quarter of the way around from `finger[1]`'s target, `finger[3]` an eighth further, and so on — each entry doubles the reach of the previous one. A node with m = 160 stores at most 160 pointers no matter how large the network gets: O(log N) state per node for an N-node network, not O(N).
+`finger[1]` is therefore the successor. `finger[2]` targets a point twice as far around the ring, `finger[3]` twice as far again, so **each entry doubles the reach of the previous one**. A node with m = 160 stores at most 160 pointers regardless of network size: **O(log N) state per node**, not O(N).
 
 | | flat successor chain | Chord finger table |
 |---|---|---|
@@ -44,7 +44,7 @@ So `finger[1]` is just `successor`. `finger[2]` points roughly a quarter of the 
 
 ## The lookup: find_successor
 
-To resolve key `id`, a node checks whether the key falls between itself and its immediate successor. If not, it doesn't send the query to its successor — it jumps to the finger table entry that gets it *closest to the target without overshooting*, then that node repeats the process:
+To resolve key `id`, a node tests whether the key falls in the half-open interval between itself and its immediate successor. If not, the query is not passed to the successor; it jumps to the finger entry that lands **closest to the target without overshooting it**, and that node repeats the procedure:
 
 ```
 // n.find_successor(id)
@@ -61,11 +61,11 @@ for i = m downto 1:
 return n
 ```
 
-Each hop at least halves the remaining distance to the target on the ring, because `closest_preceding_node` picks the farthest finger that doesn't pass `id`. That's the whole argument for O(log N) expected hops, and it's the same halving argument as binary search — just walking a circle instead of an array. The original paper's simulations bear this out: for a 64,000-node network the mean lookup path length is about 0.5 · log₂(N) hops, and an early PlanetLab-style deployment across ten Internet sites measured real lookup latencies of roughly 180-285 ms.
+The scan runs from the farthest finger inwards, so the chosen hop is the largest jump that still stays behind `id`. **Each hop at least halves the remaining ring distance to the target**, which is the entire argument for O(log N) expected hops — the halving argument of binary search applied to a circle rather than an array. The original paper's simulations agree: the mean lookup path length grows as roughly 0.5 · log₂(N) hops, and the measured latency of a deployment on Internet hosts rises with the node count at the same logarithmic rate.
 
-## Join and leave: three invariants to protect
+## Join and leave: three invariants
 
-A joining node `n` only needs one contact, some existing node `n'`, to bootstrap:
+A joining node `n` needs one contact, some existing node `n'`, to bootstrap:
 
 ```
 // n.join(n')
@@ -73,18 +73,18 @@ predecessor = nil
 successor   = n'.find_successor(n)
 ```
 
-That single `find_successor` call correctly places `n` in the ring. But three invariants have to stay true for lookups to keep working: (1) every node's successor pointer is correct, (2) every key is stored at its true successor, and (3) finger tables are reasonably fresh. Fixing all three synchronously on every join/leave would be expensive and fragile under concurrent changes — real networks have nodes joining, leaving, and failing simultaneously. Chord's answer is to relax invariant (3) and let a background process fix it up continuously.
+That single `find_successor` call places `n` at its correct ring position. Three invariants must then hold for lookups to remain correct: **(1) every node's successor pointer is correct, (2) every key is stored at its true successor, (3) finger tables are reasonably fresh.** Chord does not repair all three synchronously. Invariant (3) is relaxed and repaired by a background process, which is safe because a stale finger only misroutes a hop, never the final answer — `find_successor` treats the successor pointer, not the fingers, as ground truth.
 
 ## Stabilization: eventually-correct successors
 
-Each node periodically runs three routines instead of trying to update the world atomically at join time:
+Each node periodically runs four routines rather than updating the network atomically at join time:
 
 ```
 // runs periodically at node n
 def stabilize():
     x = successor.predecessor
     if x ∈ (n, successor):
-        successor = x                 # a closer successor showed up
+        successor = x                 # a closer successor appeared
     successor.notify(n)
 
 // n.notify(n'):  n' claims to be n's predecessor
@@ -101,12 +101,54 @@ def check_predecessor():
         predecessor = nil
 ```
 
-`stabilize` is the load-bearing routine: it repairs the successor pointer whenever a new node has inserted itself between `n` and `n`'s old successor, and `notify` lets that new node register itself as the predecessor. Run this on every node every few seconds and successor pointers — and therefore correctness of lookups — converge even while nodes are joining and leaving concurrently, without any global coordination. `fix_fingers` does the same job for the finger table, just lazily; a slightly stale finger only costs an extra hop or two, never a wrong answer, because `find_successor` always falls back to the successor pointer as ground truth.
+`stabilize` is the load-bearing routine. It repairs the successor pointer whenever a node has inserted itself between `n` and `n`'s previous successor, and `notify` lets the newcomer register as predecessor. Executed on every node on a periodic timer, successor pointers converge while joins and departures proceed concurrently, **without global coordination**. `fix_fingers` performs the same repair for one finger entry per round; a stale finger costs additional hops, not a wrong answer.
 
-Node failure is handled the same way successors are: each node keeps a **successor list** of its next r successors (not just one). If the immediate successor dies, the node substitutes the next live entry from that list. The paper proves that with r = O(log N), the ring survives even simultaneous failure of half the nodes with high probability, because it's vanishingly unlikely that r consecutive successors all fail at once.
+Node failure is absorbed by the same structure. Each node keeps a **successor list of its next r successors** rather than a single pointer, and on failure of the immediate successor substitutes the next live entry. The paper shows that with **r = O(log N)** the ring survives simultaneous failure of half the nodes with high probability, since the probability that all r consecutive successors fail at once is small.
+
+### Implementation sketch (Scala)
+
+The load-bearing pieces are the half-open ring interval test and the descending finger scan. Both are easy to get wrong because the identifier space wraps.
+
+```scala
+type Id = Long                              // m-bit identifier, 0 until 1L << m
+
+final case class Node(id: Id, finger: Vector[Id], successor: Id)
+
+/** Membership in the ring interval (from, to), wrapping at 2^m. */
+def inOpen(x: Id, from: Id, to: Id): Boolean =
+  if from < to then from < x && x < to
+  else from < x || x < to                   // interval crosses the origin
+
+def inHalfOpen(x: Id, from: Id, to: Id): Boolean =
+  inOpen(x, from, to) || x == to
+
+/** Farthest finger that still precedes id; falls back to n itself. */
+def closestPreceding(n: Node, id: Id): Id =
+  n.finger.reverseIterator
+    .find(f => inOpen(f, n.id, id))
+    .getOrElse(n.id)
+
+/** One routing step. Right means the answer, Left means forward to that node. */
+def step(n: Node, id: Id): Either[Id, Id] =
+  if inHalfOpen(id, n.id, n.successor) then Right(n.successor)
+  else
+    val next = closestPreceding(n, id)
+    if next == n.id then Right(n.successor) // no useful finger: use ground truth
+    else Left(next)
+```
+
+`step` returning `Right(n.successor)` when no finger helps is what keeps a fully stale finger table correct rather than divergent.
 
 ## Where this sits
 
-Chord is the routing layer; consistent hashing is the placement rule it routes toward. Dynamo-style systems use the ring for placement but skip Chord's O(log N) routing because every node keeps a full membership list (feasible at cluster scale, not at Internet scale). Chord is what you reach for when the membership list itself is too large or too volatile to replicate everywhere — the same naming problem van Steen & Tanenbaum pose for structured overlays, solved with logarithmic state instead of either a full directory or a linear walk.
+Chord is the routing layer; consistent hashing is the placement rule it routes toward. Dynamo-style systems adopt the ring for placement without Chord's O(log N) routing, because every node holds a full membership list — practical at cluster scale, not at Internet scale. Chord applies where the membership list itself is too large or too volatile to replicate everywhere, solving the structured-overlay naming problem with logarithmic state instead of a full directory or a linear walk.
 
-**Try next:** implement `find_successor` and `stabilize` for a ring of ~16 simulated nodes with m = 8, kill a random node every few stabilization rounds, and plot how many lookups return a wrong answer during convergence versus how many hops a correct lookup takes as N grows.
+## Pitfalls
+
+- **Interval tests written as closed rather than half-open.** A lookup for an identifier equal to the successor's own identifier is forwarded past its owner and loops, because `id ∈ (n, successor]` was coded as `id ∈ (n, successor)`.
+- **Wrapping ignored in the comparison.** Ranges that cross identifier 0 test false under a naive `from < x && x < to`, so nodes near the origin are never selected as fingers and lookups degrade toward the O(N) successor walk.
+- **Scanning the finger table forwards.** Taking the first matching entry instead of the farthest one yields a hop of minimum rather than maximum length; correctness holds, hop count rises toward O(N).
+- **Treating fingers as ground truth.** Answering from a finger entry without the `id ∈ (n, successor]` test returns a wrong owner whenever that finger is stale, which converts a transient routing error into a data-correctness error.
+- **Lookups issued during the convergence window.** Immediately after a join, before `stabilize` has repaired the affected successor pointers, a query can be answered by a node that no longer owns the key.
+- **Successor list of length one.** With r = 1 the failure of a single successor breaks the ring at that point until stabilization repairs it; the paper's survival argument requires r = O(log N).
+- **Stabilization period longer than the churn interval.** If nodes join and fail faster than `stabilize` runs, successor pointers never converge and the ring can fragment into disjoint loops.

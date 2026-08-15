@@ -2,8 +2,8 @@
 title: "Sequential vs causal consistency: which histories are legal, and why geo-replication settles for causal"
 date: 2026-08-04
 track: distributed-systems
-summary: "Data-centric consistency models are contracts over the set of legal execution histories. Sequential consistency (Lamport, 1979) demands one global interleaving; causal consistency only orders writes that are actually causally related. This article decides concrete histories under each model, shows exactly where they diverge, and explains why causal is the strongest thing you can keep under a network partition — with vector-clock dependency-wait as the enforcement mechanism."
-reading_time: 6
+summary: "Data-centric consistency models are contracts over the set of legal execution histories. Sequential consistency (Lamport, 1979) demands one global interleaving; causal consistency only orders writes that are causally related. This article decides concrete histories under each model, locates where they diverge, and explains why causal is the strongest contract retained under a network partition — with vector-clock dependency-wait as the enforcement mechanism."
+reading_time: 7
 tags: [consistency, sequential-consistency, causal-consistency, linearizability, cops, van-steen]
 sources:
   - title: "Lamport — How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs (IEEE TC, 1979)"
@@ -18,17 +18,19 @@ sources:
     url: "https://www.mongodb.com/docs/manual/core/causal-consistency-read-write-concerns/"
 ---
 
-A consistency model is not code; it is a *contract*. It fixes, for a replicated store, exactly which execution histories are legal — which sequences of reads and writes the system is allowed to produce. Chapter 7 of van Steen & Tanenbaum stacks the data-centric models by how restrictive that contract is. The two worth pulling apart are **sequential consistency** and **causal consistency**, because the gap between them is precisely the gap between "correct but slow across a WAN" and "the strongest thing you can still serve during a partition." Logical clocks show up here only at the end, as the mechanism that enforces the weaker contract — the models themselves are defined without any clock at all.
+**Gist.** A consistency model fixes which execution histories a replicated store may produce; sequential consistency requires a single total order over all operations, while causal consistency requires agreement only on operations linked by happens-before. The weakening is what makes wide-area replication possible: Mahajan, Alvisi and Dahlin prove that nothing stronger than real-time causal consistency is achievable in an always-available, one-way convergent system. The cost is that concurrent writes may be observed in different orders at different replicas, so a separate convergent conflict-handling rule is required to stop replicas diverging permanently.
+
+A consistency model is not code; it is a contract. It fixes, for a replicated store, exactly which sequences of reads and writes the system is allowed to produce. Chapter 7 of van Steen & Tanenbaum stacks the data-centric models by how restrictive that contract is. The two worth separating are **sequential consistency** and **causal consistency**, because the gap between them is the gap between a contract requiring cross-datacenter coordination on the write path and a contract that survives a partition. Logical clocks appear only at the end, as the enforcement mechanism for the weaker contract; the models themselves are defined without any clock.
 
 ## Sequential consistency: one global interleaving
 
-Lamport's 1979 definition, written for shared-memory multiprocessors but adopted wholesale by the distributed-systems community, is the reference point. A system is sequentially consistent when
+Lamport's 1979 definition, written for shared-memory multiprocessors and adopted by the distributed-systems literature, is the reference point. A system is sequentially consistent when
 
 > "the result of any execution is the same as if the operations of all the processors were executed in some sequential order, and the operations of each individual processor appear in this sequence in the order specified by its program."
 
-Two clauses do all the work. There must exist **one** total order over *all* operations (a single interleaving every process agrees on), and within that order each process's own operations keep their **program order**. Crucially, the definition says nothing about real time: a read may return a value written "later" by wall clock, as long as some legal interleaving explains every process's observations. That freedom is what separates sequential consistency from linearizability, which additionally requires the interleaving to respect real-time precedence (if op A finishes before op B starts, A precedes B). Linearizability is *strict*/atomic; sequential consistency is its non-real-time relaxation.
+Two clauses carry the weight. There must exist **one** total order over *all* operations — a single interleaving every process agrees on — and within that order each process's own operations retain their **program order**. The definition says nothing about real time: a read may return a value written later by wall clock, provided some legal interleaving explains every process's observations. That freedom separates sequential consistency from linearizability, which additionally requires the interleaving to respect real-time precedence, so that an operation finishing before another starts also precedes it in the order. Linearizability — also called atomic consistency — is that stronger model; sequential consistency is its non-real-time relaxation.
 
-Consider a single register `x`, two writers, two readers. Notation: `W(x)a` writes value `a`; `R(x)b` reads `b`. Time flows left to right per process, but there is no shared clock across rows.
+Consider a single register `x`, two writers and two readers. In the notation below, `W(x)a` writes value `a` and `R(x)b` reads `b`. Time flows left to right within each process, but there is no shared clock across rows.
 
 ```
 P1:  W(x)a
@@ -37,7 +39,7 @@ P3:                     R(x)b  R(x)a
 P4:                     R(x)b  R(x)a
 ```
 
-This is sequentially consistent. Pick the single order `W(x)b, W(x)a`; both readers observe `b` then `a`, consistent with that one interleaving. Now perturb only the readers:
+This history is sequentially consistent. The single order `W(x)b, W(x)a` explains it: both readers observe `b` then `a`, matching that one interleaving. Perturbing only the readers changes the verdict:
 
 ```
 P1:  W(x)a
@@ -46,15 +48,15 @@ P3:                     R(x)b  R(x)a
 P4:                     R(x)a  R(x)b
 ```
 
-There is **no** single interleaving here. P3 witnesses `b→a`; P4 witnesses `a→b`. A total order cannot place `W(x)a` both before and after `W(x)b`. So this history is **not** sequentially consistent. Hold onto it — causal consistency will judge it differently.
+**No single interleaving exists here.** P3 witnesses `b→a`; P4 witnesses `a→b`. A total order cannot place `W(x)a` both before and after `W(x)b`, so the history is not sequentially consistent. Causal consistency judges it differently.
 
-## Causal consistency: only order what's causally related
+## Causal consistency: order only what is causally related
 
-Causal consistency weakens the "one global order" clause to "one order *per causal chain*." Writes that are **potentially causally related** must be seen in the same order by every process; writes that are **concurrent** may be seen in any order, and different processes may disagree. Causality here is exactly Lamport's happens-before, lifted to operations: an operation is causally before another if it precedes it in the same process's program order, if it is a write that a later read observed (a *reads-from* edge), or by transitivity of those two. COPS names these same three rules — execution thread, gets-from, and transitivity — as the definition of its `❀` ordering.
+Causal consistency weakens the global-order clause to one order *per causal chain*. Writes that are **potentially causally related** must be observed in the same order by every process; writes that are **concurrent** may be observed in any order, and processes may disagree. Causality here is Lamport's happens-before lifted to operations: an operation is causally before another if it precedes it in the same process's program order, if it is a write that a later read observed (a *reads-from* edge), or by transitivity of those two. COPS names the same three rules — execution thread, gets-from, and transitivity — as the definition of its dependency ordering.
 
-Re-judge the second history. `W(x)a` (P1) and `W(x)b` (P2) are **concurrent**: neither process read the other's value before writing, so there is no causal edge between them. Causal consistency therefore permits P3 and P4 to order them oppositely. That history *is causally consistent* — even though we just proved it is not sequentially consistent. This single example is the crisp proof that **causal is strictly weaker than sequential**.
+Re-judging the second history: `W(x)a` on P1 and `W(x)b` on P2 are **concurrent**, since neither process read the other's value before writing, so no causal edge connects them. Causal consistency permits P3 and P4 to order them oppositely. That history *is* causally consistent although it was shown not to be sequentially consistent, which is the crisp demonstration that **causal consistency is strictly weaker than sequential consistency**.
 
-Now make the two writes causally dependent and watch causal consistency bite:
+Making the two writes causally dependent reverses the verdict:
 
 ```
 P1:  W(x)a
@@ -63,59 +65,64 @@ P3:                        R(x)b  R(x)a
 P4:                        R(x)a  R(x)b
 ```
 
-P2 read `a` and *then* wrote `b`, so `W(x)a → W(x)b` (reads-from, then program order). Every process must now honor that single edge: `a` before `b`. P4 obeys; P3 reports `b` then `a`, contradicting the causal order. This history is **not causally consistent** (and a fortiori not sequential). The lesson: causal consistency is not "anything goes for concurrent writes and nothing else" — it rigidly enforces every real dependency, and only relaxes on genuine concurrency.
+P2 read `a` and then wrote `b`, so `W(x)a → W(x)b` by a reads-from edge followed by program order. Every process must honour that edge: `a` before `b`. P4 obeys; P3 reports `b` then `a`, contradicting the causal order. This history is **not causally consistent**, and therefore not sequentially consistent either. Causal consistency enforces every real dependency rigidly and relaxes only on genuine concurrency.
 
 | Model | Legal-history rule | Real-time respected? | Agree on concurrent writes? | Available under partition? |
 |---|---|---|---|---|
-| Linearizable (strict/atomic) | one total order **+** real-time precedence | yes | yes (single order) | no |
+| Linearizable (atomic) | one total order **+** real-time precedence | yes | yes (single order) | no |
 | Sequential | one total order, program order preserved | no | yes (single order) | no |
 | Causal | one order **per causal chain**; concurrent writes free | no | not required | **yes** |
 | Eventual | replicas converge, eventually | no | no | yes |
 
 ## Why geo-replication stops at causal
 
-Sequential consistency and linearizability both require a single agreed order over writes, which across datacenters means coordination on the write path — and coordination cannot survive a network partition while staying available. This is the wall CAP describes. Causal consistency is special because it sits exactly at the availability boundary. Mahajan, Alvisi, and Dahlin prove it as a two-sided bound: no consistency stronger than real-time causal "can be provided in an always-available, one-way convergent system," and real-time causal *can* be. COPS makes the same point operationally under its ALPS goals (Availability, Low latency, Partition tolerance, Scalability), calling causal+ consistency the strongest model achievable under those constraints. "Causal+" is causal consistency plus **convergent conflict handling** — a deterministic merge (e.g., last-writer-wins by timestamp) so concurrent writes, which causal consistency lets replicas order differently, still converge to one value rather than diverging forever. That is the CALM intuition too: causal delivery is monotone bookkeeping, so it needs no coordination.
+Sequential consistency and linearizability both require a single agreed order over writes, which across datacenters means coordination on the write path, and coordination cannot survive a network partition while the system stays available. This is the wall CAP describes. Causal consistency sits at that availability boundary. Mahajan, Alvisi and Dahlin state it as a two-sided bound: no consistency stronger than real-time causal consistency can be provided in an always-available, one-way convergent system, and real-time causal consistency can be. COPS makes the same point operationally under its ALPS goals — Availability, Low latency, Partition tolerance, Scalability — identifying causal+ consistency as the strongest model achievable under those constraints. **Causal+ is causal consistency plus convergent conflict handling**: a deterministic merge, such as last-writer-wins by timestamp, so that concurrent writes which causal consistency allows replicas to order differently still settle on one value rather than diverging permanently.
 
 ## Enforcing it: vector clocks and dependency-wait
 
-The mechanism is the same idea in COPS's `dep_check` and in classic lazy-replication: **tag each write with the causal context it depends on, and refuse to apply a replicated write until every dependency is already present locally.** With one entry per replica, a vector clock is a complete, compact summary of that context.
+The mechanism is shared by COPS's `dep_check` and by classic lazy replication: **tag each write with the causal context it depends on, and refuse to apply a replicated write until every dependency is already present locally.** A vector clock with one entry per replica is a compact summary of that context.
 
-```python
-class CausalReplica:
-    def __init__(self, n, i):
-        self.i, self.n = i, n
-        self.vc = [0] * n          # writes from each replica applied here
-        self.queue = []            # remote writes waiting on dependencies
+### Implementation sketch (Scala)
 
-    def local_write(self, key, val):
-        self.vc[self.i] += 1
-        stamp = list(self.vc)              # this write's causal context
-        self.apply(key, val)
-        broadcast(Update(self.i, key, val, stamp))
+```scala
+final case class Update(src: Int, key: String, value: String, stamp: Vector[Int])
 
-    def deliverable(self, u):
-        # 1) u is the very next write we expect from its origin
-        if u.stamp[u.src] != self.vc[u.src] + 1:
-            return False
-        # 2) every OTHER dependency of u is already applied here
-        return all(u.stamp[k] <= self.vc[k]
-                   for k in range(self.n) if k != u.src)
+final class CausalReplica(n: Int, self: Int):
+  private var vc: Vector[Int] = Vector.fill(n)(0)   // writes from each replica applied here
+  private var queue: List[Update] = Nil             // remote writes awaiting dependencies
+  private var store: Map[String, String] = Map.empty
 
-    def on_remote(self, u):
-        self.queue.append(u)
-        progress = True
-        while progress:                    # cascade: applying one may free others
-            progress = False
-            for u in list(self.queue):
-                if self.deliverable(u):
-                    self.apply(u.key, u.val)
-                    self.vc[u.src] = u.stamp[u.src]
-                    self.queue.remove(u)
-                    progress = True
+  def localWrite(key: String, value: String): Update =
+    vc = vc.updated(self, vc(self) + 1)
+    store = store.updated(key, value)
+    Update(self, key, value, vc)                    // stamp is this write's causal context
+
+  private def deliverable(u: Update): Boolean =
+    // (1) u is the next write expected from its origin; (2) all other deps already applied
+    u.stamp(u.src) == vc(u.src) + 1 &&
+      (0 until n).forall(k => k == u.src || u.stamp(k) <= vc(k))
+
+  def onRemote(u: Update): Unit =
+    queue = u :: queue
+    var progress = true
+    while progress do                               // applying one update may free others
+      progress = false
+      queue.filter(deliverable).foreach: r =>
+        store = store.updated(r.key, r.value)
+        vc = vc.updated(r.src, r.stamp(r.src))
+        queue = queue.filterNot(_ eq r)
+        progress = true
 ```
 
-`deliverable` is the whole contract. Condition (1) is the FIFO guarantee — you apply a replica's writes in the order it made them. Condition (2) is **dependency-wait** — a write that causally follows something you haven't seen yet sits in `queue` until that something arrives. A remote write is never *blocked on a lock*, only *delayed until its causes land*, which is why reads never stall. Convergence for concurrent writes is layered on top: when two updates carry mutually concurrent stamps to the same key, break the tie deterministically (highest replica-id, or a hybrid-logical-clock timestamp) so every replica lands on the same value — the "+" in causal+.
+`deliverable` is the entire contract. Condition (1) is the FIFO guarantee: a replica's writes are applied in the order that replica made them. Condition (2) is **dependency-wait**: a write that causally follows an update not yet received waits in `queue` until that update arrives. A remote write is never blocked on a lock, only delayed until its causes land, so local reads do not stall. Convergence for concurrent writes is layered on top: when two updates carry mutually concurrent stamps for the same key, the tie must be broken deterministically — by highest replica identifier, or by a hybrid-logical-clock timestamp — so that every replica settles on the same value. That is the "+" in causal+.
 
-Real systems ship this. COPS attaches nearest-dependency metadata to each `put_after` and runs `dep_check` at the receiving datacenter before making a version visible. **MongoDB causal-consistent sessions** carry the context as a cluster time: each reply advances the session's `operationTime`, and the next read pins `afterClusterTime` so a node must have advanced past your dependencies before answering. The four session guarantees MongoDB lists — read-your-writes, monotonic reads, monotonic writes, writes-follow-reads — are exactly causal consistency observed from one client, and you only get all four *durably* with `readConcern: "majority"` and `writeConcern: "majority"`.
+Deployed systems implement this shape. COPS attaches nearest-dependency metadata to each `put_after` and runs `dep_check` at the receiving datacenter before making a version visible. **MongoDB causal-consistent sessions** carry the context as a cluster time: each reply advances the session's `operationTime`, and the next read pins `afterClusterTime`, so a node must have advanced past the session's dependencies before answering. The four session guarantees MongoDB documents — read-own-writes, monotonic reads, monotonic writes, and writes-follow-reads — are causal consistency observed from a single client, and all four hold durably only with `readConcern: "majority"` and `writeConcern: "majority"`.
 
-**Try next:** Take the `CausalReplica` above, spin up three instances, and drive the second causal-violation history through them — P1 writes `a`, a second replica reads `a` then writes `b`. Now deliver `b` to the third replica *before* `a` and assert it lands in `queue` rather than becoming visible; then deliver `a` and watch the cascade release `b`. Finally, delete condition (2) from `deliverable` and reproduce the illegal `R(x)b R(x)a` read — proving that dependency-wait, not FIFO alone, is what buys you causal consistency.
+## Pitfalls
+
+- **Treating causal consistency as "eventually the same".** Causal consistency alone permits two replicas to apply concurrent writes to one key in opposite orders and stay that way; the symptom is two datacenters serving different values indefinitely. Convergent conflict handling, not causal delivery, is what removes it.
+- **Assuming sequential consistency implies linearizability.** Sequential consistency admits histories where a read returns a value written after it in real time, so a test that asserts real-time precedence will fail against a correct sequentially consistent store.
+- **Omitting condition (2) from the delivery check.** FIFO delivery per origin replica alone allows a write to become visible before the write it read from, reproducing the `R(x)b R(x)a` history that causal consistency forbids.
+- **Unbounded dependency queues.** A dropped or delayed update from one replica holds every causally later update in `queue`, and memory grows with the backlog; the symptom is rising queue depth at one replica with reads still served from stale state.
+- **Enabling MongoDB causal-consistent sessions with default read and write concerns.** The four session guarantees are documented as durable only under `readConcern: "majority"` with `writeConcern: "majority"`; weaker concerns can expose values that a later election rolls back.
+- **Assuming causal metadata is free.** A vector clock carries one entry per replica, so the per-write context grows with the replica count; COPS instead tracks nearest dependencies rather than the full context.

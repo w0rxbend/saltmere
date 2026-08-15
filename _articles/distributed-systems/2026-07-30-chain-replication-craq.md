@@ -1,8 +1,8 @@
 ---
-title: "Chain Replication and CRAQ: strong consistency that still scales reads"
+title: "Chain replication and CRAQ: strong consistency with scalable reads"
 date: 2026-07-30
 track: distributed-systems
-summary: "Chain replication gives you linearizable writes with a dead-simple failure model — but the tail node becomes a read bottleneck. CRAQ fixes that by letting every node serve reads with a clean/dirty version check. Here's how both work, and a small Python sketch."
+summary: "Chain replication makes writes linearizable with a simple failure model, but confines reads to the tail node. CRAQ removes that bottleneck by letting every node answer reads under a clean/dirty version check. Both protocols are described, with an implementation sketch."
 reading_time: 6
 tags: [chain-replication, craq, replication, linearizability, consistency, quorum]
 sources:
@@ -16,86 +16,95 @@ sources:
     url: "https://github.com/despreston/go-craq"
 ---
 
-Most replication schemes make you trade consistency against throughput. Chain replication is interesting because its *write* path is both linearizable and cheap to reason about — no consensus round per operation, no quorum arithmetic. The catch is the read path, which is where CRAQ comes in.
+**Gist.** Replicating an object across *R* nodes while keeping reads linearizable normally costs a quorum round per operation. Chain replication (van Renesse & Schneider, OSDI 2004) obtains linearizability by ordering the replicas in a line and serving all reads from one end, so no operation requires consensus; the cost is that **a single node — the tail — absorbs the entire read load** while the other *R−1* replicas hold the same committed data they may not serve. CRAQ (Terrace & Freedman, USENIX ATC 2009) keeps that write path and allows any node to answer reads, at the cost of **an extra round trip to the tail for every object with a write in flight**.
 
-## The chain
+## The chain and its invariant
 
-Arrange the *R* replicas of an object in a total order: a **head**, some middle nodes, and a **tail**. Writes and reads enter at fixed ends.
+The *R* replicas of an object are arranged in a total order: a **head**, zero or more middle nodes, and a **tail**. Operations enter at fixed ends.
 
-- A **write** always goes to the **head**. The head applies it locally, then forwards it down the chain. Each node applies and forwards to its successor. When the write reaches the **tail**, the tail applies it and sends an **ack** back up the chain.
-- A **read** in plain chain replication is served *only by the tail*.
+- A **write** enters at the **head**. The head applies it locally and forwards it to its successor. Each node applies and forwards in turn. When the write reaches the **tail**, the tail applies it and sends an **acknowledgement** back up the chain.
+- A **read**, in plain chain replication, is served **only by the tail**.
 
-That's the whole protocol, and its beauty is the invariant it produces: the tail has applied a write if and only if *every* node has applied it. So the tail's state is exactly the set of committed writes. A read at the tail therefore returns the latest committed value — **linearizable** — with no coordination at all. Compare that to quorum systems (covered in the R+W article here), where a read must contact multiple replicas and reconcile.
+The propagation order yields the invariant that carries the protocol: **the tail has applied a write if and only if every node has applied it**, because a write reaches the tail only after passing through all predecessors. The tail's state is therefore exactly the set of committed writes, and a read served there returns the latest committed value without contacting any other node. This is the structural difference from quorum systems, where a read must contact several replicas and reconcile their answers.
 
-Failure handling is unusually simple too, because the order is fixed:
+Because the order is fixed rather than negotiated per operation, the recovery cases are enumerable:
 
-- **Head fails:** its successor becomes the new head. In-flight writes the old head hadn't forwarded are simply lost (they were never acked).
-- **Tail fails:** its predecessor becomes the new tail. Since the predecessor has everything the tail had *plus possibly a few more* not-yet-acked writes, those extra writes are now considered committed — safe.
-- **Middle node fails:** its predecessor is reconnected to its successor; a short reconciliation replays any writes the successor missed.
+- **Head fails.** Its successor becomes the new head. Writes the old head had accepted but not yet forwarded are lost; they were never acknowledged, so no client was told they committed.
+- **Tail fails.** Its predecessor becomes the new tail. The predecessor holds everything the old tail held, plus possibly writes not yet acknowledged; promoting it **converts those extra writes into committed writes**, which is safe because it can only add to the committed prefix, never remove from it.
+- **Middle node fails.** Its predecessor is reconnected to its successor, and a reconciliation step replays the writes the successor had not yet received.
 
-A separate, fault-tolerant **master** (typically Paxos/Raft-backed — see the Paxos article here) monitors liveness and publishes the current chain membership. The master handles metadata consensus; the chain handles the high-volume data path. That split is the point.
+A separate fault-tolerant **master** — in practice backed by Paxos or Raft — monitors liveness and publishes the current chain membership. **Consensus is confined to the metadata path; the data path carries no consensus round.**
 
-## Why the tail is a problem
+## The tail as a bottleneck
 
-Every read hits one node. Double your read traffic and the tail is your ceiling — the other *R−1* replicas sit there holding identical data they're not allowed to serve. For a read-mostly workload (the common case for object stores, caches, config) that's most of your hardware idle.
+Every read in plain chain replication lands on one node, so **read throughput is bounded by the capacity of a single replica regardless of R**. Adding replicas increases durability and write-path length but not read capacity. For read-mostly workloads — object stores, caches, configuration services — most of the replicated hardware serves no read traffic.
 
-## CRAQ: let every node serve reads
+## CRAQ: apportioned queries
 
-**CRAQ** (Chain Replication with Apportioned Queries, Terrace & Freedman 2009) keeps the exact write path but makes reads serve-able from *any* node — head, tail, or middle — without losing linearizability. The trick is versioning.
+CRAQ (Chain Replication with Apportioned Queries) leaves the write path unchanged and makes reads servable from **any** node without weakening the guarantee. The mechanism is per-object versioning with a two-state tag.
 
-Each node stores, per object, possibly **multiple versions**, each tagged **clean** or **dirty**:
+Each node stores, per object, possibly **multiple versions**, each marked **clean** or **dirty**:
 
-- When a node receives a new write via propagation, it appends that version and marks it **dirty** — it's been seen but not yet known-committed.
-- When the tail commits the write and the ack propagates back up, each node marks that version **clean** and drops older versions.
+- On receiving a write via propagation, a node appends the new version and marks it **dirty**: seen, but not known to be committed.
+- When the acknowledgement travels back up the chain, each node marks that version **clean** and discards older versions.
 
-Now a read at any node:
+A read at an arbitrary node then follows two cases:
 
-1. If the newest local version is **clean**, return it immediately. No coordination.
-2. If it's **dirty**, the node doesn't guess. It asks the **tail** one tiny question — "what's the latest committed version number for this object?" — and returns *that* version from its own local store.
+1. **The newest local version is clean.** Return it immediately; no coordination.
+2. **The newest local version is dirty.** The node does not guess. It queries the **tail** for the latest committed version number of that object and returns **that version from its own local store**.
 
-That version query to the tail is cheap (just a version number, not the object), and it only happens for objects with a write in flight. On a read-mostly workload almost every read hits case 1 and is served locally. You've turned *R−1* idle replicas into read capacity while keeping the same strong guarantee: a read never returns a value newer than what's committed, and never an older one than a previously-returned committed value.
+The version query transfers a version number rather than the object, and it arises **only for objects with a write in flight**. Under a read-mostly workload most reads take case 1 and are served entirely locally, converting the *R−1* non-tail replicas into read capacity. The guarantee is preserved because the tail remains the sole authority on what is committed: a node never returns a version the tail has not committed. The other half of the argument is the propagation order. A version can only commit at the tail after passing through every node, so **a node whose newest local version is clean cannot be missing a newer committed version** — if such a version existed, that node would already hold it, dirty or clean, and case 2 would apply instead.
 
-CRAQ also supports weaker modes if you want them — eventual-consistency reads that return the latest local (possibly dirty) version with no tail query, or bounded-staleness reads — but the default is the strong one, and it's the interesting one.
+CRAQ additionally defines weaker read modes — eventual consistency, which returns the newest local version, possibly dirty, with no tail query, and a bounded variant that limits how stale that version may be. The strongly consistent mode described above is the one the protocol is presented under.
 
-## A sketch
+### Implementation sketch (Scala)
 
-A node's read logic is the whole idea in a dozen lines:
+The read path is the load-bearing part; the write path is ordinary forwarding.
 
-```python
-class Node:
-    def __init__(self, is_tail, tail_client):
-        self.versions = {}      # key -> list[(version, value, clean: bool)]
-        self.is_tail = is_tail
-        self.tail = tail_client
+```scala
+final case class Version(n: Long, value: Array[Byte], clean: Boolean)
 
-    def read(self, key):
-        vs = self.versions[key]
-        latest = vs[-1]
-        version, value, clean = latest
-        if clean or self.is_tail:
-            return value                       # local, no coordination
-        # dirty: ask the tail which version is committed
-        committed_v = self.tail.latest_committed_version(key)
-        for v, val, _ in vs:
-            if v == committed_v:
-                return val                     # serve that version locally
+trait Tail:
+  def latestCommittedVersion(key: String): Long
 
-    def on_propagate(self, key, version, value):   # write coming down the chain
-        self.versions.setdefault(key, []).append((version, value, False))  # dirty
-        if self.is_tail:
-            self.commit(key, version)          # tail commits, then acks upstream
+final class CraqNode(isTail: Boolean, tail: Tail):
+  // newest version last; at most one dirty suffix per key
+  private val store = scala.collection.mutable.Map.empty[String, Vector[Version]]
 
-    def on_ack(self, key, version):            # ack coming back up the chain
-        self.versions[key] = [
-            (v, val, (v == version) or clean)  # mark committed version clean
-            for (v, val, clean) in self.versions[key] if v >= version
-        ]
+  def read(key: String): Option[Array[Byte]] =
+    store.get(key).flatMap { vs =>
+      val newest = vs.last
+      if newest.clean then Some(newest.value)
+      else
+        // dirty: the tail alone knows what is committed
+        val committed = tail.latestCommittedVersion(key)
+        vs.findLast(_.n == committed).map(_.value)
+    }
+
+  def onPropagate(key: String, n: Long, value: Array[Byte]): Unit =
+    store.updateWith(key)(vs =>
+      Some(vs.getOrElse(Vector.empty) :+ Version(n, value, clean = false))
+    )
+    if isTail then onAck(key, n) // tail commits, then acknowledges upstream
+
+  def onAck(key: String, n: Long): Unit =
+    store.updateWith(key)(_.map { vs =>
+      // the ack retires every version below n
+      vs.filter(_.n >= n).map(v => if v.n == n then v.copy(clean = true) else v)
+    })
 ```
 
-Real implementations (see `go-craq`) add the master, chain reconfiguration, and per-key chains so hot and cold objects don't share a bottleneck — but the read/write asymmetry above is the core.
+Complete implementations, such as `go-craq`, add the master, chain reconfiguration and per-key chains so that hot and cold objects do not share a bottleneck; the asymmetry above is the core.
 
-## When to reach for it
+## Applicability
 
-Chain replication + CRAQ shines for **read-mostly, strongly-consistent** stores where you'd otherwise pay quorum-read latency: metadata services, session stores, config, feature-flag backends, small object stores. It's a poor fit for write-heavy or geo-distributed-write workloads, where the serial chain adds write latency proportional to its length and a distant tail hurts.
+The combination suits **read-mostly workloads requiring linearizability**, where the alternative is quorum-read latency: metadata services, session stores, configuration and feature-flag backends, small object stores. It suits write-heavy and geographically distributed write workloads poorly: **write latency is the sum of the per-hop latencies along the chain**, so it grows with chain length, and a distant tail adds that distance to every dirty read as well.
 
-**Try next:** Implement the `Node` above with three in-process nodes wired as a chain, then write a test that fires a `write` and, *before* the ack propagates back, issues a read at the middle node — assert it performs a version query to the tail and returns the committed value, not the dirty one. Then extend it: make reads on a clean object assert that *no* tail query happened, proving reads really are local in the common case.
+## Pitfalls
+
+- **Sizing read capacity by replica count under plain chain replication.** Throughput plateaus once the tail saturates; the added replicas contribute durability only.
+- **Assuming a CRAQ read is always local.** An object under sustained write traffic keeps its newest version dirty, so every read of it pays a round trip to the tail — a hot key can drive the tail load back toward the plain-chain case.
+- **Treating writes lost at head failover as a bug.** Writes the old head had not forwarded were never acknowledged; a client that received no acknowledgement has no committed write to lose.
+- **Placing the tail far from readers.** The tail's distance is charged to every dirty read and to the final hop of every write.
+- **Sharing one chain across all keys.** A single hot object then saturates the chain for every other object; per-key or per-shard chains isolate them.
+- **Reading from a node whose membership view is stale.** The master publishes chain membership; a node acting on an outdated view can answer as tail or query a node that is no longer the tail.

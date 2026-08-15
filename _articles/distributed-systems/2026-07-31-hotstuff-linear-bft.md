@@ -1,9 +1,9 @@
 ---
-title: "HotStuff: BFT consensus that costs O(n) per decision, not O(n²)"
+title: "HotStuff: BFT consensus at O(n) messages per decision"
 date: 2026-07-31
 track: distributed-systems
-summary: "PBFT confirms a block by having every replica talk to every other replica — quadratic messages, and a view change that is worse. HotStuff replaces the all-to-all pattern with a leader that collects threshold signatures, giving linear communication and a view change no more expensive than normal operation. That is the idea behind Diem/LibraBFT."
-reading_time: 5
+summary: "Practical Byzantine Fault Tolerance (PBFT) confirms a block with all-to-all rounds — quadratic message complexity, and a view change that is worse. HotStuff replaces the all-to-all pattern with a leader collecting threshold signatures, giving linear communication and a view change no more expensive than normal operation. It is the consensus core of Diem/LibraBFT."
+reading_time: 6
 tags: [hotstuff, bft, consensus, threshold-signatures, pbft, blockchain]
 sources:
   - title: "Yin, Malkhi, Reiter, Gueta, Abraham — HotStuff: BFT Consensus with Linearity and Responsiveness (PODC 2019)"
@@ -16,44 +16,80 @@ sources:
     url: "http://muratbuffalo.blogspot.com/2019/12/hotstuff-bft-consensus-in-lens-of.html"
 ---
 
-Byzantine fault tolerance has a scaling problem, and it is not the one people expect. The famous number is that you need `3f + 1` replicas to tolerate `f` malicious ones, which is annoying but linear. The real cost is in the *messages*. Classic PBFT commits a request with two all-to-all rounds — prepare and commit — where every replica broadcasts to every other. That is O(n²) messages per decision, and it means PBFT works beautifully for `n = 4` and falls over at `n = 100`. Worse, when the leader is faulty and you have to change views, PBFT's view-change protocol is O(n³) in the worst case. Blockchains want hundreds of validators, so this is disqualifying.
+**Gist.** Byzantine fault tolerant (BFT) state machine replication in the PBFT lineage commits a request with all-to-all voting rounds, costing **O(n²) messages per decision** and a view change whose worst-case **authenticator complexity is O(n³)**, which bounds practical deployments at small replica counts. HotStuff routes every vote to the current leader, which aggregates a quorum into a single constant-size *quorum certificate* (QC) using a threshold signature scheme, reducing each phase to **O(n) messages** and making leader replacement no more expensive than a normal round. The cost is a **third voting phase** and the operational burden of a distributed threshold-key setup.
 
-HotStuff (Yin, Malkhi, Reiter, Gueta and Abraham, PODC 2019) fixes both by refusing to let replicas talk to each other at all.
+## The cost structure PBFT imposes
 
-## The two ideas
+The familiar BFT number — `3f + 1` replicas to tolerate `f` Byzantine ones — is linear in `f` and is not the binding constraint. The binding constraint is message count. Classic PBFT decides a request with two all-to-all rounds, `prepare` and `commit`, in which every replica broadcasts to every other. That is **O(n²) messages per decision**. When the leader is faulty and a view change is required, PBFT's view-change sub-protocol carries **O(n³) authenticators in the worst case** — the paper's Table 1 counts signatures and message authentication codes, not messages — because each replica must carry evidence about the past to every other replica. Both costs grow faster than the replica count, so each added replica is paid for more than once.
 
-**Star topology + threshold signatures.** In HotStuff no replica broadcasts to the group. Every replica sends its vote only to the current leader. The leader collects `2f + 1` matching votes and combines them — using a threshold signature scheme — into a single fixed-size *quorum certificate* (QC) that proves "a supermajority voted for this." The leader then broadcasts that one QC. Each phase is therefore `n` messages to the leader plus `n` back out: **O(n) per phase**, and a QC is one signature regardless of how many replicas signed it.
+HotStuff (Yin, Malkhi, Reiter, Gueta and Abraham, PODC 2019) reduces both by routing all protocol messages through the leader instead of replica to replica.
 
-**A view change that is just... the next round.** Because progress is always "leader proposes, replicas vote, leader forms a QC," replacing a stuck leader requires no special sub-protocol. The new leader simply starts a new view carrying the highest QC it has seen. View change costs the same as normal operation — this is what the paper means by *linearity* extending to leader rotation, and it is the property PBFT lacks.
+## Star topology and quorum certificates
 
-## Why three phases, not two
+**Each replica sends its vote only to the current leader**, never to the group. The leader collects `2f + 1` matching votes and combines them, via a threshold signature scheme, into a single *quorum certificate* — a fixed-size object proving that a supermajority voted for a given value. The leader then broadcasts that one certificate.
 
-HotStuff uses **three** chained voting phases — `prepare`, `pre-commit`, `commit` — before a value is decided. The extra phase compared to PBFT buys the clean view change. The subtlety it removes is the classic "hidden lock" problem: with only two phases a new leader can encounter a value that *might* have been committed by a predecessor but cannot prove it either way, forcing an expensive reconciliation. The third QC gives every replica enough certified history that a new leader can always safely pick up from the highest QC without talking to anyone about the past.
+Two consequences follow. First, a phase costs `n` inbound messages plus `n` outbound: **O(n) per phase**, with the leader as the only fan-out point. Second, **a QC is one signature regardless of how many replicas contributed to it**, so the certificate does not grow with `n` — the property that keeps the broadcast half linear in bytes as well as in messages.
 
-The elegant part is **chaining**. Instead of running three distinct phases for one block, "chained HotStuff" pipelines them: every view has a single vote round, and one block's `prepare` QC doubles as the previous block's `pre-commit`, and the one before that's `commit`. A block is decided once it has three descendants in the chain — a three-chain. This is exactly the structure Diem/LibraBFT (later DiemBFT v4) shipped as its production consensus.
+## View change as an ordinary round
 
-## The commit rule, in pseudocode
+Because every step of progress has the same shape — leader proposes, replicas vote, leader forms a QC — replacing a stuck leader requires no distinct sub-protocol. Replicas that time out send a `new-view` message carrying their highest QC to the next leader; **the new leader takes the highest QC among `2f + 1` such messages and proposes on top of it**, then proceeds exactly as a normal leader would. View change therefore costs what normal operation costs. This is the sense in which the paper's *linearity* extends to leader rotation, and it is the property PBFT lacks.
 
-The safety logic each replica runs on receiving a proposal is small enough to hold in your head:
+## Why three phases
 
-```text
-on proposal b from leader of view v:
-    # safety: only vote if this extends what we're locked on,
-    # or comes from a strictly newer view than our lock
-    if b.parent.qc.view >= lockedQC.view or extends(b, lockedQC.block):
-        send vote(b) to leader
+HotStuff runs **three chained voting phases — `prepare`, `pre-commit`, `commit` — before a value is decided**, one more than PBFT. The extra phase is what buys the uniform view change. It removes the hidden-lock problem: with two phases, a new leader can encounter a value that *might* have been committed by a predecessor while being unable to prove the matter either way, which forces the expensive reconciliation that PBFT's view change performs. **The third QC leaves every replica with enough certified history that a new leader can safely resume from the highest QC without querying anyone about the past.**
 
-on forming a QC for b (leader):
-    if b is the 3rd link of a chain b'' <- b' <- b:
-        DECIDE b''          # three-chain => commit the grandparent
-    update lockedQC = qc(b')  # lock on the 2-chain
-    broadcast b with its new QC
+## Chaining
+
+Rather than running three separate phases per block, *chained HotStuff* pipelines them. **Every view has a single vote round**, and one block's `prepare` QC serves simultaneously as its parent's `pre-commit` QC and its grandparent's `commit` QC. **A block is decided once it heads a three-chain: it, a child and a grandchild, each certified, with the views consecutive** — the three-chain rule. This is the structure Diem/LibraBFT, later DiemBFT v4, shipped as its production consensus.
+
+## The safety rule
+
+Each replica maintains `lockedQC`, the certificate it is currently locked on. On receiving a proposal `b` in view `v`, the replica votes only if `b` extends the block `lockedQC` refers to, or if `b`'s parent certificate is from a view **strictly higher** than `lockedQC`'s. The disjunction matters in that direction: an equal view is not enough, because a QC from the same view carries no evidence that the locked value was abandoned by a later quorum. On observing a three-chain `b'' <- b' <- b`, a replica decides `b''` (the grandparent) and advances the lock to the QC of `b'`.
+
+**`lockedQC` is the safety anchor**: a replica will not vote for a proposal that abandons a value it is locked on unless the proposal provably originates from a strictly higher view. That rule together with the three-chain commit is what prevents two concurrent leaders from committing conflicting blocks.
+
+### Implementation sketch (Scala)
+
+```scala
+final case class Qc(view: Long, block: Hash, sig: ThresholdSig)
+final case class Block(hash: Hash, parent: Hash, parentQc: Qc, view: Long)
+
+final class Replica(store: Map[Hash, Block]):
+  private var lockedQc: Qc = genesisQc
+  private var lastDecided: Hash = genesisQc.block
+
+  private def extends_(descendant: Hash, ancestor: Hash): Boolean =
+    Iterator.iterate(descendant)(h => store(h).parent)
+      .takeWhile(store.contains)
+      .contains(ancestor)
+
+  /** Vote iff the proposal keeps the lock, or comes from a strictly higher view. */
+  def onProposal(b: Block): Option[Vote] =
+    if extends_(b.hash, lockedQc.block) || b.parentQc.view > lockedQc.view
+    then Some(Vote(b.hash, b.view)) else None
+
+  /** b'' <- b' <- b : lock on b', decide b'' only when the views are consecutive. */
+  def onQc(qc: Qc): Unit =
+    val b       = store(qc.block)
+    val bPrime  = store(b.parent)     // b.parentQc certifies bPrime
+    val bDPrime = store(bPrime.parent)
+    if bPrime.view == b.view - 1 && bDPrime.view == bPrime.view - 1 then
+      lastDecided = bDPrime.hash
+    if b.parentQc.view > lockedQc.view then lockedQc = b.parentQc
 ```
 
-`lockedQC` is the safety anchor: a replica will not vote for a proposal that would abandon a value it is locked on, unless the proposal provably comes from a higher view. That single rule, plus the three-chain commit, is what makes concurrent leaders unable to commit conflicting blocks.
+The aggregation step is deliberately absent: the leader's combination of `2f + 1` votes into `Qc.sig` is the threshold-signature scheme's job, and it is what keeps the certificate constant-size.
 
-## What it costs you
+## What linearity does not buy
 
-Responsiveness — the leader advances as soon as it hears from `2f + 1` replicas, at network speed, without waiting out a fixed timeout — holds only while the leader is honest and the network is synchronous enough to gather a quorum. Under a bad leader you still fall back to timeouts to trigger the next view; HotStuff makes that fallback cheap, it does not eliminate it. And threshold signatures need a distributed key setup, which is real operational work you inherit.
+*Responsiveness* — the leader advancing as soon as it hears from `2f + 1` replicas, at network speed, without waiting out a fixed timeout — holds only while the leader is honest and the network is delivering fast enough to assemble a quorum. **Under a faulty leader the protocol still falls back to timeouts to trigger the next view.** HotStuff makes that fallback cheap; it does not remove it.
 
-**Try next:** take a 4-replica toy PBFT you have (or sketch one) and count the messages to commit one request — you will see the n² fan-out. Then replace the commit round: have replicas vote *only to the leader*, have the leader concatenate the `2f+1` votes into one "certificate" blob, and re-broadcast that. Even without real threshold crypto, watching the message count drop from n² to 2n makes HotStuff's central trick concrete.
+Threshold signatures require a distributed key setup, and that setup is inherited operational work: key generation, distribution and any subsequent reconfiguration of the validator set.
+
+## Pitfalls
+
+- **Two-phase variants lose the cheap view change.** Dropping to two phases reintroduces the hidden-lock case, where a new leader cannot determine whether a predecessor committed a value; recovering that information is precisely the reconciliation the third phase eliminates.
+- **Committing on a two-chain violates safety.** The decision rule is the three-chain; treating the parent rather than the grandparent as decided admits conflicting commits by concurrent leaders.
+- **Ignoring the lock check when views advance.** Voting for any proposal from a higher view without checking that it extends `lockedQC` or carries a parent QC from a strictly higher view removes the anchor that binds concurrent leaders to a single history.
+- **Assuming responsiveness under a faulty leader.** A silent or equivocating leader is detected by timeout, not by network-speed quorum formation, so tail latency is governed by the timeout schedule rather than by round-trip time.
+- **Treating the leader's fan-out as free.** Linearity is a message-count property with the leader as the single fan-out point; the leader's outbound bandwidth remains proportional to `n` per view.

@@ -3,7 +3,7 @@ title: "Plumtree: Gossip That Self-Optimizes Into a Spanning Tree"
 date: 2026-07-31
 track: distributed-systems
 summary: "How Plumtree keeps flooding gossip's fault tolerance while collapsing its redundancy into a spanning tree — eager/lazy push, PRUNE, and GRAFT-based healing."
-reading_time: 5
+reading_time: 6
 tags: [distributed-systems, gossip, broadcast, epidemic-protocols, plumtree, riak]
 sources:
   - title: "Epidemic Broadcast Trees (Leitão, Pereira, Rodrigues, SRDS 2007)"
@@ -18,22 +18,22 @@ sources:
     url: "https://github.com/Leapsight/plum_db"
 ---
 
-Gossip broadcast is loved for one reason: it degrades gracefully. Every node forwards each new message to `f` random peers (eager push), so a message reaches everyone even as nodes crash and links flap. The cost is embarrassing redundancy — in a stable network, most GOSSIP messages a node receives are duplicates it already has. You pay for resilience you aren't currently using.
-
-Plumtree — "Epidemic Broadcast Trees" by João Leitão, José Pereira, and Luís Rodrigues (SRDS 2007) — resolves the trade-off instead of picking a side. It starts as pure flooding and *lets the redundant links prune themselves away*, converging on a spanning tree for the payload while keeping the full gossip overlay in reserve to repair that tree.
+**Gist.** Flooding gossip tolerates crashes and link failures because every node forwards each new message to several random peers, but in a stable network most received messages are duplicates, so the redundancy is paid for continuously and used rarely. Plumtree — "Epidemic Broadcast Trees" by João Leitão, José Pereira and Luís Rodrigues (SRDS 2007) — starts as pure flooding and lets each redundant edge remove itself, converging on a spanning tree that carries the payload while the remaining overlay links carry only message identifiers. The cost is that repair is no longer instantaneous: a broken branch is detected by timer expiry rather than by a duplicate, so a failure adds latency proportional to the detection timeout for the affected messages.
 
 ## Two peer sets, two kinds of push
 
-Each node partitions its neighbors (supplied by a membership service like HyParView) into two sets:
+Each node partitions the neighbours supplied by a membership service (HyParView in the paper) into two sets:
 
-- **eagerPushPeers** — get the full payload immediately (GOSSIP). These links form the tree.
-- **lazyPushPeers** — get only the message ID (IHAVE), batched and sent lazily. These are the safety net.
+- **eagerPushPeers** — receive the full payload immediately in a GOSSIP message. These links constitute the tree.
+- **lazyPushPeers** — receive only the message identifier in an IHAVE announcement, batched and sent lazily. These links constitute the repair channel.
 
-Initially every neighbor is an eager peer, so the first broadcast floods exactly like naive gossip. The optimization happens as duplicates arrive.
+**Every neighbour begins as an eager peer**, so the first broadcast floods exactly as naive gossip does. The optimisation is driven entirely by duplicate arrivals; no node computes a tree, and no node holds a global view.
 
 ## Pruning: turning a mesh into a tree
 
-When a node receives a **duplicate** GOSSIP (it already delivered that message ID), it knows the link it arrived on is redundant — the message reached it faster by another path. So it demotes the sender to lazy and replies with a **PRUNE**, telling the sender to do the same in the other direction. Both ends move the link from eager to lazy. Symmetric pruning of every cyclic edge leaves precisely a spanning tree, where each node receives each payload exactly once.
+When a node receives a GOSSIP whose message identifier it has already delivered, that arrival is evidence that **the same payload reached the node faster along another path**, which makes the incoming edge redundant for tree purposes. The receiver demotes the sender to its lazy set and replies with **PRUNE**, on receipt of which the sender performs the symmetric demotion. Both endpoints therefore agree on the classification of the edge — the invariant that keeps the eager relation symmetric.
+
+Symmetric demotion of every cyclic edge leaves a spanning tree over the overlay, on which **each node receives each payload exactly once**.
 
 ```text
 on GOSSIP(m, mID, round, sender):
@@ -53,9 +53,11 @@ on PRUNE(sender):
 
 ## Grafting: healing the tree with the leftover links
 
-A tree has no redundancy, so a single broken branch would partition delivery — unacceptable. This is where the lazy links earn their keep. Every node also announces each message ID to its lazy peers via IHAVE. If a node sees an **IHAVE for a message it never received via the tree**, that gap signals a broken (or slow) branch.
+A tree carries no redundancy, so the loss of one interior node or one branch would leave part of the membership undelivered. The lazy links close that gap. Each node announces every message identifier to its lazy peers, so **an IHAVE for an identifier that never arrived as GOSSIP is the signal that the tree branch towards that message's source is broken or slow**.
 
-Rather than react instantly, it arms a timer (`timeout1`) to let the in-flight payload arrive. If the timer fires first, the node **GRAFTs**: it promotes the announcing lazy peer to eager and requests the missing payload. A GRAFT both repairs the tree edge and pulls the data. A second, shorter timer (`timeout2`, roughly one RTT) retries against the next node that announced the same ID, so a dead peer doesn't stall recovery.
+The reaction is deliberately delayed. The node arms a timer, `timeout1`, giving the in-flight payload a chance to arrive over the tree; **if the payload arrives first, the timer is cancelled and the tree is left unchanged**, which is why a merely slow branch does not thrash the topology. If the timer fires first, the node performs a **GRAFT**: it promotes the announcing lazy peer to eager and requests the missing payload from it. One message therefore both repairs a tree edge and retrieves the data.
+
+A second timer, `timeout2`, shorter than `timeout1`, arms a retry against the next node that announced the same identifier, so a peer that is itself dead does not stall recovery indefinitely. The set of announcers is retained in insertion order precisely so that this fallback exists.
 
 ```text
 on IHAVE(mID, sender):
@@ -75,14 +77,66 @@ on GRAFT(mID, sender):
     if mID in received: send(GOSSIP, payload[mID], mID, ...) -> sender
 ```
 
-Because healing draws on the *entire* remaining overlay, not a fixed backup path, partitions and node churn get routed around automatically — and any redundant branches the healing introduces get pruned right back out by the normal PRUNE path. Membership churn plugs in through the sampling service's `NeighborUp`/`NeighborDown` callbacks, which add or drop entries in the eager set. Plumtree also carries a round number on messages so that if lazy delivery consistently beats eager delivery by a threshold (the paper uses 3 for a single sender, 7 for many), it proactively grafts the faster link and prunes the slower one, shortening the tree.
+Because healing draws on the entire remaining overlay rather than a designated backup path, node churn and partitions are routed around without configuration, and any redundancy that healing reintroduces is removed again by the ordinary PRUNE path on the next duplicate. Membership changes enter through the sampling service's `NeighborUp`/`NeighborDown` callbacks, which add to or remove from the eager set.
 
-## Where it runs in production
+GOSSIP messages additionally carry a **round number**, the hop count from the source. When lazy delivery of an identifier consistently precedes eager delivery by more than a configured threshold in rounds — **the threshold is a protocol parameter, not a derived constant** — the node grafts the faster link and prunes the slower one, shortening the tree without waiting for a failure.
 
-- **Riak Core** — `riak_core_broadcast` is Plumtree-based and underpins Cluster Metadata. Basho swapped HyParView for a fully-connected peer service (tuned for ~5–100 nodes) and layered on lazy-message queuing, anti-entropy, and historical delivery for late-joining nodes.
-- **HyParView** — Plumtree's natural partner: HyParView maintains the resilient partial-view membership; Plumtree builds the efficient broadcast tree on top of it.
-- **Partisan / plum_db** — Leapsight's `plum_db` reimplements the Riak Core metadata store over lasp-lang's Partisan, keeping the epidemic-broadcast-tree core.
+### Implementation sketch (Scala)
 
-The mental model worth keeping: eager push is your *steady-state fast path*, lazy push (IHAVE/GRAFT) is your *repair channel*, and PRUNE is what makes the fast path cheap. You get a tree's efficiency with gossip's failure semantics because the tree is never load-bearing on its own — the gossip overlay is always underneath it.
+The load-bearing state is two peer sets plus the pending-announcement map; the transitions below are the eager/lazy reclassification rules only, with transport and timer scheduling elided.
 
-**Try next:** Clone `lrascao/plumtree`, wire up a 7-node cluster, and instrument the eager/lazy peer sets. Broadcast a message, watch PRUNEs collapse the mesh into a tree, then kill an interior node mid-broadcast and log the IHAVE-triggered GRAFTs that re-stitch delivery — the whole heal cycle is visible in a few dozen lines of trace.
+```scala
+type NodeId = String
+type MsgId  = String
+
+final class Plumtree(self: NodeId, send: (NodeId, Any) => Unit):
+  private var eager: Set[NodeId] = Set.empty
+  private var lazyPeers: Set[NodeId] = Set.empty
+  private var received: Map[MsgId, (Array[Byte], Int)] = Map.empty  // payload and its round
+  private var missing: Map[MsgId, List[NodeId]] = Map.empty  // announcers, in arrival order
+
+  private def toLazy(p: NodeId): Unit = { eager -= p; lazyPeers += p }
+  private def toEager(p: NodeId): Unit = { lazyPeers -= p; eager += p }
+
+  def onGossip(id: MsgId, payload: Array[Byte], round: Int, from: NodeId): Unit =
+    if received.contains(id) then
+      toLazy(from); send(from, Prune(self))          // duplicate ⇒ edge is redundant
+    else
+      received += id -> (payload, round)
+      missing -= id                                  // gap closed; no GRAFT needed
+      toEager(from)
+      eager.excl(from).foreach(send(_, Gossip(id, payload, round + 1, self)))
+      lazyPeers.excl(from).foreach(send(_, IHave(id, round + 1, self)))
+
+  def onIHave(id: MsgId, from: NodeId): Unit =
+    if !received.contains(id) then
+      missing = missing.updatedWith(id)(prev => Some(prev.getOrElse(Nil) :+ from))
+
+  /** Invoked when timeout1 (or the timeout2 retry) expires for `id`. */
+  def onTimeout(id: MsgId): Unit =
+    missing.get(id).flatMap(_.headOption).foreach: announcer =>
+      missing = missing.updated(id, missing(id).tail)
+      toEager(announcer)
+      send(announcer, Graft(id, self))
+
+  def onGraft(id: MsgId, from: NodeId): Unit =
+    toEager(from)
+    received.get(id).foreach((p, r) => send(from, Gossip(id, p, r + 1, self)))
+```
+
+## Deployments
+
+- **Riak Core** — `riak_core_broadcast` is Plumtree-based and underpins Cluster Metadata. Basho replaced HyParView with a fully connected peer service sized for the cluster sizes Riak targets, and added lazy-message queuing and periodic anti-entropy exchanges so that state missed by broadcast is still reconciled.
+- **HyParView** — the membership protocol the paper pairs with Plumtree: HyParView maintains the resilient partial view, Plumtree builds the broadcast tree over it.
+- **Partisan / plum_db** — Leapsight's `plum_db` reimplements the Riak Core metadata store over lasp-lang's Partisan, retaining the epidemic-broadcast-tree core.
+
+Eager push is the steady-state path, IHAVE/GRAFT is the repair channel, and PRUNE is what makes the steady-state path cheap. The tree is never load-bearing on its own, because the full gossip overlay remains present underneath it.
+
+## Pitfalls
+
+- **`timeout1` set too low.** A transiently slow tree branch triggers GRAFTs before the payload arrives; the grafted edge then delivers a duplicate, which triggers a PRUNE, and the topology oscillates while paying both payload and control traffic.
+- **`timeout1` set too high.** A genuinely failed interior node is not detected until the timer expires, so every message in flight through that branch is delayed by at least that interval before repair begins.
+- **Asymmetric peer sets.** If a PRUNE is lost and only the receiver demotes the edge, the sender keeps eager-pushing, so the receiver keeps observing duplicates and keeps re-issuing PRUNE; the symmetry of the eager relation is what terminates the exchange.
+- **Discarding the announcer list after the first GRAFT.** Retaining only one announcer per identifier means a GRAFT sent to a peer that has itself crashed has no fallback when `timeout2` fires, and the message is not recovered until another IHAVE arrives.
+- **Unbounded `received` and `missing` maps.** Both are keyed by message identifier and grow with broadcast volume; without expiry, duplicate suppression and gap detection retain state for the lifetime of the process.
+- **Assuming delivery is ordered.** The protocol establishes that each node receives each payload once over the tree; grafted deliveries arrive out of the tree's normal order, so applications requiring order must supply it themselves.

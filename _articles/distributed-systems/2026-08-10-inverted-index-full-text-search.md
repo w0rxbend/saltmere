@@ -1,9 +1,9 @@
 ---
-title: 'The Inverted Index and Full-Text Search: How Lucene and Elasticsearch Actually Work'
+title: 'The Inverted Index and Full-Text Search: Lucene and Elasticsearch Mechanics'
 date: 2026-08-10
 track: distributed-systems
-summary: '"Design search" is a system-design staple, and the whole thing rests on one data structure: the inverted index that maps each term to a postings list of doc ids. This walks the index and its positions for phrase queries, the analysis pipeline you must apply identically at index and query time, relevance ranking from TF-IDF to BM25 (the Lucene/Elasticsearch default since 2016) with the k1 saturation and b length-normalization knobs, and how Lucene builds immutable segments that merge like an LSM-tree. Includes a ~30-line Python inverted index plus BM25 scorer and a positional phrase query.'
-reading_time: 6
+summary: 'Full-text search rests on one data structure: the inverted index, mapping each term to a postings list of document ids. This article walks the index and its positions for phrase queries, the analysis pipeline that must be applied identically at index and query time, relevance ranking from TF-IDF to BM25 (the Lucene and Elasticsearch default since Lucene 6.0) with its k1 saturation and b length-normalization parameters, and Lucene immutable segments that merge like an LSM-tree.'
+reading_time: 7
 tags:
 - inverted-index
 - full-text-search
@@ -32,11 +32,11 @@ sources:
   url: https://github.com/quickwit-oss/tantivy
 ---
 
-Ask a candidate to "design a search feature" and the weak answer reaches for `WHERE body LIKE '%quick brown%'`. That scan reads every row, matches raw bytes, can't rank results, and can't use an index — it's O(rows × doc length) on every query. The strong answer names the data structure the whole field is built on: the **inverted index**. Lucene — the library under Elasticsearch, OpenSearch, and Solr — is one very good implementation of it. This is what's happening under the hood.
+**Gist.** Substring matching over raw text (`WHERE body LIKE '%quick brown%'`) scans every row and cannot rank the results, costing O(rows x document length) per query. Full-text engines invert the mapping — term to sorted **postings list** of document ids — so a query touches only documents containing the query terms, and scores them with BM25. The cost is a second copy of the corpus in normalized form, an analysis pipeline that must be applied identically at write and read time, and an index that is built from immutable segments merged in the background rather than updated in place.
 
 ## The inverted index
 
-A forward index maps document → terms ("what words are in doc 7?"). Search needs the opposite: term → the documents that contain it. That's the *inverted* index, and it's just a dictionary of terms, each pointing at a **postings list** of doc ids:
+A forward index maps document to terms ("which words occur in document 7?"). Retrieval needs the opposite direction: term to the documents containing it. That is the *inverted* index — a dictionary of terms, each pointing at a postings list of document ids:
 
 ```
 brown  -> [1, 2, 3]
@@ -44,109 +44,112 @@ quick  -> [1, 2]
 fox    -> [1]
 ```
 
-To answer `quick AND brown`, you intersect two sorted postings lists — a linear merge over just the docs that contain those terms, never touching the rest of the corpus. Postings lists are kept sorted by doc id precisely so intersection is a cheap zipper walk, and they're compressed (delta-encoded gaps + variable-byte or PForDelta) so a term appearing in millions of docs still costs little to read.
+Answering `quick AND brown` intersects two sorted postings lists: a linear merge over the documents containing those terms, never reading the rest of the corpus. **Postings lists are stored sorted by document id so that intersection is a single simultaneous walk over both lists**, and they are compressed (delta-encoded gaps plus variable-byte or PForDelta coding) so a term occurring in millions of documents remains cheap to read.
 
-Boolean matching is only half of it. To support **phrase queries** — `"quick brown"` as an adjacent pair, not two words scattered across the doc — each posting also stores the **positions** where the term occurs in that document:
+Boolean matching covers only set membership. **Phrase queries** — `"quick brown"` as an adjacent pair rather than two words scattered through the document — require that each posting also record the **positions** at which the term occurs in that document:
 
 ```
 quick -> {1:[0], 2:[0,3]}
 brown -> {1:[1], 2:[1]}
 ```
 
-Doc 1 has `quick` at position 0 and `brown` at 1 — adjacent, so it matches the phrase. A phrase query intersects the docs, then checks that for some occurrence of the first term at position `p`, every later term appears at `p+i`. (Lucene also stores this data to power highlighting and proximity/slop queries.)
+Document 1 has `quick` at position 0 and `brown` at position 1; they are adjacent, so the phrase matches. **The phrase algorithm intersects the document sets first, then verifies that for some occurrence of the first term at position `p`, term `i` of the phrase occurs at `p + i`.** Lucene uses the same positional data for highlighting and for proximity (slop) queries.
 
-## The analysis pipeline — and why it must be symmetric
+## The analysis pipeline and its symmetry invariant
 
-Raw text isn't searchable as-is. Before anything hits the index, it runs through an **analyzer**: a tokenizer plus a chain of token filters. A typical English pipeline:
+Raw text is not searchable as stored. Before reaching the index it passes through an **analyzer**: a tokenizer followed by a chain of token filters. A representative English pipeline:
 
 1. **Tokenize** — split on non-word boundaries into terms.
-2. **Lowercase** — so `Quick` and `quick` collide.
-3. **Stop words** — optionally drop ultra-common tokens (`the`, `a`, `of`) that carry little signal.
-4. **Stemming / lemmatization** — reduce `foxes`, `jumping`, `ran` toward a root. Stemming is crude suffix-chopping (`foxes` → `fox`); lemmatization is dictionary-based and returns real lemmas (`ran` → `run`). Elasticsearch ships both (`porter_stem`, `kstem`, dictionary lemmatizers).
+2. **Lowercase** — so that `Quick` and `quick` collapse to one term.
+3. **Stop words** — optionally drop very common tokens (`the`, `a`, `of`) that carry little discriminating signal.
+4. **Stemming or lemmatization** — reduce `foxes`, `jumping`, `ran` toward a root. Stemming is suffix truncation (`foxes` to `fox`); lemmatization is dictionary-driven and yields real lemmas (`ran` to `run`). Elasticsearch ships algorithmic stemmer filters (`porter_stem`, `kstem`) and a dictionary-driven `hunspell` filter.
 
-The rule that trips people up in interviews: **the exact same analyzer must run at index time and at query time.** If you stem documents to `fox` but search the literal token `foxes`, the query term never matches the indexed term and you get zero hits. The index and the query have to meet in the same normalized term space. (Elasticsearch lets you set a different `search_analyzer`, but only deliberately — e.g. to skip synonym expansion on one side. The default is symmetry.)
+The invariant: **the same analyzer must run at index time and at query time.** If documents are stemmed to `fox` while the query is matched against the literal token `foxes`, the query term is absent from the dictionary and the result set is empty. Index and query must meet in the same normalized term space. Elasticsearch permits a distinct `search_analyzer` — for example to expand synonyms on one side only — but the default configuration is symmetric.
 
 ## Ranking: TF-IDF, then BM25
 
-Matching gives you a *set*; users want a *ranked list*. The classic scoring intuition is **TF-IDF**: a term matters more in a document the more often it appears there (term frequency, TF), and matters more overall the rarer it is across the corpus (inverse document frequency, IDF — `brown` in every doc is uninformative; `defenestration` in three docs is gold).
+Matching produces a *set*; a search result is a *ranked list*. The classical scoring intuition is **term frequency-inverse document frequency (TF-IDF)**: a term counts for more in a document the more often it occurs there (term frequency, TF), and counts for more overall the rarer it is in the corpus (inverse document frequency, IDF — `brown` occurring in every document discriminates nothing, while a term occurring in three documents discriminates strongly).
 
-Plain TF-IDF has two weaknesses, and **BM25** ("Best Matching 25," from Robertson and Sparck Jones's Okapi work) fixes both. Since **[LUCENE-6789](https://issues.apache.org/jira/browse/LUCENE-6789), shipped in Lucene 6.0 (April 2016), BM25 is the default similarity in Lucene** — and therefore in Elasticsearch and Solr. The formula, summing over query terms `t`:
+**BM25** ("Best Matching 25", from the Okapi work of Robertson and colleagues, reviewed in Robertson and Zaragoza's *Probabilistic Relevance Framework*) addresses two weaknesses of plain TF-IDF. Under **[LUCENE-6789](https://issues.apache.org/jira/browse/LUCENE-6789), shipped in Lucene 6.0 (April 2016), BM25 is the default similarity in Lucene**, and therefore in Elasticsearch and Solr. Summing over query terms `t`:
 
 ```
-score(D, Q) = Σ  IDF(t) · [ f(t,D) · (k1 + 1) ] / [ f(t,D) + k1 · (1 - b + b · |D|/avgdl) ]
+score(D, Q) = Σ  IDF(t) * [ f(t,D) * (k1 + 1) ] / [ f(t,D) + k1 * (1 - b + b * |D|/avgdl) ]
 ```
 
-where `f(t,D)` is the term's frequency in `D`, `|D|` is the document length in terms, `avgdl` the average document length, and `IDF(t) = ln(1 + (N − n(t) + 0.5) / (n(t) + 0.5))` for a corpus of `N` docs with `n(t)` containing the term. The two knobs are the whole point:
+where `f(t,D)` is the frequency of the term in `D`, `|D|` the document length in terms, `avgdl` the mean document length, and `IDF(t) = ln(1 + (N - n(t) + 0.5) / (n(t) + 0.5))` over a corpus of `N` documents of which `n(t)` contain the term. The two parameters carry the behaviour:
 
-- **`k1` — term-frequency saturation** (default **1.2**). In raw TF, a document mentioning `quick` twenty times scores 20× one mention — spammy and wrong. BM25 feeds TF through a saturating curve: the `f/(f + k1·…)` shape rises fast for the first few occurrences then flattens toward an asymptote. `k1` sets *how fast* it saturates. Lower `k1` saturates sooner (the 3rd occurrence barely helps); higher `k1` keeps rewarding repetition longer. This is the single biggest conceptual upgrade over TF-IDF.
-- **`b` — length normalization** (default **0.75**). A 5,000-word document naturally contains `quick` more often than a tweet, without being more *about* it. The `(1 − b + b·|D|/avgdl)` factor discounts long documents relative to `avgdl`. `b = 0` disables normalization entirely; `b = 1` applies it fully; 0.75 is the tuned middle. Elastic's *Practical BM25* series walks through picking these per-field — short `title` fields often want a different `b` than long `body` fields.
+- **`k1` — term-frequency saturation** (Lucene default **1.2**). Under raw TF a document mentioning `quick` twenty times scores twenty times one mention. BM25 passes TF through a saturating function: the `f/(f + k1 * ...)` form rises steeply over the first few occurrences and then flattens toward an asymptote. **`k1` controls the rate of saturation**: a lower `k1` saturates sooner, so the third occurrence contributes little; a higher `k1` continues to reward repetition.
+- **`b` — length normalization** (Lucene default **0.75**). A 5,000-word document contains `quick` more often than a short one without being more about it. The factor `(1 - b + b * |D|/avgdl)` discounts documents longer than `avgdl`. **`b = 0` disables normalization; `b = 1` applies it in full.** Elastic's *Practical BM25* series discusses selecting these per field, noting that short `title` fields and long `body` fields do not necessarily want the same `b`.
 
-## A tiny index + BM25 scorer
+### Implementation sketch (Scala)
 
-Thirty-odd lines: analyze, build the positional inverted index, score with BM25, and answer a phrase query from positions.
+Analysis, a positional inverted index, BM25 scoring, and a phrase query over positions. The same `analyze` function serves documents and queries, which is the symmetry invariant made structural.
 
-```python
-import re, math
-from collections import defaultdict
+```scala
+val stop = Set("the", "a", "is", "of", "to", "and", "in")
 
-def analyze(text):                      # SAME pipeline for docs and queries
-    STOP = {"the","a","is","of","to","and","in"}
-    toks = re.findall(r"[a-z0-9]+", text.lower())
-    return [t for t in toks if t not in STOP]
+def analyze(text: String): Vector[String] =
+  "[a-z0-9]+".r.findAllIn(text.toLowerCase).toVector.filterNot(stop)
 
-docs = {1: "The quick brown fox jumps",
-        2: "Quick brown foxes are quick and clever",
-        3: "A lazy brown dog sleeps in the sun"}
+val docs = Map(
+  1 -> "The quick brown fox jumps",
+  2 -> "Quick brown foxes are quick and clever",
+  3 -> "A lazy brown dog sleeps in the sun")
 
-index = defaultdict(lambda: defaultdict(list))   # term -> {doc_id: [positions]}
-length, N = {}, len(docs)
-for did, raw in docs.items():
-    terms = analyze(raw)
-    length[did] = len(terms)
-    for pos, t in enumerate(terms):
-        index[t][did].append(pos)
-avgdl = sum(length.values()) / N
+val analyzed: Map[Int, Vector[String]] = docs.view.mapValues(analyze).toMap
+val length: Map[Int, Int] = analyzed.view.mapValues(_.size).toMap
+val n = docs.size
+val avgdl = length.values.sum.toDouble / n
 
-def bm25(query, k1=1.2, b=0.75):
-    scores = defaultdict(float)
-    for t in analyze(query):
-        postings = index.get(t, {})
-        n = len(postings)                                    # docs containing t
-        idf = math.log(1 + (N - n + 0.5) / (n + 0.5))
-        for did, positions in postings.items():
-            f = len(positions)                               # term freq in doc
-            norm = f + k1 * (1 - b + b * length[did] / avgdl)
-            scores[did] += idf * (f * (k1 + 1)) / norm
-    return sorted(scores.items(), key=lambda x: -x[1])
+// term -> docId -> ascending positions
+val index: Map[String, Map[Int, Vector[Int]]] =
+  analyzed.toVector
+    .flatMap((did, terms) => terms.zipWithIndex.map((t, p) => (t, did, p)))
+    .groupMap(_._1)(t => (t._2, t._3))
+    .view.mapValues(_.groupMap(_._1)(_._2).view.mapValues(_.sorted).toMap)
+    .toMap
 
-def phrase(query):                                           # exact adjacency
-    terms = analyze(query)
-    for did in set.intersection(*[set(index.get(t, {})) for t in terms]):
-        if any(all((p + i) in index[terms[i]][did] for i in range(len(terms)))
-               for p in index[terms[0]][did]):
-            yield did
+def bm25(query: String, k1: Double = 1.2, b: Double = 0.75): Seq[(Int, Double)] =
+  analyze(query).foldLeft(Map.empty[Int, Double].withDefaultValue(0.0)) { (acc, t) =>
+    val postings = index.getOrElse(t, Map.empty)
+    val df = postings.size
+    val idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+    postings.foldLeft(acc) { case (m, (did, positions)) =>
+      val f = positions.size.toDouble
+      val norm = f + k1 * (1 - b + b * length(did) / avgdl)
+      m.updated(did, m(did) + idf * f * (k1 + 1) / norm)
+    }
+  }.toSeq.sortBy(-_._2)
 
-print(bm25("quick brown"))          # [(2, 0.735), (1, 0.657), (3, 0.134)]
-print(list(phrase("quick brown")))  # [1, 2]
-print(list(phrase("brown fox")))    # [1]
+def phrase(query: String): Set[Int] =
+  val terms = analyze(query)
+  val candidates = terms.map(t => index.getOrElse(t, Map.empty).keySet).reduce(_ intersect _)
+  candidates.filter: did =>
+    index(terms.head)(did).exists: p =>
+      terms.indices.forall(i => index(terms(i))(did).contains(p + i))
 ```
 
-Doc 2 wins `quick brown` because it contains `quick` twice — but note BM25's saturation means the second occurrence adds *less* than the first, and its longer length is discounted by `b`, so it doesn't run away with the score. The phrase query rejects doc 3 (it has `brown` but no adjacent `quick`) using positions alone — something a `LIKE` scan could only do by re-reading every document's full text.
+Document 2 outranks document 1 for `quick brown` because it contains `quick` twice, but saturation means the second occurrence contributes less than the first, and the greater length is discounted through `b`, so the lead is bounded. The phrase query rejects document 3 — which contains `brown` with no adjacent `quick` — from positions alone, whereas a `LIKE` scan could establish the same only by re-reading each document's full text.
 
-## Immutable segments that merge — the LSM analogy
+## Immutable segments that merge: the LSM analogy
 
-The last piece is *how the index is built at scale*, and it mirrors storage engines exactly. Lucene never mutates the index in place. A batch of documents is analyzed in memory and flushed to a **segment**: a small, self-contained, **immutable** inverted index on disk. New writes go to new segments; a query fans out across *all* current segments and merges their results. Deletes are just tombstone bits — the term data lingers until cleanup.
+Index construction at scale mirrors log-structured storage engines. **Lucene never mutates an index in place.** A batch of documents is analyzed in memory and flushed to a **segment**: a small, self-contained, immutable inverted index on disk. New writes create new segments; a query fans out over all current segments and merges the per-segment results. **Deletions are recorded as tombstone bits, so the term data for a deleted document remains in the segment until it is removed by a merge.**
 
-Left alone, segment count would explode and every query would touch hundreds of files, so a background **merge** policy periodically combines small segments into fewer larger ones, physically dropping tombstoned docs along the way. Buffer in memory → flush immutable sorted runs → merge in the background, trading write amplification for fast reads: that is precisely the **[LSM-tree](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees)** shape, with segments playing the role of SSTables and merge playing compaction. Recognizing that a search index and a RocksDB store are the same idea in different clothes is exactly the kind of connection interviewers are listening for.
-
-**Try next:** run the code above, then bump `k1` from 1.2 to 3.0 and re-score `quick brown` — watch doc 2's lead over doc 1 widen as repeated `quick` gets rewarded more; then set `b = 0` and see the length penalty on the longer doc 2 disappear.
+Unchecked, the segment count grows and every query touches many files, so a background **merge** policy combines small segments into fewer larger ones and physically drops tombstoned documents in the process. Buffer in memory, flush immutable sorted runs, merge in the background, trading write amplification for read performance: that is the **[LSM-tree](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees)** shape, with segments in the role of SSTables and merge in the role of compaction.
 
 ## Distributed search: shard by document, scatter-gather
 
-Elasticsearch/OpenSearch partition an index **by document**: each doc is routed to one shard (a full Lucene index) by hash of its ID — consistent with the partitioning schemes covered elsewhere in this track. A query can't be routed, so it fans out:
+Elasticsearch and OpenSearch partition an index **by document**: each document is routed to one shard — itself a complete Lucene index — by a hash of its identifier. A query cannot be routed the same way, since the relevant documents may live on any shard, so it fans out:
 
-1. **Query phase (scatter):** the coordinating node sends the query to one copy of every shard; each returns its local top-k as `(doc_id, score)` — no documents yet.
-2. **Merge:** the coordinator heap-merges N shards × k entries into a global top-k.
-3. **Fetch phase (gather):** it fetches the actual `_source` for only those winners from the shards that own them.
+1. **Query phase (scatter):** the coordinating node sends the query to one copy of every shard; each returns its local top-k as `(doc_id, score)` pairs, without document bodies.
+2. **Merge:** the coordinator heap-merges the N shards x k entries into a global top-k.
+3. **Fetch phase (gather):** it retrieves `_source` for the surviving documents only, from the shards that own them.
 
-Two classic gotchas: deep pagination (`from=10000` forces every shard to return 10 010 candidates — hence `search_after`), and per-shard IDF — each shard computes BM25 from its own statistics, so scores can differ for identical docs on differently-populated shards. With realistic shard sizes term statistics even out; Elastic's Practical BM25 series shows the small-index case where they don't.
+## Pitfalls
+
+- **Asymmetric analysis returns zero hits with no error.** Documents stemmed to `fox` while queries are matched on the unstemmed token `foxes` never intersect; the query is well formed and the result set is empty.
+- **Deep pagination costs grow with the offset, not the page size.** A request with `from=10000` forces every shard to return 10,010 candidates to the coordinator for merging; `search_after` avoids the growing per-shard prefix.
+- **BM25 statistics are per shard.** Each shard computes IDF from its own document counts, so identical documents on differently populated shards can receive different scores. The divergence is most visible on small indices; as shards grow, their term statistics converge toward the corpus-wide values.
+- **`b = 0` removes length normalization entirely.** Long documents then accumulate term frequency without penalty and dominate the ranking for common terms.
+- **A postings list stored without positions cannot answer phrase or proximity queries.** The failure is at index build time, not query time: the positional data must be written when the document is indexed.
+- **Deleted documents continue to occupy the index and influence file count until a merge runs.** Tombstones exclude them from results but not from the on-disk segment.

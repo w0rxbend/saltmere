@@ -2,8 +2,8 @@
 title: 'The Count-Min Sketch: Frequency Estimation in Sublinear Space'
 date: 2026-08-10
 track: distributed-systems
-summary: How a two-dimensional array of counters and d hash functions estimates how often you've seen a key using kilobytes instead of gigabytes, why it overestimates but never underestimates, the ε ≈ e/w error bound, the conservative-update trick, and how it powers TinyLFU cache admission and hot-key detection.
-reading_time: 6
+summary: How a two-dimensional array of counters and d hash functions estimates key frequencies in kilobytes instead of gigabytes, why the estimator overestimates but never underestimates, the w = ⌈e/ε⌉ error bound, the conservative-update variant, and how the sketch underpins TinyLFU cache admission and hot-key detection.
+reading_time: 7
 tags:
 - count-min-sketch
 - probabilistic-data-structures
@@ -33,121 +33,123 @@ sources:
   url: https://redis.io/docs/latest/develop/data-types/probabilistic/count-min-sketch/
 ---
 
-## The problem: counting frequencies you can't afford to store
+**Gist.** Answering "how many times has this key appeared?" exactly requires one counter per *distinct* key, and for URLs, IP addresses or user identifiers that population runs to billions. The **Count-Min Sketch** (Cormode & Muthukrishnan, 2005) replaces the map with a fixed `d × w` array of counters and `d` hash functions: an update increments one counter per row, a query returns the minimum of those `d` counters. The cost is a **one-sided error** — the estimate is never below the true count, but with probability at least `1 − δ` it exceeds the truth by no more than `ε · ‖a‖₁`, an error scaled by the *total stream size* rather than by the key's own frequency.
 
-Plenty of systems need to answer "how many times have I seen this key?" A cache wants to know whether a candidate is accessed often enough to be worth keeping. A load balancer wants to spot the one product ID that's suddenly getting a million requests a second. A network box wants the flows hogging the link. The exact answer is a hash map from key to count — and that map grows with the number of *distinct* keys, which for URLs, IPs, or user IDs can be billions. One `int64` counter per key is gigabytes, and most of those keys you'll see once and never again.
+## The problem: frequencies that cannot be stored exactly
 
-The **Count-Min Sketch** (Cormode & Muthukrishnan, 2005) trades exactness for a fixed, tiny footprint. Like HyperLogLog it's a *sketch* — a small summary you feed items into and query — but it answers a different question. HyperLogLog estimates *cardinality* (how many distinct things); Count-Min estimates *frequency* (how often a specific thing). Same probabilistic spirit, orthogonal use. (See the companion article on [HyperLogLog](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation).)
+Several classes of system need per-key frequencies. A cache needs to know whether a candidate is accessed often enough to be worth retaining. A load balancer needs to identify the single product identifier absorbing a disproportionate share of requests. A network device needs the flows saturating a link. The exact answer is a hash map from key to count, and that map grows with the number of distinct keys, most of which appear once and never recur.
+
+Count-Min trades exactness for a footprint fixed in advance. Like HyperLogLog it is a *sketch* — a small summary that items are fed into and queried against — but it answers a different question. HyperLogLog estimates *cardinality*, how many distinct elements occurred; Count-Min estimates *frequency*, how often a nominated element occurred. (See the companion article on [HyperLogLog](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation).)
 
 ## The structure: d rows, w counters, one increment per row
 
-A Count-Min Sketch is a two-dimensional array of counters with **depth `d`** (rows) and **width `w`** (columns), plus `d` independent hash functions `h₁…h_d`, each mapping a key to a column in `{1…w}`. The hashes come from a pairwise-independent family.
+A Count-Min Sketch is a two-dimensional counter array of **depth `d`** (rows) and **width `w`** (columns), together with `d` hash functions `h₁…h_d` drawn from a pairwise-independent family, each mapping a key into `{1…w}`.
 
-Two operations:
+- **Add `(key, c)`:** for every row `j`, `table[j][h_j(key)] += c`. **One counter per row, so `O(d)` work independent of `w`.**
+- **Estimate `(key)`:** return the minimum over rows of `table[j][h_j(key)]`.
 
-- **Add `(key, c)`:** for every row `j`, increment `table[j][h_j(key)] += c`. One counter touched per row — `O(d)` work, independent of `w`.
-- **Estimate `(key)`:** return `min` over all rows of `table[j][h_j(key)]`.
+Each row is an independent lossy histogram: distinct keys collide into a shared column and their counts accumulate together. Because the rows use different hash functions, two keys colliding in row 1 are unlikely to collide again in row 2. The minimum across rows therefore selects the row in which the queried key absorbed the least collision noise.
 
-That's the whole thing. Each row is an independent, lossy histogram: many keys collide into the same column and their counts pile up together. But because the rows use *different* hash functions, two keys that collide in row 1 almost certainly land in different columns in row 2. Taking the minimum across rows picks the row where your key suffered the least collision noise — hence "Count-*Min*."
+## Why the estimator overestimates but never underestimates
 
-## Why it overestimates but never underestimates
-
-Every increment for `key` lands on the counters `key` hashes to, so each of those counters is *at least* the true count of `key`. Collisions from *other* keys can only push those counters higher, never lower. So every row gives an overestimate, and the minimum of overestimates is still ≥ the truth:
+Every increment for `key` lands on the `d` counters that `key` hashes to, so each of those counters is at least the true count of `key`. Increments from *other* keys can only raise those counters. Each row therefore yields an overestimate, and the minimum of overestimates remains at least the truth:
 
 ```
 estimate(key) ≥ true_count(key)     always
 ```
 
-The sketch is a **one-sided estimator**: it can tell you a key is hotter than it is, but it will never hide a hot key. That asymmetry is exactly what you want for admission control and heavy-hitter detection — you'd rather occasionally admit a lukewarm key than ever reject a genuinely hot one.
+The sketch is a **one-sided estimator**: it can report a key as hotter than it is, but it cannot conceal a hot key. That asymmetry is the property admission control and heavy-hitter detection depend on — a false positive is a lukewarm key admitted, whereas a false negative would be a genuinely hot key rejected, which the structure cannot produce.
 
-## The error bounds (get these right)
+## The error bound
 
-The two dimensions are set directly from the accuracy you want. Given a target additive error `ε` and a failure probability `δ`:
+Both dimensions follow directly from the target additive error `ε` and failure probability `δ`:
 
 ```
 w = ⌈e / ε⌉          (e = Euler's number ≈ 2.718)
 d = ⌈ln(1 / δ)⌉
 ```
 
-The guarantee, from the paper: the estimate never underestimates, and **with probability at least `1 − δ`,**
+The guarantee stated in the paper: the estimate never underestimates, and **with probability at least `1 − δ`,**
 
 ```
 estimate(key) ≤ true_count(key) + ε · ‖a‖₁
 ```
 
-where `‖a‖₁` is the total number of items added (the L1 norm of the frequency vector). The error is *additive* and scaled by the *total stream size*, not by the individual key's count. So wider rows (`w`) shrink `ε` — the overcount per query — while more rows (`d`) drive down `δ`, the probability that all rows got unlucky at once. Space is `O(w·d)` counters, i.e. `O((1/ε)·ln(1/δ))` — logarithmic in the confidence, and completely independent of how many distinct keys you throw at it.
+where `‖a‖₁` is the L1 norm of the frequency vector, that is the total number of items added. **The error is additive and proportional to the total stream size, not to the queried key's own count** — so a key occurring once in a stream of 10⁹ items carries the same absolute error budget as a key occurring 10⁶ times, which makes the estimator far more useful for heavy hitters than for rare keys. Increasing `w` shrinks `ε`, the overcount per query; increasing `d` drives down `δ`, the probability that every row was simultaneously unlucky. Space is `O(w·d)` counters, `O((1/ε)·ln(1/δ))`, **independent of the number of distinct keys**.
 
-Concretely: `ε = 0.001`, `δ ≈ 0.001` gives `w = ⌈e/0.001⌉ = 2719` and `d = ⌈ln 1000⌉ = 7`. That's ~19,000 counters — a handful of kilobytes — to estimate every key's frequency in a billion-item stream to within 0.1% of the stream size, 99.9% of the time.
+With `ε = 0.001` and `δ ≈ 0.001`: `w = ⌈e/0.001⌉ = 2719`, `d = ⌈ln 1000⌉ = 7`, 19,033 counters — under 80 KB at 32-bit counters, and a few kilobytes if the counters are narrowed to 4 or 8 bits — estimating any key's frequency in a billion-item stream to within 0.1% of the stream size, with probability at least 99.9%.
 
-## An implementation in ~30 lines
+### Implementation sketch (Scala)
 
-```python
-import hashlib
+```scala
+final class CountMinSketch(val w: Int = 2719, val d: Int = 7):
+  private val table: Array[Array[Long]] = Array.ofDim[Long](d, w)
 
-class CountMinSketch:
-    def __init__(self, w=2719, d=7):     # ε≈0.001, δ≈0.001
-        self.w, self.d = w, d
-        self.table = [[0] * w for _ in range(d)]
+  // d columns from one hash: seed each row differently and fold to [0, w)
+  private def columns(key: String): Array[Int] =
+    Array.tabulate(d): j =>
+      val h = scala.util.hashing.MurmurHash3.stringHash(key, 0x9747b28c + j)
+      math.floorMod(h, w)
 
-    def _cols(self, key):                 # one column per row
-        for j in range(self.d):
-            h = hashlib.blake2b(str(key).encode(), digest_size=8,
-                                person=j.to_bytes(8, "big")).digest()
-            yield int.from_bytes(h, "big") % self.w
+  def add(key: String, count: Long = 1L): Unit =
+    val cols = columns(key)
+    var j = 0
+    while j < d do
+      table(j)(cols(j)) += count
+      j += 1
 
-    def add(self, key, count=1):
-        for j, col in enumerate(self._cols(key)):
-            self.table[j][col] += count
+  def estimate(key: String): Long =
+    val cols = columns(key)
+    (0 until d).map(j => table(j)(cols(j))).min
 
-    def estimate(self, key):
-        return min(self.table[j][col] for j, col in enumerate(self._cols(key)))
-
-    def add_conservative(self, key, count=1):
-        cols = list(self._cols(key))
-        target = min(self.table[j][c] for j, c in enumerate(cols)) + count
-        for j, c in enumerate(cols):      # only raise counters below target
-            if self.table[j][c] < target:
-                self.table[j][c] = target
-
-cms = CountMinSketch()
-for _ in range(5000): cms.add("hot-key")
-for i in range(100000): cms.add(f"cold-{i}")
-print(cms.estimate("hot-key"))    # ≥ 5000, slightly inflated by collisions
-print(cms.estimate("cold-42"))    # ≥ 1, occasionally more
+  /** Conservative update: raise counters only up to the new minimum. */
+  def addConservative(key: String, count: Long = 1L): Unit =
+    val cols = columns(key)
+    val target = (0 until d).map(j => table(j)(cols(j))).min + count
+    var j = 0
+    while j < d do
+      if table(j)(cols(j)) < target then table(j)(cols(j)) = target
+      j += 1
 ```
 
-The `person` parameter of BLAKE2 gives us `d` distinct hash functions from one primitive — cheaper than seeding `d` separate hashers.
+Seeding one hash primitive `d` times supplies the `d` hash functions without instantiating `d` separate hashers.
 
-## The conservative-update optimization
+## The conservative-update variant
 
-Notice `add` blindly bumps every one of a key's counters. But since the query only ever reads the *minimum*, you don't need the larger counters to grow at all. **Conservative update** (Estan & Varghese's "minimal increment") computes the post-increment estimate — `current_min + count` — and then raises each of the key's counters only up to that target, leaving already-larger counters untouched (`add_conservative` above).
+Plain `add` increments every counter belonging to a key. Since a query reads only the minimum, the counters already above that minimum need not grow. **Conservative update** — Estan & Varghese's "minimal increment" — computes the post-increment estimate `current_min + count` and raises each of the key's counters only as far as that target, leaving larger counters untouched.
 
-This keeps the no-underestimate guarantee while sharply reducing the overcount, because counters shared with other keys stop absorbing increments they don't need — it cuts average error several-fold on skewed workloads. The tradeoff: it breaks the *linear-sketch* property, so two conservatively-updated sketches can no longer be summed counter-by-counter to merge (recent worst-case analysis in the arXiv paper below).
+The no-underestimate guarantee survives, and the overcount falls, because counters shared with other keys stop absorbing increments that would not change the reported minimum. The cost is that **the variant is no longer a linear sketch**: two conservatively updated sketches over disjoint streams cannot be merged by counter-wise addition, which removes the parallel-aggregation property that plain Count-Min has. Worst-case behaviour of the variant is analysed in the arXiv paper cited below.
 
-## The caching connection: TinyLFU admission
+## TinyLFU admission
 
-Here's where the sketch earns its keep in cache design. Pure LRU admits *everything* on access, so a one-hit scan can evict genuinely popular entries. LFU keeps the frequently-used, but a classic LFU needs a real counter per key — the very cost we're avoiding. **TinyLFU** (Einziger, Friedman & Manes, 2017) resolves this: use a Count-Min Sketch as an approximate frequency estimator, then admit a new item only if its estimated frequency exceeds that of the entry it would evict.
+Least-recently-used (LRU) eviction admits every accessed item, so a single scan of one-hit keys can displace genuinely popular entries. Least-frequently-used (LFU) eviction retains popular entries but classically requires a real counter per key — the cost the sketch exists to avoid. **TinyLFU** (Einziger, Friedman & Manes, 2017) combines the two: a Count-Min Sketch supplies approximate frequencies, and a new item is admitted only when its estimated frequency exceeds that of the entry it would displace.
 
-The production implementation in **Caffeine** (and Rust's `moka`) sharpens the sketch for the cache setting:
+The implementation in **Caffeine** (and Rust's `moka`) adapts the sketch to the cache setting:
 
-- **4-bit counters.** Access frequencies are small and long-tailed, so counters saturate at 15 — packing 16 counters per 64-bit word, costing roughly *4× the cache capacity in counters* rather than a full `int` per key.
-- **Aging by halving.** After a sample window of `10 × capacity` operations, *every* counter is divided by two. This is the crucial addition to plain Count-Min: it lets stale popularity fade so the cache tracks the *current* hot set instead of anchoring to keys that were hot an hour ago. The halving also reclaims headroom in the 4-bit counters.
-- **W-TinyLFU** front-runs this with a small LRU *window* to catch bursty newcomers the sketch hasn't learned yet, then has the window's victim and the main region's probation candidate compete on estimated frequency — higher estimate wins, with a little random jitter to defeat hash-collision attacks.
+- **4-bit counters** saturating at 15, packing 16 counters per 64-bit word, so the sketch costs a few bits per tracked entry rather than a full-width integer per key.
+- **Aging by halving.** After a sample window of `10 × capacity` operations, every counter is divided by two, so past popularity decays and the estimator tracks the current hot set. The halving also reclaims headroom in the 4-bit counters.
+- **W-TinyLFU** places a small LRU *window* in front, catching bursty newcomers the sketch has not yet observed; the window's victim and the main region's probation candidate then compete on estimated frequency, with random jitter in the comparison to resist hash-collision attacks.
 
-The one-sided error is what makes this safe: because the sketch never *under*counts, a truly hot key's estimate can't fall below its real frequency and get wrongly evicted; the worst case is a lukewarm key looking slightly hotter than it is.
+The one-sided error is what makes the arrangement safe: since the sketch cannot undercount, a hot key's estimate cannot fall below its real frequency, and the worst outcome is a lukewarm key appearing slightly hotter than it is.
 
-## Beyond admission: hot-key and heavy-hitter detection
+## Heavy-hitter and hot-key detection
 
-The same estimator finds **heavy hitters** — keys whose frequency exceeds some fraction of the stream. Feed every request into a sketch, and any key whose estimate crosses a threshold is a hot-key candidate (the no-underestimate property means you never miss one; you only get occasional false positives to filter). That's the trigger for operational responses: replicate a hot partition across more nodes, promote a hotspot into a dedicated local cache, or shed load for an abusive client. Redis ships this directly as the `CMS.*` commands in RedisBloom.
+The same estimator identifies **heavy hitters**, keys whose frequency exceeds a chosen fraction of the stream. Every request is added to a sketch, and any key whose estimate crosses the threshold becomes a candidate; the no-underestimate property means no heavy hitter is missed, and the residual errors are false positives that a second pass can filter. Detected hot keys are the trigger for operational responses such as replicating a hot partition, promoting the key into a dedicated local cache, or shedding load. Redis exposes the structure directly through the `CMS.*` commands in RedisBloom.
 
-## Count-Min vs HyperLogLog vs Bloom
+## Count-Min versus HyperLogLog versus Bloom
 
-Three sketches, three questions, easy to confuse:
+- **Count-Min Sketch** — how often does key X occur? Frequency, one-sided overestimate.
+- **[HyperLogLog](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation)** — how many distinct keys occur? Cardinality, two-sided relative error set by the register count, merges losslessly.
+- **Bloom and Cuckoo filters** — has key X occurred at all? Set membership, no counts.
 
-- **Count-Min Sketch** — *how often* is key X? Frequency, one-sided overestimate.
-- **[HyperLogLog](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation)** — *how many distinct* keys? Cardinality, ~2% two-sided error, merges losslessly.
-- **Bloom / Cuckoo filters** — *have I seen* key X at all? Set membership, no counts.
+Count-Min is the only one of the three that estimates counts, which is why frequency-aware admission policies such as TinyLFU are built on it.
 
-Count-Min is the only one of the three that estimates *counts*, and that's precisely why frequency-aware caches like TinyLFU reach for it. (Bloom, Cuckoo, and TinyLFU each have their own article in this series.)
+## Pitfalls
 
-**Try next:** run the implementation above, then compare `add` versus `add_conservative` on a Zipfian key stream — plot estimated-vs-true frequency for a few keys and watch the conservative variant hug the diagonal far more tightly, then add the periodic halving and confirm a once-hot key's estimate decays as the workload shifts.
+- **Reading an absolute error into a low-frequency key.** The bound is `ε · ‖a‖₁`, scaled by the whole stream; a key seen twice in a stream of 10⁹ items can be reported as thousands of occurrences, so per-key estimates are meaningful only for keys whose true counts are large relative to `ε · ‖a‖₁`.
+- **Merging conservatively updated sketches counter-wise.** Conservative update is not linear, so summing two such sketches yields a result with no proved bound; only plain Count-Min sketches of identical `w`, `d` and hash seeds merge by addition.
+- **Sketches with mismatched dimensions or seeds.** Counter-wise merging assumes both sketches map each key to the same columns; differing `w`, `d` or hash seeds produce silently meaningless counts rather than an error.
+- **Never aging counters in a long-lived process.** Plain Count-Min accumulates monotonically, so a key hot an hour ago keeps its high estimate forever; TinyLFU's periodic halving exists because the unaged sketch reports historical rather than current popularity.
+- **Saturating narrow counters.** Caffeine's 4-bit counters stop at 15, so all keys above that frequency become indistinguishable; the comparison degrades to a tie once the hot set exceeds the counter ceiling and no halving has intervened.
+- **Treating the estimate as an exact count in downstream arithmetic.** Subtracting two estimates, or dividing one by another, compounds two independent overestimates and can yield a ratio far from the true one; the guarantee covers single-key queries only.
+- **Assuming deletions work.** Decrements break the no-underestimate invariant, because a decrement applied to a shared counter also removes count belonging to colliding keys; the standard sketch supports non-negative updates only.

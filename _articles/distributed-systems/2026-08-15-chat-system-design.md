@@ -1,9 +1,9 @@
 ---
-title: "Design a Chat System (WhatsApp/Slack-Style)"
+title: "Designing a Chat System (WhatsApp/Slack-Style)"
 date: 2026-08-15
 track: distributed-systems
-summary: "Chat is four subsystems wearing one trench coat: a stateful WebSocket edge, a per-conversation ordering authority, a wide-row message store, and an inbox/receipt sync protocol for flaky mobile clients. Here's the message flow end to end, the Discord-style Cassandra/ScyllaDB schema with time buckets, per-device cursors, and the back-of-envelope numbers to say out loud."
-reading_time: 6
+summary: "A chat system decomposes into four subsystems: a stateful WebSocket edge, a per-conversation ordering authority, a wide-row message store, and a cursor-based sync protocol for intermittently connected devices. This article traces the message path end to end, the Discord-style Cassandra/ScyllaDB schema with time buckets, per-device cursors, and the sizing arithmetic behind them."
+reading_time: 7
 tags: [chat, websocket, cassandra, scylladb, message-ordering, system-design]
 sources:
   - title: "Discord Engineering — How Discord Stores Trillions of Messages"
@@ -16,32 +16,37 @@ sources:
     url: "https://slack.engineering/migrating-millions-of-concurrent-websockets-to-envoy/"
 ---
 
-Start the interview by splitting the problem: a **connection layer** (long-lived sockets, presence), a **messaging core** (ordering, fan-out, persistence), and a **sync layer** (cursors, receipts, offline push). Then size it.
+**Gist.** A chat system must deliver messages within human reaction time to devices that disconnect constantly, while preserving a single agreed order inside each conversation and retaining (or deliberately discarding) history at petabyte scale. The mechanism is a stateful WebSocket edge whose sessions are indexed in a shared registry, a per-conversation owner shard that assigns monotonically increasing identifiers, and a bucketed wide-column log that clients resume from by cursor. The cost is that ordering authority becomes a per-conversation single point of serialisation, and the edge — unlike the rest of the stack — cannot be made stateless.
 
-## Back-of-envelope
+The problem separates into a **connection layer** (long-lived sockets, presence), a **messaging core** (ordering, fan-out, persistence), and a **sync layer** (cursors, receipts, offline push).
 
-50M DAU × 40 messages/day = **2B messages/day ≈ 23k msg/s average, ~120k msg/s peak** (5× multiplier). At ~1 KB per stored message (text + metadata + indexes) that's ~2 TB/day before replication — a few PB over five years, which is why the reference stores are LSM-based wide-column DBs, not Postgres. Concurrent connections: assume 20% of DAU online → 10M sockets. WhatsApp famously held **2M+ TCP connections per Erlang/FreeBSD box** (the High Scalability writeup: ~500M users on 11,000 cores), so 10M sockets is dozens-to-hundreds of gateway nodes depending on how hot you run them; Slack runs millions of concurrent WebSockets through an Envoy edge.
+## Sizing
+
+Fifty million daily active users (DAU) at 40 messages per day yield **2 × 10⁹ messages/day ≈ 23,000 messages/s average**, and **≈120,000 messages/s peak** under a 5× peak-to-mean multiplier. At roughly 1 KB stored per message (body, metadata, index entries) that is about **2 TB/day before replication**, and a few petabytes over five years. That volume is the reason the reference implementations use log-structured merge-tree (LSM) wide-column stores rather than a row-store relational database: the workload is append-dominated with range reads over a recent suffix.
+
+Concurrent connections follow from the online fraction: 20% of DAU online gives **10 million simultaneous sockets**. WhatsApp reported serving nearly 500 million users on 11,000 cores, with **millions of concurrent connections per Erlang/FreeBSD machine**. Ten million sockets therefore falls in the range of dozens to hundreds of gateway nodes, depending on how heavily each is loaded; no published figure fixes the number for a given hardware profile. Slack routes millions of concurrent WebSockets through an Envoy edge.
 
 ## Connection layer
 
-Clients hold one **WebSocket** to a gateway (transport trade-offs are in [the WebSocket/SSE article](/articles/microservices/2026-08-10-realtime-websocket-sse-longpoll)); the gateway is the only stateful edge piece. It maintains:
+Each client holds one **WebSocket** to a gateway; transport alternatives are compared in [the WebSocket/SSE article](/articles/microservices/2026-08-10-realtime-websocket-sse-longpoll). The gateway is the only stateful component at the edge, and it maintains two structures.
 
-- **Session registry:** `user_id → {gateway, device_id}` in a shared store (Redis, or Slack-style consistent hashing so a conversation's server is computable). Routing a message to a user = look up their gateway, forward.
-- **Presence heartbeats:** client pings every ~30 s; the registry entry carries a TTL of ~2 missed heartbeats, so "online" is just "registry key exists." Broadcast presence changes lazily and only to conversations currently on screen — presence fan-out at Slack-scale is *more* traffic than messages, which is why Slack moved clients to subscription-based presence instead of pushing everyone's status to everyone.
+The **session registry** maps `user_id → {gateway, device_id}` in a shared store such as Redis. The alternative is to compute the owning server from the identifier by consistent hashing, which removes the lookup at the cost of a rebalance whenever the ring changes. Delivering a message to a user reduces to resolving the gateway and forwarding.
 
-Slack's architecture is the clean mental model: stateless gateways at the edge, **Channel Servers** behind them that are sharded by **consistent hash of channel ID** and hold each channel's in-flight state.
+**Presence** is derived from heartbeats: the client pings on a fixed interval (on the order of 30 s) and the registry entry carries a time-to-live (TTL) of about two missed heartbeats, so "online" is the predicate *registry key exists*. The invariant that matters is that presence is **soft state** — it is reconstructed from live connections and never repaired from durable storage. Presence fan-out is a major traffic source at Slack's scale — a status change is of interest to every member of every shared channel — which is why clients subscribe to the presence of a bounded set of users rather than receiving every status change.
 
-## Message flow and ordering
+Slack separates the two concerns: an edge that terminates the sockets — since migrated behind Envoy — and **Channel Servers** behind it, sharded by **consistent hash of channel identifier**, holding each channel's in-flight state. The edge then holds only connections, and the per-channel routing state lives one hop back.
 
-`sender → gateway → chat service (owner shard for conversation_id) → persist → fan-out to recipient gateways → push for offline devices`.
+## Message path and ordering
 
-Ordering only needs to be **per conversation**, and that's the trick: route every message through the conversation's owner shard, which assigns a monotonically increasing `message_id`. Use a Snowflake-style time-ordered 64-bit ID ([details here](/articles/distributed-systems/2026-08-11-distributed-unique-ids-snowflake-uuidv7-ulid)) — it sorts chronologically, doubles as a created-at timestamp, and is exactly what Discord clusters on. Global cross-conversation ordering is neither needed nor worth paying for.
+The path is `sender → gateway → chat service (owner shard for conversation_id) → persist → fan-out to recipient gateways → push notification for offline devices`.
 
-**Group fan-out:** for a 20-person group, the owner shard writes the message once to the conversation log and pushes a pointer to each online member's gateway — fan-out-on-write to *connections*, not to per-user message copies. For 100k-member channels (Slack, Discord servers), don't push the body at all: notify "channel has new messages," let clients pull the range — the same [push/pull hybrid as news feeds](/articles/sys-patterns/2026-08-11-fan-out-on-write-vs-read-feeds).
+Ordering is required only **per conversation**. Routing every message for a conversation through that conversation's owner shard makes the shard the sole assigner of a monotonically increasing `message_id`, which establishes a total order within the conversation without any cross-shard coordination. A Snowflake-style time-ordered 64-bit identifier ([construction here](/articles/distributed-systems/2026-08-11-distributed-unique-ids-snowflake-uuidv7-ulid)) sorts chronologically and encodes its own creation time; Discord clusters messages on exactly such an identifier. Global ordering across conversations is not required and is not purchased.
 
-## Storage: wide rows, bucketed
+**Group fan-out** writes the message once to the conversation log and pushes a pointer to each online member's gateway: fan-out-on-write to *connections*, not to per-user copies of the body. For channels with 100,000 members the body is not pushed at all — the server signals that the channel has new messages and clients pull the range, the [push/pull hybrid used for feeds](/articles/sys-patterns/2026-08-11-fan-out-on-write-vs-read-feeds).
 
-The canonical schema is Discord's (Cassandra, later ScyllaDB):
+## Storage: bucketed wide rows
+
+The reference schema is Discord's, on Cassandra and later ScyllaDB:
 
 ```sql
 CREATE TABLE messages (
@@ -54,21 +59,73 @@ CREATE TABLE messages (
 ) WITH CLUSTERING ORDER BY (message_id DESC);
 ```
 
-One partition = one conversation's messages for one time window, sorted newest-first — so "load recent history" and "page older" are single-partition sequential reads. The **bucket** exists because unbounded partitions rot: without it, a busy channel's partition grows past the ~100 MB comfort zone and compaction/repair suffer. Even bucketed, **hot partitions** (a huge channel, everyone reading at once) can drag a node's latency down for every partition it hosts — Discord's fixes were moving to ScyllaDB (trillions of messages, 177 Cassandra nodes → 72 ScyllaDB nodes) and putting Rust **data services** in front that do request coalescing: N concurrent readers of the same row cost one DB query.
+One partition holds one conversation's messages for one time window, sorted newest-first, so "load recent history" and "page backwards" are single-partition sequential reads. The **bucket** bounds partition growth: without it a busy channel's partition grows past the ~100 MB range that compaction and repair handle comfortably. Even bucketed, a **hot partition** — a large channel read concurrently by many clients — degrades latency for every partition co-resident on that node. Discord's reported remedies were a migration to ScyllaDB (**177 Cassandra nodes replaced by 72 ScyllaDB nodes**) and Rust **data services** in front of the store performing request coalescing, so that N concurrent readers of the same row issue one database query.
 
 ## Inbox, sync, and receipts
 
-Mobile clients disconnect constantly, so sync must be resumable:
+Because mobile clients disconnect frequently, synchronisation must be resumable rather than incremental-push-only.
 
-- **Per-device cursor:** each device stores, per conversation, the last `message_id` it has applied; on reconnect it asks "everything after cursor" — cheap, because that's a clustering-key range scan. Multi-device (Slack, Telegram-style) is just multiple cursors over the same server-side log.
-- **Receipts are three distinct facts:** *sent* (server persisted it — first tick), *delivered* (recipient device acked — second tick), *read* (conversation opened — blue). Delivered/read flow as tiny upstream events on the same socket and fan out to the sender; for groups, aggregate (store per-member `last_read_id`, render "read by 12").
-- **Offline delivery:** if the registry says no device is connected, enqueue to the user's inbox and fire APNs/FCM with a collapse key so 50 messages become one badge update. WhatsApp is pure **store-and-forward** — the server queue exists only until every device acks, then messages are deleted (also what makes E2E encryption tractable). Slack/Discord are **retained-history** systems: the log is the product, and the DB above is sized for it. Say which model you're building; it changes storage by orders of magnitude.
+- **Per-device cursor.** Each device records, per conversation, the last `message_id` it has applied. On reconnect it requests everything after that cursor, which is a clustering-key range scan inside a single partition. Multi-device accounts are several cursors over one server-side log.
+- **Receipts are three distinct facts.** *Sent* means the server persisted the message; *delivered* means a recipient device acknowledged it; *read* means the conversation was opened. Delivered and read travel upstream on the same socket and fan out to the sender. For groups the aggregate is stored per member as `last_read_id` and rendered as a count.
+- **Offline delivery.** When the registry shows no connected device, the message is enqueued to the user's inbox and a push notification is emitted through APNs or FCM with a collapse key, so a burst of messages coalesces into one badge update.
 
-| Decision | Cheap option | Scale option |
+The retention model is the decision with the largest cost consequence. WhatsApp is **store-and-forward**: the server queue exists only until every device acknowledges, after which the message is deleted — a design compatible with end-to-end encryption, since the server never needs to read the body. Slack and Discord are **retained-history** systems in which the log is the product and the store above is sized accordingly. The two models differ in storage requirement by orders of magnitude.
+
+### Implementation sketch (Scala)
+
+The load-bearing element is the owner shard: a single-threaded assigner per conversation that stamps an identifier, appends, then fans out. Serialising by conversation is what makes the order total.
+
+```scala
+final case class Message(id: Long, convId: Long, author: Long, body: String)
+
+trait Store:
+  def append(m: Message): Unit
+  def since(convId: Long, bucket: Int, cursor: Long): Seq[Message]
+
+trait Gateway:
+  def deliver(m: Message): Unit
+
+trait Registry:
+  def sessions(user: Long): Seq[Gateway]
+
+trait Push:
+  def enqueue(user: Long, messageId: Long): Unit
+
+final class OwnerShard(store: Store, registry: Registry, push: Push, nextId: () => Long):
+  // One lock per conversation: concurrent conversations proceed in parallel,
+  // but a single conversation has exactly one assigner of message ids.
+  private val locks = scala.collection.concurrent.TrieMap.empty[Long, AnyRef]
+
+  def submit(convId: Long, author: Long, body: String, members: Seq[Long]): Long =
+    val lock = locks.getOrElseUpdate(convId, new AnyRef)
+    lock.synchronized:
+      val m = Message(nextId(), convId, author, body)
+      store.append(m)                       // durable before any delivery
+      members.foreach: u =>
+        val gws = registry.sessions(u)
+        if gws.isEmpty then push.enqueue(u, m.id)  // offline: inbox + collapse-key push
+        else gws.foreach(_.deliver(m))
+      m.id
+
+  def resume(convId: Long, bucket: Int, cursor: Long): Seq[Message] =
+    store.since(convId, bucket, cursor)     // clustering-key range scan
+```
+
+`submit` persists before delivering, so a gateway crash costs a retransmission rather than a lost message; `resume` is the reconnect path that repairs it.
+
+| Decision | Low-cost option | Scale option |
 |---|---|---|
-| Ordering | DB autoincrement per conversation | Snowflake IDs from owner shard |
-| Group delivery | Push body to all members | Push notify + client pull (large channels) |
-| History | Store-and-forward, delete on ack | Bucketed wide rows, years of retention |
-| Presence | Push all changes | Subscriptions + TTL'd registry keys |
+| Ordering | Per-conversation autoincrement in the database | Snowflake identifiers from the owner shard |
+| Group delivery | Push body to all members | Push notification plus client pull for large channels |
+| History | Store-and-forward, delete on acknowledgement | Bucketed wide rows, multi-year retention |
+| Presence | Push every change | Subscriptions plus TTL'd registry keys |
 
-**Try next:** build the smallest honest version — one gateway process, Redis session registry, the bucketed schema in ScyllaDB or SQLite — then kill a client mid-conversation and verify the cursor-based catch-up replays exactly the missed range, no dupes, no gaps.
+## Pitfalls
+
+- **Delivering before persisting.** The sender sees a sent receipt, the owner shard crashes before the append commits, and the message is absent from every reader's cursor replay — a permanent gap rather than a retry.
+- **Unbucketed partitions.** A single busy channel accumulates one unbounded partition; compaction and repair times grow with it, and the node hosting that partition slows for every other partition it holds.
+- **Assigning identifiers at the gateway rather than the owner shard.** Two gateways stamp concurrent messages from clock-skewed hosts, and clients sorting by identifier render the reply before the message it answers.
+- **Treating presence as durable.** Registry entries written without a TTL survive an ungraceful socket close, so users remain "online" indefinitely and messages route to a gateway that no longer holds the connection.
+- **Push notifications without a collapse key.** A burst of 50 group messages produces 50 device notifications, and the notification cost, not the message cost, becomes the scaling limit.
+- **Cursor advanced on receipt rather than on application.** A client that acknowledges a range before writing it to local storage loses that range on a crash, and the next reconnect requests only newer messages, leaving a hole no retry closes.
+- **Ignoring the retention model at design time.** A store-and-forward queue sized for transient state cannot absorb a later product decision to retain history; the storage requirement changes by orders of magnitude, not by a factor.

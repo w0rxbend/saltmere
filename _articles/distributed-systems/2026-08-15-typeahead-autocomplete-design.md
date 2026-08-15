@@ -1,8 +1,8 @@
 ---
-title: "Design Typeahead Autocomplete: Precompute Top-k, Then Argue About Where"
+title: "Typeahead Autocomplete: Precomputed Top-k per Prefix"
 date: 2026-08-15
 track: distributed-systems
-summary: "Autocomplete has a ~100ms budget per keystroke, so nobody ranks at query time — you precompute top-k completions per prefix and argue about where they live: a trie with cached top-k per node, or a Redis sorted set per prefix (the Prefixy approach). Covers offline vs streaming aggregation, prefix sharding, and what Facebook's typeahead adds for personalization."
+summary: "Autocomplete has roughly a 100 ms budget per keystroke, so ranking at query time is excluded; the top-k completions are precomputed per prefix and served with one lookup. Covers the trie with cached top-k, the Redis sorted-set-per-prefix model (Prefixy), batch versus streaming aggregation, prefix sharding, and the personalization split in Facebook's typeahead."
 reading_time: 6
 tags: [system-design, autocomplete, trie, redis, interview-prep]
 sources:
@@ -16,75 +16,85 @@ sources:
     url: "https://www.elastic.co/docs/reference/elasticsearch/rest-apis/search-suggesters"
 ---
 
-Every keystroke in a search box fires a query, and the answer must come back before the next keystroke — Facebook's typeahead team put the budget bluntly: with a ~100ms window, "late answers are wrong answers." That budget bans the obvious design (scan queries matching prefix, rank by frequency, at request time). The entire game is **precomputing the top-k completions for every prefix** and serving them with one cheap lookup. The interview is about where that precomputed data lives and how it gets refreshed.
+**Gist.** Every keystroke in a search box issues a request whose answer must arrive before the next keystroke; Facebook's typeahead write-up frames the constraint as a budget on the order of 100 ms, past which a result is no longer useful because the query text has already changed. That budget excludes the direct design — scan the phrases matching the prefix, rank by frequency, at request time — so the **top-k completions are precomputed for every prefix** and a request becomes a single lookup. The cost is space and staleness: each phrase is replicated along its whole prefix path, and the precomputed ranking reflects whenever the aggregation last ran.
 
 ## Trie with top-k cached at every node
 
-The textbook structure: a trie over historical queries, where each node additionally stores the k best completions in its subtree. Lookup = walk the prefix (O(len(prefix))), return the node's cached list. No subtree traversal at query time — that's the point.
+The classical structure is a trie over historical queries in which **each node additionally stores the k best completions in its subtree**. Lookup walks the prefix in O(len(prefix)) character steps and returns the node's cached list. **No subtree traversal happens at query time**; that is the invariant the structure exists to maintain, and every write must restore it.
 
-```python
-import heapq
+Maintaining it means a phrase of length L is pushed into L bounded heaps, one per proper prefix. Hot phrases are therefore replicated along their entire prefix path — memory traded for read latency. Production variants compress paths (radix/Patricia), cap the depth at which full top-k lists are stored, and serialize the structure into **immutable snapshots swapped atomically** on the serving hosts. Elasticsearch's completion suggester is this idea productized: it uses purpose-built in-memory structures (finite state transducers, FSTs) that the reference documents as "costly to build," and builds them at index time rather than query time.
 
-class Node:
-    __slots__ = ("children", "topk")
-    def __init__(self):
-        self.children, self.topk = {}, []   # topk: [(count, phrase)]
+### Implementation sketch (Scala)
 
-class Trie:
-    def __init__(self, k=5):
-        self.root, self.k = Node(), k
+```scala
+final case class Suggestion(phrase: String, count: Long)
 
-    def insert(self, phrase, count):
-        node = self.root
-        for ch in phrase:
-            node = node.children.setdefault(ch, Node())
-            heapq.heappush(node.topk, (count, phrase))   # push onto every
-            if len(node.topk) > self.k:                  # prefix's heap,
-                heapq.heappop(node.topk)                 # evict the min
-        # (a real build dedupes phrase re-inserts; fine for batch rebuild)
+final class Node(val children: scala.collection.mutable.Map[Char, Node] =
+                   scala.collection.mutable.Map.empty):
+  // Min-ordered by count: the head is the weakest survivor, evicted first.
+  val topK: scala.collection.mutable.PriorityQueue[Suggestion] =
+    scala.collection.mutable.PriorityQueue.empty(
+      Ordering.by[Suggestion, Long](-_.count))
 
-    def suggest(self, prefix):
-        node = self.root
-        for ch in prefix:
-            if ch not in node.children:
-                return []
-            node = node.children[ch]
-        return [p for _, p in sorted(node.topk, reverse=True)]
+final class TopKTrie(k: Int):
+  private val root = Node()
+
+  /** Restores the invariant "every prefix node holds the k best of its
+    * subtree" by touching exactly len(phrase) nodes. */
+  def insert(phrase: String, count: Long): Unit =
+    var node = root
+    for ch <- phrase do
+      node = node.children.getOrElseUpdate(ch, Node())
+      node.topK.enqueue(Suggestion(phrase, count))
+      if node.topK.size > k then node.topK.dequeue()
+
+  def suggest(prefix: String): Seq[String] =
+    prefix
+      .foldLeft(Option(root))((n, ch) => n.flatMap(_.children.get(ch)))
+      .toSeq
+      .flatMap(_.topK.toSeq.sortBy(-_.count).map(_.phrase))
 ```
 
-Space is the catch: a phrase of length L is pushed into L heaps, so hot phrases are replicated along their whole prefix path — deliberately trading memory for read speed. Production versions compress (radix/Patricia paths), cap depth (nobody needs suggestions for 60-char prefixes; store full top-k only for prefixes up to ~10 chars), and serialize the trie into weekly-built immutable snapshots. Elasticsearch's completion suggester is this idea productized — purpose-built in-memory structures (FSTs) that are "costly to build," which is why they're constructed at index time, not query time.
+A batch build feeds each distinct phrase once with its aggregated count; re-inserting the same phrase with a new count admits duplicates into the heaps and must be deduplicated by the builder.
 
-## The Redis alternative: a sorted set per prefix
+## The Redis alternative: one sorted set per prefix
 
-You don't need a literal trie. **Prefixy** (a nice public case study) and a long line of Redis folklore starting with antirez's 2010 post flatten the trie into a hash: for every prefix, keep a **Redis sorted set** `prefix → {completion: score}`.
+A literal trie is not required. **Prefixy**, a published case study, and a line of Redis practice starting with antirez's post flatten the trie into a keyspace: for every prefix, keep a **Redis sorted set** mapping completion to score.
 
-- Read: `ZREVRANGE "how " 0 4` → top-5 completions, O(log N + k), one round trip.
-- Write: user submits query q → for each prefix of q: `ZINCRBY prefix 1 q`. Score bumps and re-ranking happen atomically in one command per prefix.
+- Read: `ZREVRANGE "how " 0 4` returns the top five completions in O(log N + k) over one network round trip.
+- Write: for each prefix of a submitted query `q`, issue `ZINCRBY prefix 1 q`. The score bump and the re-ranking are a **single atomic command per prefix**.
 
-antirez's original trick predates `ZADD`-per-prefix designs: he stored *every prefix as a member* of one sorted set with score 0, so lexicographic ordering made a binary search (`ZRANK` + `ZRANGE`) return completions — clever when memory was tight, but the set-per-prefix model with real frequency scores is what you'd ship today. Prefixy's stated trade-off applies to both: "we trade space for time," accepting the prefix explosion because read speed is the product.
+antirez's original construction differs: it stores *every prefix as a member* of one sorted set with score 0, so lexicographic ordering makes a `ZRANK` plus `ZRANGE` binary search yield completions. The set-per-prefix model carries real frequency scores instead, at the cost of one key per distinct prefix. Prefixy describes this as trading space for time: the prefix explosion is accepted because read latency is the product.
 
 | | Trie + cached top-k | Redis ZSET per prefix | ES completion suggester |
 |---|---|---|---|
 | Read | O(len(prefix)), in-process | O(log N + k), 1 network hop | FST walk, HTTP hop |
-| Update | rebuild/patch snapshot | `ZINCRBY`, live | reindex docs |
-| Freshness | batch (hours–week) | seconds | near-real-time index |
-| Ops | custom service + snapshots | stock Redis, easy sharding | you already run ES? |
+| Update | rebuild or patch snapshot | `ZINCRBY`, live | reindex documents |
+| Freshness | one batch cadence | one write round trip | near-real-time index |
+| Ops | custom service plus snapshots | stock Redis, sharded by key | reuses an existing cluster |
 
-## Getting the counts: weekly batch vs streaming
+## Obtaining the counts: batch versus streaming
 
-Where do scores come from? Log every submitted query, then:
+Scores derive from a log of submitted queries, aggregated one of two ways.
 
-- **Offline aggregation (the classic answer):** MapReduce/Spark job aggregates the query log (say, weekly or daily), computes per-phrase counts with time decay, builds top-k per prefix, ships immutable trie snapshots to servers, atomically swaps pointers. Simple, testable, and rank stability is a *feature* — suggestions shouldn't jitter per keystroke.
-- **Streaming updates:** consume the query stream and `ZINCRBY` live (the Prefixy model), or push through a stream processor that maintains per-prefix top-k. Needed if "breaking news" must surface in minutes. The costs: hot-key contention on short prefixes, and unbounded phrase cardinality — cap ZSET sizes (`ZREMRANGEBYRANK` after insert) and consider a Count-Min Sketch for the long tail of counts, which the corpus covers in the [heavy hitters article](/articles/distributed-systems/2026-08-10-count-min-sketch).
+- **Offline aggregation.** A MapReduce or Spark job aggregates the query log on a fixed cadence, computes per-phrase counts with time decay, builds top-k per prefix, ships immutable trie snapshots, and swaps pointers atomically. The pipeline is testable, and **rank stability is a property rather than a defect** — suggestions should not reorder between adjacent keystrokes.
+- **Streaming updates.** The query stream is consumed and applied with `ZINCRBY` (the Prefixy model), or fed to a stream processor maintaining per-prefix top-k. This is what surfaces newly trending queries without waiting for the next batch. Two costs follow: **hot-key contention on short prefixes**, since every query increments its one- and two-character prefixes, and **unbounded phrase cardinality** per prefix, which requires trimming (`ZREMRANGEBYRANK` after insert) and, for the long tail of counts, a sketch such as the one described in the [heavy hitters article](/articles/distributed-systems/2026-08-10-count-min-sketch).
 
-Most real systems are hybrid: batch job owns the baseline ranking; a small streaming layer overlays trending queries.
+Hybrids are common: the batch job owns the baseline ranking and a smaller streaming layer overlays trending queries.
 
 ## Sharding, the client, and personalization
 
-**Shard by prefix**, not by phrase: hash the first 2–3 characters so `"ho"` and everything under it lands on one shard, and any request touches exactly one shard. Naive alphabetical range sharding ('a–d', 'e–h', ...) creates hot shards — letter frequency is wildly skewed — so hash prefixes, and further split individual scorching prefixes ("t", "th") onto dedicated replicas. Short prefixes (1 char) are both hottest and least useful; many systems don't even query the backend until 2–3 chars and serve single-char prefixes from a tiny static list cached at the edge or in the client.
+**Shard by prefix, not by phrase.** Hashing the first two or three characters places `"ho"` and its whole subtree on one shard, so any request touches exactly one shard. Alphabetical range sharding ('a–d', 'e–h', …) produces hot shards because letter frequency is skewed; hashing spreads them, and individually scorching prefixes can be split onto dedicated replicas. One-character prefixes are simultaneously the hottest and the least selective, which is why many systems do not query the backend below two or three characters and serve the shortest prefixes from a small static list held in the client or at the edge.
 
-The **client** is part of the system: debounce keystrokes (~50–150ms) so fast typers don't fire a request per character, cancel in-flight requests when a newer one supersedes them, discard out-of-order responses (attach the prefix or a sequence number), and cache prefix→results locally — a backspace should never hit the network.
+The **client is part of the system**. Keystrokes are debounced so that a fast typist does not emit one request per character; in-flight requests are cancelled when a newer one supersedes them; **responses must be matched to their prefix or a sequence number and discarded when out of order**, since a stale reply that arrives last will otherwise overwrite the correct suggestions; and a local prefix-to-results cache keeps a backspace off the network.
 
-**Personalization** is what separates Google-bar autocomplete from Facebook's typeahead. Facebook's architecture: on first focus, the browser *bootstraps* the user's first-degree graph (friends, pages, events) into client-side cache, so the likeliest results complete with zero network. Backend-side, a stateless **aggregator** fans each prefix out to specialized leaf services — a global (unpersonalized) index and a graph-proximity service — then merges and re-ranks with the user's signals, with memcached in front of the global leaves. The general pattern: keep the shared prefix→top-k machinery unpersonalized and cacheable, then re-rank the final ~20 candidates per user at the edge.
+**Personalization** is the axis on which Facebook's typeahead differs from an unpersonalized search bar. On first focus, the browser bootstraps the user's first-degree graph — friends, pages, events — into a client-side cache, so the likeliest results complete without a network call. Server-side, a stateless **aggregator** fans each prefix out to specialized leaf services, including a global unpersonalized index and a graph-proximity service, then merges and re-ranks the results using the user's signals, with memcached in front of the global leaves. The structural pattern is to keep the shared prefix-to-top-k machinery unpersonalized and therefore cacheable, and to re-rank only the small final candidate set per user.
 
-**Try next:** build the ZSET-per-prefix design against a real query log (AOL or Wikipedia clickstream), then add a 100ms-debounced HTML input and measure p99 keystroke-to-render — then try shipping the trie version and see which one you'd rather operate.
+## Pitfalls
+
+- **Re-inserting a phrase with an updated count into a live trie.** The old entry remains in every ancestor heap, so the same phrase appears twice in a suggestion list with different scores; batch builders must aggregate counts before insertion.
+- **Alphabetical range sharding.** Letter frequency is skewed, so the shard owning common initial letters saturates while others idle.
+- **Untrimmed sorted sets under streaming writes.** Every distinct query ever typed under a prefix stays resident, so memory grows with query cardinality rather than with k.
+- **No sequence number on client responses.** A slower request for a shorter prefix returns after a faster one for a longer prefix, and the suggestion list reverts to results for text the user has already passed.
+- **Querying the backend on the first character.** Single-character prefixes concentrate the highest request rate on the fewest distinct answers, and the answers are too unselective to be useful.
+- **Treating batch freshness as a bug.** Rebuilding rankings continuously makes suggestions reorder between keystrokes, which is visible to the user as flicker in the list.

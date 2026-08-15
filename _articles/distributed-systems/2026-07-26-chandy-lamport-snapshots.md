@@ -1,9 +1,9 @@
 ---
-title: "Chandy-Lamport snapshots: photographing a running distributed system"
+title: "Chandy-Lamport snapshots: recording a running distributed system"
 date: 2026-07-26
 track: distributed-systems
-summary: "How the Chandy-Lamport algorithm records a consistent global state of a running distributed system using markers over FIFO channels — and why the same idea powers Flink's exactly-once checkpoints."
-reading_time: 5
+summary: "How the Chandy-Lamport algorithm records a consistent global state of a running distributed system using markers over FIFO channels, and how the same idea underlies Flink's exactly-once checkpoints."
+reading_time: 6
 tags: [snapshots, chandy-lamport, global-state, consistent-cut, van-steen, flink]
 sources:
   - title: "Chandy & Lamport, Distributed Snapshots: Determining Global States of Distributed Systems (ACM TOCS 1985) — PDF"
@@ -18,98 +18,99 @@ sources:
     url: "https://www.distributed-systems.net/index.php/books/ds4/"
 ---
 
-You want to answer a question about a running system: is it deadlocked? How much money is in all the accounts combined? Can I restart from here after a crash? Each answer needs a *global state* — the local state of every process plus every message currently in flight. But there is no global clock and no way to freeze everyone at once. If you poll each process at a different moment, you get a Frankenstein state: a transfer already debited from account A but not yet credited to B, so the money simply vanishes.
+**Gist.** Questions such as "is the system deadlocked?" or "what is the sum of all account balances?" require a *global state*: the local state of every process plus every message still in transit, and no global clock exists to freeze all processes at one instant. Chandy and Lamport's 1985 algorithm records a **consistent cut** of a running system by pushing a control token — the **marker** — through first-in-first-out (FIFO) channels, without halting the system and without synchronized clocks. The cost is that the recorded state need not correspond to any instant of wall-clock time: it is a state the system *could* have passed through, which is sufficient for stable properties and for restart, but not for questions whose answers change over time.
 
-Chandy and Lamport's 1985 algorithm records a global state that is *consistent* — one that could have occurred — without stopping the system and without a synchronized clock. It's the theoretical bedrock under checkpointing, distributed deadlock detection, and modern stream processors like Apache Flink.
+Polling processes one at a time yields an inconsistent state instead. A transfer debited from account A and not yet credited to B is recorded with the money absent from both, because the in-flight message carrying the credit belongs to no recorded location.
 
 ## The model: processes and FIFO channels
 
-The system is a set of processes connected by unidirectional **channels**. Two assumptions do the heavy lifting:
+The system is a set of processes connected by unidirectional **channels**. Two assumptions carry the correctness argument:
 
-| Assumption | Why it matters |
+| Assumption | Consequence |
 |---|---|
-| Channels are **FIFO** and reliable | Messages arrive in the order sent, none lost or duplicated |
-| Channels have nonzero, unbounded latency | Messages can be "in transit" — that's exactly the state we must capture |
+| Channels are **FIFO** and reliable | Messages arrive in send order; none lost or duplicated |
+| Channel delay is arbitrary but finite | Messages can be *in transit*, and that transit content is part of the state to capture |
 
-The global state is the collection of every process's local state *plus* the contents of every channel. Capturing the channels is the whole trick: a naive snapshot that only reads process states misses the in-transit messages, and those are where inconsistencies hide.
+The global state is the collection of every process's local state **plus the contents of every channel**. Capturing the channels is the load-bearing part: a snapshot that reads process states only omits the in-transit messages, and those are where the inconsistency resides.
 
-Any process can start a snapshot at any time; multiple can start concurrently. The mechanism is a single control message: the **marker**.
+Any process may initiate a snapshot at any time, and several may initiate concurrently. The algorithm carries no snapshot coordinator.
 
 ## The marker rules
 
-A marker is a special token pushed into channels. Because channels are FIFO, a marker acts as a clean divider: everything that arrives *before* the marker belongs to the pre-snapshot past on that channel; everything *after* belongs to the future. There are exactly two rules.
+A marker is a distinguished token pushed into channels. Because a channel is FIFO, the marker acts as a divider on that channel: everything arriving **before** it belongs to the recorded past, everything **after** it to the future. The algorithm consists of exactly two rules.
 
-```python
-class Process:
-    def __init__(self, pid, out_channels, in_channels):
-        self.pid = pid
-        self.recorded = False          # have I saved my own state yet?
-        self.my_state = None
-        self.channel_state = {c: [] for c in in_channels}   # captured in-transit msgs
-        self.recording = {c: False for c in in_channels}     # am I still logging this channel?
-        self.out_channels = out_channels
-        self.in_channels = in_channels
+- **Marker-sending rule.** A process records its own local state and then, **before sending any further application message**, emits a marker on each of its outgoing channels. An initiator applies this rule spontaneously.
+- **Marker-receiving rule.** On the **first** marker a process ever sees, it records its own state and records the arriving channel's state as **empty**. On every **subsequent** marker, it stops recording that channel; the application messages logged on it between the moment the process recorded its state and the arrival of the marker **are** that channel's recorded state.
 
-    def record_own_state_and_flood(self):
-        """Marker-Sending Rule (also how an initiator starts)."""
-        self.my_state = snapshot_local_state()   # e.g. account balance, deadlock flags
-        self.recorded = True
-        # Start logging every incoming channel for in-transit messages
-        for c in self.in_channels:
-            self.recording[c] = True
-            self.channel_state[c] = []
-        # Send a marker on every outgoing channel BEFORE any further app message
-        for c in self.out_channels:
-            send(c, Marker(self.pid))
+The algorithm terminates once every process has received a marker on each of its incoming channels. Each process then holds its own local state plus the state of each inbound channel, and the union over all processes is the global snapshot. The number of markers sent is one per channel per snapshot.
 
-    def on_marker(self, channel):
-        """Marker-Receiving Rule."""
-        if not self.recorded:
-            # First marker I've seen: this channel was empty at snapshot time
-            self.channel_state[channel] = []
-            self.recording[channel] = False
-            self.record_own_state_and_flood()
-        else:
-            # Already recorded: the marker closes this channel's log.
-            # Everything logged since I recorded == messages in transit.
-            self.recording[channel] = False
+### Implementation sketch (Scala)
 
-    def on_app_message(self, channel, msg):
-        deliver(msg)
-        # If I've recorded but this channel is still open, msg was in flight
-        if self.recorded and self.recording[channel]:
-            self.channel_state[channel].append(msg)
+```scala
+final case class Marker(from: Int)
+
+final class Process(
+    val pid: Int,
+    inChannels: Set[Int],
+    outChannels: Set[Int],
+    send: (Int, Any) => Unit,
+    deliver: Any => Unit,
+    localState: () => Any
+):
+  private var recorded: Boolean = false
+  private var myState: Option[Any] = None
+  private val channelLog = collection.mutable.Map.from(inChannels.map(_ -> Vector.empty[Any]))
+  private val recording = collection.mutable.Map.from(inChannels.map(_ -> false))
+
+  /** Marker-sending rule; also how an initiator begins. */
+  def recordAndFlood(): Unit =
+    myState = Some(localState())
+    recorded = true
+    inChannels.foreach { c => recording(c) = true; channelLog(c) = Vector.empty }
+    // Must precede any further application message on these channels.
+    outChannels.foreach(c => send(c, Marker(pid)))
+
+  /** Marker-receiving rule. */
+  def onMarker(c: Int): Unit =
+    if !recorded then
+      recordAndFlood()
+      // First marker: this channel carried nothing across the cut, so close it
+      // again after the flood, which armed every inbound log.
+      channelLog(c) = Vector.empty
+    recording(c) = false // closes the log; what was logged is the channel state
+
+  def onAppMessage(c: Int, msg: Any): Unit =
+    deliver(msg)
+    if recording(c) then channelLog(c) = channelLog(c) :+ msg
 ```
 
-Read the two rules carefully:
+## Why the recorded cut is consistent
 
-- **Marker-sending rule.** A process records its own state, then — before sending any further application message — emits a marker on each outgoing channel. The initiator simply invokes this rule spontaneously.
-- **Marker-receiving rule.** On the *first* marker a process ever sees, it records its own state and marks the arriving channel as empty. On *subsequent* markers, it stops recording the channel; the messages it logged between recording its state and receiving that marker *are* the channel's captured state.
+The recorded state may never have held at any single instant of wall-clock time. What holds is that it is a **consistent cut**: for every message recorded as *received*, the corresponding *send* is also in the recorded past. No effect appears without its cause.
 
-The algorithm terminates once every process has received a marker on all of its incoming channels. Each process ends up holding its own local state and the state of each inbound channel; the union is the global snapshot.
+FIFO ordering supplies this. Let process *p* record its state and immediately emit a marker on channel *c* to *q*. Any application message *p* sends on *c* afterwards queues **behind** the marker, so *q* processes it only after the marker and classifies it as post-snapshot. Conversely, a message *p* sent **before** recording reaches *q* ahead of the marker; if *q* has already recorded its own state, *q* logs that message as in-transit. The combination excludes the case of a message received in the recorded past but sent in the recorded future — the **orphan message**, which is precisely what makes a cut inconsistent.
 
-## Why the cut is a consistent cut
-
-The recorded state may never have existed at any single instant of wall-clock time — and that's fine. What matters is that it is a **consistent cut**: for every message included as *received*, its *send* is also part of the recorded past. No effect appears without its cause.
-
-FIFO ordering is what guarantees this. Suppose process p records its state and immediately fires a marker down channel c to q. Any application message p sends on c *after* the marker sits behind it in the queue, so q processes it only after the marker — meaning q sees it as post-snapshot. Conversely, a message p sent *before* recording arrives at q ahead of the marker; if q had already recorded, q logs it as in-transit. There is no way for a message to be "received-in-the-past but sent-in-the-future." That impossible case — an orphan message — is precisely what makes a cut *inconsistent*, and the marker discipline rules it out.
-
-So the snapshot is reachable from the actual initial state and can reach the actual current state. For a *stable property* — one that stays true once true, like a deadlock or termination — this is enough: if the property holds in the snapshot, it holds now.
+The recorded state is therefore reachable from the actual initial state and can reach the actual current state. For a **stable property** — one that remains true once it becomes true, such as deadlock or termination — this suffices: a stable property holding in the snapshot holds now. For an unstable property the implication fails in both directions, because the snapshot corresponds to a point the system may have already left.
 
 ## From deadlock detection to Flink's exactly-once
 
-The classic uses are **detecting stable properties**: distributed deadlock (a wait-for cycle won't spontaneously heal) and termination detection. Van Steen and Tanenbaum present it in the coordination chapter as the canonical way to obtain a global state without global time.
+The classical applications are **detection of stable properties**: distributed deadlock, where a wait-for cycle does not spontaneously dissolve, and termination detection. Van Steen and Tanenbaum present it as the means of obtaining a global state in the absence of global time.
 
-The modern reincarnation is stream processing. Flink's **Asynchronous Barrier Snapshotting** (Carbone et al., 2015) is Chandy-Lamport adapted to dataflow graphs: the marker becomes a **barrier** injected at the sources and flowing with the records. When an operator has received the barrier for checkpoint *n* on all inputs (it *aligns* the barriers), it snapshots its state and forwards the barrier downstream — exactly the marker-receiving rule. Because channels between operators are FIFO, the aligned snapshot is a consistent cut of the pipeline, and Flink can persist it and, on failure, restore every operator plus the in-flight records to give **exactly-once** processing.
+The modern instance is stream processing. Flink's **Asynchronous Barrier Snapshotting (ABS)** (Carbone et al., 2015) adapts the algorithm to dataflow graphs: the marker becomes a **checkpoint barrier** injected at the sources and carried along with the records. When an operator has received the barrier for checkpoint *n* on all of its inputs — barrier **alignment** — it snapshots its state and forwards the barrier downstream, which is the marker-receiving rule. Because the stream partitions between operators are FIFO, the aligned snapshot is a consistent cut of the pipeline; Flink persists it and, on failure, restores operator state from it, which gives **exactly-once state semantics** — each record affects the persisted state once. Alignment also lets ABS avoid recording channel contents in the acyclic case: an operator that has seen the barrier on one input stalls that input until the barrier arrives on the rest, so nothing is in flight across the cut. End-to-end exactly-once additionally requires sinks that participate in the checkpoint, and Flink's unaligned checkpoints trade the stall back for recorded in-flight records.
 
 | Chandy-Lamport (1985) | Flink ABS |
 |---|---|
 | Marker | Checkpoint barrier |
 | FIFO channel | FIFO stream partition |
 | Record process state on first marker | Operator snapshots state when barriers align |
-| Channel state = logged in-transit messages | In-flight records between operators |
+| Channel state = logged in-transit messages | Nothing recorded under alignment; in-flight records only for unaligned checkpoints |
 | Consistent cut of a general graph | Consistent cut of the dataflow DAG |
 
-The mechanism is 40 years old and still shipping in production the moment you enable checkpointing on a stream job.
+## Pitfalls
 
-**Try next:** Implement the `Process` class above over three nodes with FIFO queues and a bank-transfer workload, have node 0 initiate a snapshot mid-transfer, then assert that summing all process states *plus* all captured channel states always yields the conserved total — even when a transfer is in flight.
+- **Non-FIFO channels break the cut.** With reordering, an application message sent after the marker can overtake it and be logged as in-transit, or a pre-marker message can arrive after the marker and be dropped from the snapshot; the result is a state where a receive has no matching send.
+- **Sending an application message between recording state and emitting markers** places that message on the wrong side of the divider on every affected channel, so the receiver treats a post-snapshot message as pre-snapshot.
+- **Reading process states without channel states** is the common shortcut, and it loses exactly the in-flight messages: a bank workload snapshotted this way reports a total short by the value of every transfer in transit.
+- **Interpreting the snapshot as an instant.** The recorded state may never have existed at any wall-clock moment; conclusions drawn from it are sound only for stable properties or for restart, not for "the system looked like this at 12:00:00".
+- **Assuming termination without inbound marker coverage.** A process with an incoming channel that never delivers a marker — because the sender crashed or the channel is unreliable — leaves its channel log open, and the snapshot never completes; the algorithm assumes reliable channels and does not itself tolerate process failure.
+- **Concurrent initiators are not merged.** Independent initiations produce independent snapshots; and a process that does not distinguish markers belonging to different snapshots mixes two cuts into one recorded state.

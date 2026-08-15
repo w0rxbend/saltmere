@@ -1,9 +1,9 @@
 ---
-title: "Erasure coding: how object stores get 11 nines without 3x the disks"
+title: "Erasure coding: eleven nines of durability without 3x the disks"
 date: 2026-08-13
 track: distributed-systems
-summary: "Reed–Solomon striping cuts storage overhead from 3.0x to 1.4x while tolerating more failures — the trade is repair traffic, which local reconstruction codes (Azure LRC) attack. The overhead math, the durability math behind \"11 nines\", and where EC backfires: small objects and hot data."
-reading_time: 6
+summary: "Reed–Solomon striping cuts storage overhead from 3.0x to 1.4x while tolerating more simultaneous failures; the cost is repair traffic, which local reconstruction codes (Azure LRC) reduce. Covers the overhead arithmetic, the durability model behind \"eleven nines\", and the cases where erasure coding backfires: small objects and hot data."
+reading_time: 7
 tags: [erasure-coding, object-storage, reed-solomon, durability, ceph]
 sources:
   - title: "Erasure Coding in Windows Azure Storage — Huang et al. (USENIX ATC 2012, Best Paper)"
@@ -18,11 +18,11 @@ sources:
     url: "https://docs.ceph.com/en/reef/rados/operations/erasure-code/"
 ---
 
-"Design S3" interviews usually stall at the same point: the candidate says "replicate every object three times" and the interviewer asks what that costs at an exabyte. Three copies means buying 3 PB of disk per PB of data. Real object stores don't do that for bulk data — they erasure-code it, which is how you get more durability than 3x replication for half the overhead. Here's the math and the catches.
+**Gist.** Storing three full copies of every object costs 3 PB of disk per PB of data, which does not scale to exabyte fleets. Reed–Solomon erasure coding replaces copies with algebraic redundancy: an object is split into *k* data shards plus *m* parity shards, and any *k* of the *k+m* shards reconstruct the original, giving more failure tolerance at roughly 1.3–1.5x overhead. The cost is repair: replacing one lost shard requires reading *k* surviving shards and decoding, so a disk replacement generates an order of magnitude more cluster traffic than a replica copy.
 
-## Replication vs Reed–Solomon
+## Replication versus Reed–Solomon
 
-Reed–Solomon coding RS(k, m) splits an object (or a fixed-size stripe) into **k data shards**, computes **m parity shards**, and spreads all k+m across different disks, hosts, or availability zones. *Any* k of the k+m shards reconstruct the original — you can lose any m. Storage overhead is (k+m)/k, and fault tolerance is decoupled from copy count:
+Reed–Solomon coding RS(k, m) splits an object — or a fixed-size stripe of it — into **k data shards**, computes **m parity shards**, and places all k+m shards in distinct failure domains: separate disks, hosts, racks, or availability zones. The reconstruction property is that **any k of the k+m shards suffice**; consequently any m simultaneous losses are survivable. Storage overhead is (k+m)/k, which decouples fault tolerance from copy count.
 
 | Scheme | Raw bytes per byte stored | Survives | Repairing 1 lost shard reads |
 |---|---|---|---|
@@ -30,41 +30,76 @@ Reed–Solomon coding RS(k, m) splits an object (or a fixed-size stripe) into **
 | RS(6,3) | 1.5x | any 3 failures | 6 shards (6x the lost data) |
 | RS(10,4) | 1.4x | any 4 failures | 10 shards (10x the lost data) |
 
-RS(10,4) beats 3x replication on *both* axes that matter for durability and cost — it survives four failures instead of two at less than half the footprint. Backblaze runs 17+3 across 20 pods in a "vault" (1.18x overhead); S3 erasure-codes across hosts and AZs, as Andy Warfield's write-up confirms. So why does anyone still replicate? The third column.
+RS(10,4) dominates 3x replication on both durability and cost: four tolerated failures instead of two, at less than half the footprint. Backblaze runs 17+3 across 20 pods in a "vault", an overhead of 1.18x. Warfield's account of S3 describes erasure-coded shards spread across large numbers of drives and hosts. The remaining advantage of replication is entirely in the third column.
 
-## Repair traffic, and the Azure LRC trick
+## Repair traffic and local reconstruction codes
 
-When a disk dies under replication, you copy each lost object once. Under RS(10,4), reconstructing each lost shard means reading **ten** surviving shards and running the decode — a dead 16 TB disk triggers ~160 TB of cluster reads. Repair traffic competes with foreground I/O, and slow repair directly erodes durability (more on that below).
+Under replication, a dead disk is repaired by copying each lost object once: repair traffic equals lost data. Under RS(10,4), each lost shard is reconstructed by reading **ten surviving shards** and decoding, so a failed 16 TB disk induces on the order of 160 TB of cluster reads. That traffic competes with foreground I/O, and because durability depends on repair completing before further failures accumulate, **slow repair is a durability defect, not only a performance one**.
 
-The Azure **Local Reconstruction Codes** paper (USENIX ATC 2012) attacks exactly this. LRC(12,2,2) keeps 12 data shards, adds 2 *global* parities, and splits the data into two groups of 6, each with its own *local* parity. The dominant failure — one lost shard — is now repaired from the 6 shards in its group, not 12+. Cost: 16/12 = 1.33x overhead, and it tolerates any 3 failures plus the large majority of 4-failure patterns. The paper's punchline: same average repair cost as RS(6,3) but 1.33x instead of 1.5x overhead, which at Azure's scale paid for the research many times over. Ceph and HDFS both grew LRC-style plugins for the same reason.
+The Azure **Local Reconstruction Codes (LRC)** work (Huang et al., USENIX ATC 2012) targets this cost. LRC(12,2,2) keeps 12 data shards, adds 2 *global* parity shards, and partitions the data into two groups of six, each group carrying its own *local* parity. **The single-shard failure — the dominant case — is then repaired from the six shards of its own group**, rather than from twelve. The resulting overhead is 16/12 ≈ 1.33x, and the code tolerates any 3 failures plus the large majority of 4-failure patterns. Stated against Reed–Solomon: the same single-shard reconstruction cost as RS(6,3) at 1.33x rather than 1.5x overhead. Ceph ships an LRC erasure-code plugin.
 
 ## The shape of an S3-style store
 
-Two planes, deliberately separated:
+Two planes are kept separate.
 
-- **Metadata path:** key → (stripe layout, shard locations, version). A replicated, strongly consistent index — quorum-replicated and typically [LSM-backed](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees) — handles PUT/GET lookups, multipart bookkeeping, and listing. This is where consistency lives.
-- **Data path:** shards land on storage nodes chosen so no two shards of a stripe share a failure domain (disk, host, rack, AZ) — placement is the [consistent-hashing / placement-map problem](/articles/distributed-systems/2026-07-25-consistent-hashing-ring) again. A background repair service watches for missing shards and reconstructs onto fresh disks.
+- **Metadata path.** Key → (stripe layout, shard locations, version). This index is quorum-replicated, strongly consistent, and typically [LSM-backed](/articles/distributed-systems/2026-08-10-lsm-trees-vs-b-trees); it serves PUT/GET lookups, multipart bookkeeping and listing. **Consistency lives here, not in the data path.**
+- **Data path.** Shards are placed such that **no two shards of one stripe share a failure domain**, which is the [consistent-hashing / placement-map problem](/articles/distributed-systems/2026-07-25-consistent-hashing-ring) again. A background repair service detects missing shards and reconstructs them onto fresh disks.
 
-A common production pattern (Azure does this explicitly): writes first land 3x-replicated in an append-only journal for low latency, then sealed extents are erasure-coded lazily and the replicas dropped. Hot recent data pays replication's overhead briefly; cold bulk pays 1.3–1.5x forever.
+Azure applies a two-stage write path explicitly: writes first land 3x-replicated in an append-only journal, obtaining low write latency; sealed extents are then erasure-coded asynchronously and the replicas released. Recent data therefore pays replication overhead briefly, and cold bulk data pays 1.3–1.5x indefinitely.
 
-## Where "11 nines" comes from
+## Deriving "eleven nines"
 
-Durability claims are a race between failure and repair: you lose data only if **m+1 shards of one stripe die before repair completes**. Ballpark it with a binomial: disk AFR of 1% and a 1-day repair window gives per-window failure probability p ≈ 0.01/365 ≈ 2.7×10⁻⁵. For RS(10,4), losing 5 of 14 shards in one window:
+Durability is a race between failure arrival and repair completion: an object is lost only when **m+1 shards of the same stripe fail inside one repair window**. A binomial approximation with an annualised failure rate (AFR) of 1% and a one-day repair window gives a per-window per-disk failure probability p ≈ 0.01/365 ≈ 2.7×10⁻⁵. For RS(10,4), five of the fourteen shards must be lost:
 
 ```text
 P(loss/window) ≈ C(14,5) · p⁵ = 2002 · (2.7e-5)⁵ ≈ 3e-20
-P(loss/year)   ≈ 365 · 3e-20  ≈ 1e-17   →  comfortably past 11 nines
+P(loss/year)   ≈ 365 · 3e-20  ≈ 1e-17   →  past eleven nines
 ```
 
-Backblaze publishes this exact calculation (open-sourced in their `erasure-coding-durability` repo) for 17+3. Two honest caveats worth volunteering in an interview: the model assumes **independent** failures — a bad drive batch, a rack fire, or a software bug that corrupts whole stripes is correlated and dominates real risk, which is why shards cross failure domains — and it assumes repair actually finishes in the window, so repair bandwidth is a durability parameter, not a nicety.
+Backblaze applies the same style of calculation to its 17+3 vaults. Two limits of the model are worth stating explicitly. First, it assumes **independent failures**; a bad drive batch, a rack fire, or a software fault that corrupts whole stripes is correlated, and correlated risk dominates the observed loss rate — which is the reason shards are spread across failure domains in the first place. Second, it assumes repair completes within the assumed window, so **repair bandwidth is an input parameter of the durability figure**.
 
-## When EC hurts
+### Implementation sketch (Scala)
 
-- **Small objects.** A 4 KB object striped RS(10,4) produces fourteen tiny shards; per-shard fixed costs and metadata swamp the savings, and a GET costs k disk reads instead of one. Stores either pack small objects into larger stripes or just replicate them.
-- **Hot data.** Every degraded read (one shard slow or lost) becomes a k-way fan-out plus decode — tail latency multiplies. Replicas can serve a hot object from any copy.
-- **Overwrites.** Updating one byte means re-encoding the stripe; EC wants immutable, sealed data — which objects conveniently are.
+The arithmetic above is short enough to express directly, which makes the sensitivity to the repair window visible.
 
-Configuring it is anticlimactic:
+```scala
+final case class Code(k: Int, m: Int):
+  def shards: Int = k + m
+  def overhead: Double = shards.toDouble / k
+
+/** Probability that a single shard's disk fails within one repair window. */
+def perWindow(afr: Double, repairDays: Double): Double = afr * repairDays / 365.0
+
+def choose(n: Int, r: Int): Double =
+  (1 to r).foldLeft(1.0)((acc, i) => acc * (n - r + i) / i)
+
+/** Dominant term: exactly m+1 of the k+m shards lost inside one window. */
+def lossPerWindow(c: Code, p: Double): Double =
+  val lost = c.m + 1
+  choose(c.shards, lost) * math.pow(p, lost) * math.pow(1 - p, c.shards - lost)
+
+def lossPerYear(c: Code, afr: Double, repairDays: Double): Double =
+  val windows = 365.0 / repairDays
+  windows * lossPerWindow(c, perWindow(afr, repairDays))
+
+/** Repair reads per lost shard, in multiples of the shard size. */
+def repairAmplification(c: Code): Int = c.k        // Reed–Solomon
+def repairAmplificationLrc(groupSize: Int): Int = groupSize  // single-shard case
+
+val rs104 = Code(10, 4)
+lossPerYear(rs104, afr = 0.01, repairDays = 1.0)   // ~1e-17
+lossPerYear(rs104, afr = 0.04, repairDays = 7.0)   // orders of magnitude worse
+```
+
+The two calls at the end isolate the point: **degrading the repair window costs more nines than degrading disk quality**, because the window enters the expression raised to the power m+1.
+
+## Where erasure coding hurts
+
+- **Small objects.** A 4 KB object under RS(10,4) becomes fourteen very small shards; per-shard fixed costs and metadata exceed the capacity saved, and each GET performs k disk reads rather than one. Stores either pack small objects into larger stripes or replicate them.
+- **Hot data.** Any degraded read — one shard missing or slow — becomes a k-way fan-out plus a decode, multiplying tail latency. A replicated object can instead be served from whichever copy responds first.
+- **Overwrites.** Modifying one byte requires re-encoding the stripe. Erasure coding suits immutable, sealed data, which is what object storage holds.
+
+Configuration is comparatively small:
 
 ```bash
 # MinIO: 4 parity shards per erasure set (RS(4,4) on an 8-drive set)
@@ -75,4 +110,11 @@ ceph osd erasure-code-profile set ec42 k=4 m=2 crush-failure-domain=host
 ceph osd pool create ecpool erasure ec42
 ```
 
-**Try next:** clone Backblaze's `erasure-coding-durability` repo and re-run the durability model with a 4% AFR and a 7-day repair window — watch how many nines slow repair burns compared to cheap disks.
+## Pitfalls
+
+- Placing shards without a failure-domain constraint produces stripes whose shards share a rack or host; a single rack loss then removes more than m shards at once and the binomial durability estimate no longer applies.
+- Sizing repair bandwidth from average load ignores that repair traffic is bursty and proportional to k; during a disk replacement the cluster reads roughly k times the lost capacity, and foreground latency degrades until repair drains.
+- Quoting a nines figure computed under independent failures conceals the dominant real risk: correlated events such as a bad drive batch or a bug that corrupts every shard of a stripe identically.
+- Erasure-coding small objects directly inflates metadata and turns each GET into k reads; the capacity saved on a 4 KB object is smaller than the per-shard overhead it introduces.
+- Treating an erasure-coded pool as overwritable forces a full stripe re-encode per modification; the code is defined over a sealed stripe, not over individual bytes.
+- Reducing m to save capacity also reduces the exponent m+1 in the loss expression, so a one-shard reduction in parity moves durability by orders of magnitude, not by a fraction.

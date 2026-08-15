@@ -2,7 +2,7 @@
 title: "HyperLogLog: Counting Billions of Uniques in 12 Kilobytes"
 date: 2026-08-10
 track: distributed-systems
-summary: How a probabilistic sketch estimates the number of distinct elements in a stream using leading-zero counts and per-bucket maxima, why the sketches merge losslessly across shards, and how to build one in Python or drive Redis PFADD/PFCOUNT/PFMERGE.
+summary: How a probabilistic sketch estimates the number of distinct elements in a stream using leading-zero counts and per-bucket maxima, why the sketches merge losslessly across shards, and how the Redis PFADD/PFCOUNT/PFMERGE commands expose them.
 reading_time: 6
 tags:
   - hyperloglog
@@ -21,94 +21,86 @@ sources:
     url: "https://blog.acolyer.org/2016/03/17/hyperloglog-in-practice-algorithmic-engineering-of-a-state-of-the-art-cardinality-estimation-algorithm/"
 ---
 
-## The problem: distinct counts don't fit in memory
+**Gist.** An exact count of distinct elements requires remembering every element already seen, so a set of `n` distinct 64-bit values costs `O(n)` memory — gigabytes per counter, per dimension, per time window, at a billion uniques. HyperLogLog (HLL) replaces the set with a fixed-size array of small registers holding the maximum leading-zero count of the hashes routed to each register, and estimates cardinality from those maxima. The cost is that the answer is an estimate with a relative standard error of about **1.04/√m** for `m` registers, and individual elements can no longer be tested for membership or removed.
 
-Counting how many *distinct* things you've seen is deceptively expensive. Total events are cheap — one counter, increment forever. But "how many unique visitors today," "how many distinct IPs hit this endpoint," or "how many unique search terms" all require remembering which items you've already counted. The exact answer needs a set, and a set of `n` distinct 64-bit values costs `O(n)` memory. At a billion uniques that's gigabytes per counter, per dimension, per time window.
+## The problem: distinct counts do not fit in memory
 
-HyperLogLog (HLL) trades exactness for a fixed, tiny footprint. Flajolet, Fusy, Gandouet, and Meunier showed in 2007 that you can estimate cardinalities "well beyond 10⁹ with a typical accuracy of 2% while using a memory of only 1.5 kilobytes." The structure is a *sketch*: a small fixed-size summary that you feed elements into and query for an estimate. And critically for distributed systems, two sketches merge into the sketch of their union with no loss.
+Total event counts are cheap: one counter, incremented forever. Distinct counts — unique visitors per day, distinct client addresses per endpoint, unique search terms — require knowing whether an element has already been counted, which an exact algorithm can only do by storing the elements themselves.
 
-## The intuition: leading zeros
+HLL trades exactness for a fixed footprint. Flajolet, Fusy, Gandouet and Meunier showed in 2007 that cardinalities "well beyond 10⁹" can be estimated "with a typical accuracy of 2% while using a memory of only 1.5 kilobytes". The structure is a *sketch*: a small fixed-size summary fed elements one at a time and queried for an estimate. Two sketches over the same register count merge into the sketch of the union of their inputs, exactly.
 
-Hash every element to a uniform random bit string. In a stream of random bits, the probability that a value starts with exactly `k` leading zeros is `2^-(k+1)`. So if the longest run of leading zeros you've *ever* seen is `k`, you've probably observed roughly `2^k` distinct values — seeing a rare pattern is evidence you drew many samples. It's the same logic as: if a friend flipped a coin and got 10 heads in a row at some point, they probably flipped a lot of coins.
+## The observable: leading zeros
 
-That single observable — track the max leading-zero count `ρ`, estimate `2^ρ` — is the seed of the algorithm (Flajolet's earlier work called it the "observable"). The catch is variance: one unlucky hash with 20 leading zeros wrecks the estimate. A single register is basically a coin flip.
+Hash each element to a bit string that behaves as uniformly random. In such a string, the probability of exactly `k` leading zeros is `2^-(k+1)`. If the longest run of leading zeros observed so far is `k`, roughly `2^k` distinct values have probably been hashed: **a rare bit pattern is evidence of many draws**. This single observable — track the maximum leading-zero count `ρ`, estimate `2^ρ` — is the seed of the algorithm.
 
-## Stochastic averaging: many small buckets
+Its weakness is variance. One hash with an unusually long zero prefix inflates the estimate by orders of magnitude, and a single register carries essentially no averaging.
 
-HLL kills the variance by averaging many independent estimators. Use the first `b` bits of each hash to pick one of `m = 2^b` **registers**, and use the *remaining* bits to compute `ρ`, the position of the leftmost 1-bit. Each register keeps the maximum `ρ` it has seen. You've split the stream into `m` substreams, each running its own leading-zero estimator, without a second hash pass — this is *stochastic averaging*.
+## Stochastic averaging
 
-To combine the registers, the original paper uses the **harmonic mean** (Figure 2), which suppresses the outlier registers that would otherwise inflate the estimate:
+HLL reduces that variance by running many estimators over disjoint substreams. The **first `b` bits of the hash select one of `m = 2^b` registers**; the **remaining bits determine `ρ`, the position of the leftmost 1-bit**. Each register retains the maximum `ρ` routed to it. The stream is thereby partitioned into `m` substreams without a second hash pass — *stochastic averaging*.
+
+The 2007 paper combines the registers with the **harmonic mean**, which damps the outlier registers that would otherwise dominate:
 
 ```
 Z = 1 / Σⱼ 2^(-M[j])
 E = α_m · m² · Z
 ```
 
-`α_m` is a bias-correction constant; asymptotically `α_m ≈ 1/(2 log 2) ≈ 0.72134`. The headline accuracy result is that the relative standard error is about **1.04/√m**. More registers means more precision at a linear memory cost. With `m = 16384` that's `1.04/√16384 = 0.81%` — exactly the number Redis advertises.
+`α_m` is a bias-correction constant, asymptotically `α_m ≈ 1/(2 log 2) ≈ 0.72134`. The headline accuracy result is a relative standard error of about **1.04/√m**: precision improves as the square root of a memory cost that grows linearly. At `m = 16384`, `1.04/√16384 = 0.81%`, the figure Redis documents.
 
-## A HyperLogLog from scratch
+When many registers remain at zero, the harmonic-mean estimator is biased, and the original algorithm substitutes **linear counting** — `m · log(m/V)` for `V` empty registers — in the small-range regime.
 
-Here is a complete, runnable HLL in ~30 lines. It uses `b = 14` bits of prefix (16,384 registers), a 64-bit hash, and the low-cardinality "linear counting" correction the original paper applies when many registers are still empty.
+### Implementation sketch (Scala)
 
-```python
-import hashlib
-from math import log
+The sketch below shows the load-bearing operations only: routing, the register update, the harmonic-mean estimator with the small-range correction, and the merge. Hashing quality, serialization and register packing are omitted.
 
-class HyperLogLog:
-    def __init__(self, b=14):
-        self.b = b
-        self.m = 1 << b                      # number of registers
-        self.registers = [0] * self.m
-        self.alpha = 0.7213 / (1 + 1.079 / self.m)  # bias constant for m>=128
+```scala
+final class HyperLogLog(val b: Int = 14, private val registers: Array[Byte]):
+  private val m: Int = 1 << b
+  private val alpha: Double = 0.7213 / (1 + 1.079 / m)   // valid for m >= 128
 
-    def _hash(self, value):
-        d = hashlib.sha1(str(value).encode()).digest()
-        return int.from_bytes(d[:8], "big")  # 64-bit
+  def add(value: String): Unit =
+    val x = hash64(value)
+    val idx = (x >>> (64 - b)).toInt                     // first b bits: register
+    val rest = x << b                                    // remaining bits, left-aligned
+    // leftmost 1-bit position within the remaining 64 - b bits
+    val rho = (if rest == 0 then 64 - b else java.lang.Long.numberOfLeadingZeros(rest)) + 1
+    if rho > registers(idx) then registers(idx) = rho.toByte
 
-    def add(self, value):
-        x = self._hash(value)
-        idx = x >> (64 - self.b)             # first b bits -> register index
-        rest = (x << self.b) & ((1 << 64) - 1)  # remaining bits, left-aligned
-        rho = 64 - self.b - rest.bit_length() + 1 if rest else 64 - self.b + 1
-        self.registers[idx] = max(self.registers[idx], rho)
+  def count(): Long =
+    val z = registers.foldLeft(0.0)((acc, r) => acc + math.pow(2.0, -r.toDouble))
+    val e = alpha * m.toDouble * m / z
+    val empty = registers.count(_ == 0)
+    if e <= 2.5 * m && empty > 0 then (m * math.log(m.toDouble / empty)).toLong
+    else e.toLong
 
-    def count(self):
-        Z = sum(2.0 ** -r for r in self.registers)
-        E = self.alpha * self.m * self.m / Z
-        if E <= 2.5 * self.m:                # small-range: linear counting
-            V = self.registers.count(0)
-            if V:
-                return int(self.m * log(self.m / V))
-        return int(E)
+  /** Sketch of the union of the two input streams: per-register maximum. */
+  def merged(other: HyperLogLog): HyperLogLog =
+    require(other.b == b)
+    new HyperLogLog(b, Array.tabulate(m)(j => registers(j) max other.registers(j)))
 
-    def merge(self, other):                  # union = per-register max
-        assert self.m == other.m
-        self.registers = [max(a, b) for a, b in zip(self.registers, other.registers)]
-
-hll = HyperLogLog()
-for i in range(1_000_000):
-    hll.add(f"user:{i}")
-print(hll.count())   # ~1,000,000 (typically within ~1%)
+object HyperLogLog:
+  def apply(b: Int = 14): HyperLogLog = new HyperLogLog(b, new Array[Byte](1 << b))
 ```
 
-The `merge` method is three characters of logic — `max` — and it's the whole reason HLL matters for distributed systems.
+`merged` is the entire distributed story: `max`.
 
-## Why the sketches merge: union = per-register max
+## Why the sketches merge
 
-Register `j` holds the maximum `ρ` observed among all elements that hashed into bucket `j`. If shard A processed some elements and shard B processed others, the correct register value for the *union* is simply the larger of A's and B's register `j` — because "the max over A∪B" equals "the max of (max over A) and (max over B)." No re-scanning, no shared state, no coordination.
+Register `j` holds the maximum `ρ` over all elements routed to bucket `j`. If shard A processed one part of the stream and shard B another, the register value for the union is the larger of A's and B's register `j`, because the maximum over `A ∪ B` equals the maximum of the two per-shard maxima. No rescan, no shared state, no coordination — provided both sketches use **the same `b` and the same hash function**.
 
-This makes HLL an idempotent, commutative, associative sketch. You can:
+The consequences:
 
-- Maintain one HLL per shard, per minute, per server, entirely independently.
-- Roll minutes into hours and hours into days by merging.
-- Compute "uniques across the whole fleet last week" by max-ing a pile of 12 KB blobs.
-- Add the same element twice, or replay a stream, with no double-counting.
+- One sketch per shard, per minute, per server, maintained independently.
+- Minutes rolled into hours and hours into days by merging.
+- Fleet-wide uniques computed by taking maxima over a pile of fixed-size blobs.
+- Elements added twice, or a stream replayed, without double counting.
 
-That's a CRDT-flavored property: sketches are a bounded join-semilattice under per-register max. It's why MapReduce jobs, Flink pipelines, and analytics warehouses lean on HLL — the reduce step is trivial and the wire cost is constant regardless of cardinality.
+Per-register max is idempotent, commutative and associative, so the register array forms a bounded join-semilattice — the structure a state-based conflict-free replicated data type (CRDT) requires. The reduce step in a MapReduce or Flink pipeline is therefore a byte-wise maximum, and the wire cost is constant in the cardinality.
 
 ## Redis: PFADD, PFCOUNT, PFMERGE
 
-Redis ships HLL as a native type (the `PF` prefix honors Philippe Flajolet). It uses `m = 16384` dense 6-bit registers — 16384 × 6 bits = 12,288 bytes, "12k bytes for every HyperLogLog," with a 0.81% standard error and cardinalities up to 2⁶⁴.
+Redis ships HLL as a native type under the `PF` prefix. It uses **`m = 16384` dense 6-bit registers — 16384 × 6 bits = 12,288 bytes**, "12k bytes for every HyperLogLog", with a 0.81% standard error and cardinalities up to 2⁶⁴.
 
 ```
 > PFADD visitors:day1 alice bob carol
@@ -125,16 +117,24 @@ OK
 (integer) 4
 ```
 
-`PFADD` returns 1 if the sketch's estimate probably changed. `PFMERGE` writes the per-register max union into a destination key — the persistent form of the multi-key `PFCOUNT`. Note the docs' warning: multi-key `PFCOUNT` does an on-the-fly merge that can take milliseconds, and `PFCOUNT` is technically a write because it caches the estimate in the last 8 bytes of the value.
+`PFADD` returns 1 when at least one internal register was altered. `PFMERGE` writes the per-register maximum union into a destination key, the persistent form of the multi-key `PFCOUNT`. The documentation notes two operational facts: **multi-key `PFCOUNT` performs an on-the-fly merge whose cost is on the order of a few milliseconds**, and **`PFCOUNT` is technically a write command**, because it caches the computed estimate inside the value it reads.
 
-## HLL++: what Google fixed in 2013
+## HLL++: the 2013 refinements
 
-The original algorithm has two rough edges at the extremes. Heule, Nunkesser, and Hall's "HyperLogLog in Practice" addressed them:
+Heule, Nunkesser and Hall addressed the algorithm's behaviour at both extremes:
 
-- **64-bit hashes** replace 32-bit, so "the large range correction for cardinalities close to 2³² is no longer needed" — collisions near four billion stop biasing the estimate.
-- **Empirical bias correction** replaces linear counting in the mid-range, using measured bias at ~200 cardinalities with k-nearest-neighbor interpolation (k=6), removing the error spike the original showed around the 40,960 threshold at p=14.
-- **Sparse representation** stores index–value pairs (at a higher precision, p'=25) when most registers are empty, so a sketch tracking a few hundred items costs far less than 12 KB and is up to 4× more accurate for cardinalities below ~12,000, only converting to the dense array when it grows.
+- **64-bit hashes** replace 32-bit, so "the large range correction for cardinalities close to 2³² is no longer needed"; hash collisions near four billion stop biasing the estimate.
+- **Empirical bias correction** replaces linear counting in the mid-range, using bias measured at roughly 200 cardinalities with k-nearest-neighbour interpolation (k = 6). This removes the error spike the original algorithm exhibits around the 40,960 threshold at p = 14.
+- **A sparse representation** stores index–value pairs at higher precision (p' = 25) while most registers are empty, so a sketch tracking a few hundred elements costs far less than the dense array and is more accurate over that range; it converts to the dense representation once the sparse encoding would be the larger of the two.
 
-These are engineering refinements, not a new idea — the leading-zero-plus-per-register-max core is unchanged, and the merge property is preserved. Redis, Presto, BigQuery, and Druid all ship HLL++-flavored variants.
+The leading-zero-plus-per-register-maximum core is unchanged and the merge property is preserved. Later implementations adopt parts of this line of work — Redis, for instance, uses a 64-bit hash and a sparse encoding that upgrades to the dense one.
 
-**Try next:** build the Python sketch above, feed it 1M items, and plot estimate-vs-truth as you sweep `b` from 4 to 16 — watch the error track 1.04/√m and confirm that `a.merge(b)` gives the same count as adding both streams to one sketch.
+## Pitfalls
+
+- **Merging sketches built with different `b` or different hash functions produces a meaningless number rather than an error.** The per-register maximum is only the union's register when both sketches partition the hash space identically; a mismatch silently mixes unrelated substreams.
+- **Set difference is not supported.** Subtracting `PFCOUNT` of one sketch from another estimates a difference of two noisy quantities, and for similar cardinalities the error can exceed the result. Registers only ever increase, so deletion is impossible.
+- **`PFCOUNT` is not a pure read.** It updates the cached estimate stored in the key, so it can dirty a value and propagate a write where a read was expected.
+- **Multi-key `PFCOUNT` in a hot path adds latency proportional to the number of keys**, since the union is recomputed on every call; `PFMERGE` into a rollup key moves that cost off the read path.
+- **Small cardinalities are the regime where the estimator is biased**, not the safe one: the plain harmonic-mean formula requires the small-range correction, and sketches that skip it under-report on nearly empty register arrays.
+- **The 1.04/√m figure is a standard error, not a bound.** Individual sketches deviate further, so a dashboard comparing two HLL-derived numbers that differ by less than a few standard errors is reading noise.
+- **Membership cannot be recovered.** A sketch answers "how many distinct", never "was this element present", so an HLL cannot be repurposed for deduplication.

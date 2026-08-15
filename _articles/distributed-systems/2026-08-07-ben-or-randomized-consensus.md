@@ -1,9 +1,9 @@
 ---
-title: "Ben-Or's randomized consensus: how a coin flip walks around FLP"
+title: "Ben-Or's randomized consensus: a coin flip around FLP"
 date: 2026-08-07
 track: distributed-systems
-summary: "FLP says no deterministic asynchronous protocol can guarantee consensus with even one crash. Ben-Or's 1983 answer is disarmingly simple: when the round is deadlocked, every node flips a private coin. This is the full two-phase round, the exact thresholds, why it needs n > 2f, and why local coins cost you O(2^n) expected rounds."
-reading_time: 6
+summary: "FLP establishes that no deterministic asynchronous protocol guarantees consensus in the presence of a single crash. Ben-Or's 1983 protocol has every process flip a private fair coin when a round ends deadlocked. This covers the two-phase round, the exact thresholds, the requirement n > 2f, and the O(2^n) expected rounds that local coins impose."
+reading_time: 7
 tags: [consensus, randomization, flp, asynchrony, distributed-systems, byzantine-fault-tolerance]
 sources:
   - title: "Ben-Or — Another Advantage of Free Choice: Completely Asynchronous Agreement Protocols (PODC 1983, hosted PDF)"
@@ -18,73 +18,89 @@ sources:
     url: "https://cs.nyu.edu/~apanda/classes/sp25/papers/aguilera-toueg10.pdf"
 ---
 
-FLP tells you the bad news: in a fully asynchronous network where one process might crash, no *deterministic* protocol can guarantee agreement *and* termination. The proof hangs on the adversary always finding one "critical" message it can delay to keep the system undecided. That trick works because the scheduler can predict what each node will do next. Michael Ben-Or's 1983 paper (*Another Advantage of Free Choice*, PODC) removes exactly that predictability: when a round ends without a clear majority, every node flips a private, fair coin. The adversary can no longer steer a run it cannot foresee, and the protocol terminates with probability 1. It is one of the shortest routes from an impossibility theorem to a working algorithm in all of distributed systems.
+**Gist.** The Fischer–Lynch–Paterson (FLP) impossibility result states that in a fully asynchronous system with one possible crash failure, no deterministic protocol guarantees both agreement and termination, because the adversarial scheduler can always delay one critical message to keep the run undecided. Michael Ben-Or's 1983 protocol (*Another Advantage of Free Choice*, PODC) removes the scheduler's foresight: when a round ends without a majority, every process draws a fresh private fair coin, and the protocol terminates with probability 1. The cost is running time — with independent local coins, termination requires all coin-flipping processes to agree by chance, which takes **O(2^n) expected rounds**.
 
-## The setup
+## The model and the resilience bound
 
-We want binary consensus among `n` processes, up to `f` of which may crash, over an asynchronous network (no message-delay bound). Each process starts with an input in `{0,1}` and must satisfy the usual three properties: **agreement** (no two correct processes decide differently), **validity** (a decided value was some process's input), and **termination** (every correct process eventually decides). Ben-Or's crash-fault protocol needs `n > 2f` — a strict majority of processes must be correct, equivalently `f < n/2`. That majority is what makes the "collect `n − f` messages" step safe: any two such collections overlap, so two correct nodes can never build contradictory majorities in the same round.
+The problem is binary consensus among `n` processes, up to `f` of which may crash, over an asynchronous network with no bound on message delay. Each process starts with an input in `{0,1}` and the protocol must satisfy **agreement** (no two correct processes decide differently), **validity** (a decided value was some process's input), and **termination** (every correct process eventually decides).
 
-## One round = two message exchanges
+Ben-Or's crash-fault protocol requires **`n > 2f`**, equivalently `f < n/2`: a strict majority of processes are correct. That bound is what makes the central waiting step safe. Because at most `f` processes crash, waiting for `n − f` messages cannot block forever; and because `n − f > n/2`, **any two sets of `n − f` messages intersect**, so a value vouched for by every member of one collection cannot be missed entirely by another.
 
-Every round `r` has two broadcast-and-collect phases. The paper labels its messages type-1 and type-2; lecture notes call them the **report/propose** phase and the **proposal/ratify** phase. Same thing.
+Majority uniqueness within a round comes from the counting gate rather than from that intersection: each process sends one phase-1 value per round, so more than `n/2` of the collected messages carrying `v` means more than `n/2` of all messages in the round carry `v`. Two different values cannot both clear that gate.
 
-**Phase 1 (report).** Broadcast `(1, r, x)` carrying your current estimate `x`. Wait until `n − f` type-1 messages for round `r` arrive. Now check them: if **more than `n/2`** of them carry the same value `v`, you have witnessed a majority for `v`; otherwise you have not.
+## One round is two message exchanges
 
-**Phase 2 (proposal).** If phase 1 gave you a strict majority `v`, broadcast `(2, r, v, D)` — a *D* ("decide-candidate") message vouching for `v`. If it did not, broadcast `(2, r, ?)`, a null vote. Wait until `n − f` type-2 messages arrive, then apply the decision rule:
+Each round `r` consists of two broadcast-and-collect phases. The paper labels the messages type-1 and type-2, sent as `(1, r, …)` and `(2, r, …)`; the two phases are referred to below as report and proposal.
 
-- If you received **more than `f`** D-messages all for the same `v` → **decide `v`** (and do one more round so laggards can catch up).
-- Else if you received **at least one** D-message for some `v` → **adopt** it: set `x ← v` and continue to round `r + 1`.
-- Else (only nulls) → **flip a coin**: set `x ← 0 or 1`, each with probability 1/2, and continue.
+**Phase 1 (report).** A process broadcasts `(1, r, x)` carrying its current estimate `x`, then waits for `n − f` type-1 messages of round `r`. If **more than `n/2`** of the collected messages carry the same value `v`, the process has witnessed a majority for `v`.
 
-The three-way rule is the whole design. The `> f` D-messages needed to decide guarantee at least one D came from a *correct* process; since a correct process only sends a D for a value it saw a strict majority behind in phase 1, and majorities in the same round are unique, no correct node can decide `0` while another decides `1`. The single-D adopt rule is the safety bridge: if *anyone* could have decided `v`, everyone else at least adopts `v`, so the next round starts already leaning the right way. And the coin is the liveness escape — it only fires when the round was genuinely split, and it is precisely what the adversary cannot plan around.
+**Phase 2 (proposal).** A process that saw a strict majority `v` broadcasts `(2, r, v, D)`, a decide-candidate message vouching for `v`; otherwise it broadcasts `(2, r, ?)`, a null vote. It then waits for `n − f` type-2 messages and applies a three-way rule:
 
-## One node's round loop
+- More than **`f`** D-messages for the same `v` → **decide `v`**, while continuing to send round `r + 1` messages so lagging processes can still fill their collections.
+- Otherwise at least **one** D-message for some `v` → **adopt**: set `x ← v` and proceed to round `r + 1`.
+- Otherwise (only nulls) → **flip a coin**: set `x` to 0 or 1, each with probability 1/2, and proceed.
 
-```python
-import random
+The three thresholds carry the correctness argument. Requiring **more than `f`** D-messages guarantees that at least one D-message came from a correct process; a correct process emits a D only for a value backed by a strict majority in phase 1, and majorities within a round are unique, so a decision on `0` and a decision on `1` cannot coexist. The **single-D adopt rule** is the safety bridge between rounds: if any process could have decided `v`, every other correct process has seen at least one D for `v` and adopts it, so the next round begins with all estimates equal to `v` and decides. The coin fires only when the round was genuinely split, which is the state where a deterministic rule would hand the scheduler its critical message.
 
-def ben_or(node, x, n, f, net):
-    # x: this node's initial estimate in {0, 1}
-    r = 0
-    while True:
-        r += 1
+### Implementation sketch (Scala)
 
-        # --- Phase 1: report your estimate ---
-        net.broadcast(("R", r, x))
-        reports = net.collect(kind="R", round=r, count=n - f)  # wait for n-f
+The load-bearing detail is the `n - f` cut-off on collection and the three-way rule; the transport is elided.
 
-        counts = tally(v for (_, _, v) in reports)
-        maj = argmax_value(counts)
-        proposal = maj if counts[maj] > n / 2 else None      # strict majority?
+```scala
+enum Vote:
+  case D(v: Int)
+  case Abstain
 
-        # --- Phase 2: proposal / ratification ---
-        net.broadcast(("P", r, proposal))                    # None == "?"
-        props = net.collect(kind="P", round=r, count=n - f)  # wait for n-f
+trait Net:
+  def broadcastReport(r: Int, x: Int): Unit
+  def collectReports(r: Int, count: Int): Seq[Int]      // blocks until `count` arrive
+  def broadcastVote(r: Int, vote: Vote): Unit
+  def collectVotes(r: Int, count: Int): Seq[Vote]
 
-        ds = [v for (_, _, v) in props if v is not None]     # the D-votes
-        dcount = tally(ds)
+def benOr(x0: Int, n: Int, f: Int, net: Net, coin: () => Int): Int =
+  var x = x0
+  var r = 0
+  while true do
+    r += 1
+    net.broadcastReport(r, x)
+    // Waiting for all n would block forever once a single process has crashed.
+    val reports = net.collectReports(r, n - f)
+    val tally   = reports.groupMapReduce(identity)(_ => 1)(_ + _)
+    val vote    = tally.find((_, c) => c > n / 2) match
+      case Some((v, _)) => Vote.D(v)
+      case None         => Vote.Abstain
 
-        if ds:
-            v = mode(ds)
-            if dcount[v] > f:            # >f D-votes for v  ->  DECIDE
-                net.broadcast(("R", r + 1, v))  # help stragglers, then:
-                return v
-            x = v                        # saw a D  ->  ADOPT it
-        else:
-            x = random.randint(0, 1)     # no D at all  ->  FLIP A COIN
+    net.broadcastVote(r, vote)
+    val ds = net.collectVotes(r, n - f).collect { case Vote.D(v) => v }
+    val dTally = ds.groupMapReduce(identity)(_ => 1)(_ + _)
+
+    dTally.find((_, c) => c > f) match
+      case Some((v, _)) =>
+        // Deciding is not halting: peers still need this process's round r+1
+        // messages to reach their own n - f cut-offs.
+        net.broadcastReport(r + 1, v)
+        net.broadcastVote(r + 1, Vote.D(v))
+        return v
+      case None =>
+        // A single D still pins the next round's estimate; only an all-null
+        // round reaches the coin.
+        x = ds.headOption.getOrElse(coin())
+  x
 ```
 
-Two subtleties worth internalizing. First, `net.collect` waits for exactly `n − f` messages and no more — waiting for all `n` would let a single crash hang the round forever, which is the asynchrony trap FLP exploits. Second, the coin flip must be a *fresh, private* draw each time; reusing a seed or letting the value leak hands the scheduler back its predictive power.
+The `coin` argument must return a **fresh, private draw each call**. A seed shared with the adversary, or a value derivable from message content, restores the predictability that the randomization exists to destroy.
 
-## Why it terminates — and why it can be slow
+## Termination, and its cost
 
-Termination rides on one event: a round in which **every** coin-flipping node happens to draw the same bit. When that occurs, all estimates for the next round converge, phase 1 sees a unanimous majority, phase 2 produces a flood of D-messages, and everyone decides. With independent, fair local coins, the probability that up to `n` nodes all land on the same value in a given round is roughly `2^{-(n-1)}` — exponentially small in `n`. So the *expected* number of rounds is on the order of `O(2^n)`. That is the price of "free choice" done locally: it is correct with probability 1, but a real adversary can drag the expected running time to exponential (Aspnes' survey states the per-round termination probability "may be exponentially small as a function of the number of processes").
+Termination rests on a single event: a round in which **every** coin-flipping process draws the same bit. All estimates then agree entering the next round, phase 1 observes a unanimous majority, phase 2 produces D-messages from every correct process, and the `> f` threshold is met.
 
-The fix, due to Rabin and refined by many since, is a **shared coin**: a subprotocol that gives all correct nodes the *same* random bit with constant probability, however the messages interleave. Swap the local `random.randint` for a shared-coin call and the same skeleton terminates in a *constant* expected number of rounds. For the Byzantine setting, shared-coin protocols achieve `O(1)` expected rounds at the optimal resilience `f < n/3`.
+With independent fair local coins, the probability that as many as `n` processes land on the same value in a given round is on the order of `2^{-(n-1)}`, so the expected number of rounds is on the order of **`O(2^n)`**. Aspnes' survey makes the same point: with purely local coins the per-round agreement probability degrades exponentially in the number of processes. The protocol is correct with probability 1, but the adversary can drag expected running time to exponential in `n`.
 
-## The Byzantine variant, and the resilience ladder
+The remedy, introduced by Rabin and refined subsequently, is a **shared coin**: a subprotocol that delivers the *same* random bit to all correct processes with constant probability regardless of message interleaving. Substituting a shared coin for the local draw leaves the round structure unchanged and yields a **constant expected number of rounds**. In the Byzantine setting, shared-coin protocols achieve `O(1)` expected rounds at the optimal resilience `f < n/3`.
 
-Ben-Or's paper also gives a Byzantine-tolerant protocol with the identical two-phase shape, but the thresholds tighten to absorb lying nodes: it requires `n > 5f`, the phase-1 majority gate becomes `(n + f)/2`, adopting needs `f + 1` D-messages, and deciding needs more than `(n + f)/2`. That `n > 5f` was later improved to the optimal `n > 3f` (Bracha–Toueg), which is the bound modern asynchronous BFT still lives at.
+## The Byzantine variant and the resilience ladder
+
+Ben-Or's paper also gives a Byzantine-tolerant protocol with the same two-phase shape and tightened thresholds: it requires **`n > 5f`**, the phase-1 majority gate becomes `(n + f)/2`, adopting requires more than `f` D-messages, and deciding requires more than `(n + f)/2`. The `n > 5f` requirement was later improved to the optimal `n > 3f` (Bracha–Toueg), the bound at which asynchronous Byzantine fault-tolerant protocols still operate.
 
 | Setting | Resilience | Decide threshold | Expected rounds |
 |---|---|---|---|
@@ -93,6 +109,14 @@ Ben-Or's paper also gives a Byzantine-tolerant protocol with the identical two-p
 | Byzantine (Ben-Or 1983) | `n > 5f` | `> (n+f)/2` D-votes | `O(2^n)` |
 | Byzantine, optimal | `n > 3f` | — | `O(1)` with shared coin |
 
-The lasting lesson is structural: FLP is not a wall, it is a statement about *deterministic* schedulers beating *deterministic* protocols. Add one bit of genuine randomness at the exact point where the round is deadlocked, and the adversary loses its foresight. Everything after Ben-Or — shared coins, weak coins, Byzantine variants — is engineering to make that idea *fast*, not to make it *work*.
+The structural point is that FLP constrains *deterministic* protocols against *deterministic* schedulers. One bit of genuine randomness, introduced precisely where the round is deadlocked, removes the adversary's foresight. The subsequent literature — shared coins, weak coins, Byzantine variants — addresses speed rather than possibility.
 
-**Try next:** implement the loop above for `n = 4, f = 1` with independent local coins and a message scheduler you control. Run 10,000 trials from a split input (two nodes start `0`, two start `1`), record rounds-to-decision, and plot the distribution — you should see a geometric-ish tail consistent with a per-round success probability near `2^{-3}`. Then replace the local flip with a trivial "shared coin" (all nodes read the same seeded bit for round `r`) and watch the tail collapse to one or two rounds.
+## Pitfalls
+
+- **Waiting for `n` messages instead of `n − f`.** A single crashed process never sends, so the collection never completes and the round hangs indefinitely; the `n − f` cut-off is the only reason the protocol makes progress under asynchrony.
+- **Reusing or exposing the coin.** A seeded or predictable per-round bit lets the scheduler order messages against the outcome, and the run can be kept undecided again — the FLP argument applies to any protocol the adversary can simulate.
+- **Deciding on `≥ f` rather than `> f` D-messages.** With exactly `f` D-messages, every one of them may have come from a process that has since crashed, so no correct process is guaranteed to be broadcasting a D; other processes can then collect an all-null round, flip coins, and enter the next round with estimates contradicting the decision.
+- **Dropping the single-D adopt rule.** A process that ignores a lone D and flips a coin instead may enter the next round with an estimate contradicting a decision another process already made.
+- **Deciding and halting immediately.** A process that returns without the final broadcast can leave other correct processes short of the `n − f` messages they are waiting for, so they never terminate.
+- **Applying the crash thresholds under Byzantine faults.** The `n > 2f` bound and the `n/2` gate assume processes fail only by stopping; a lying process that sends different reports to different recipients defeats them, and the Byzantine variant's `(n + f)/2` gates exist for that case.
+- **Assuming probability-1 termination bounds latency.** With local coins the expected round count grows as `O(2^n)`, so a run at moderate `n` can exceed any practical deadline without violating the protocol's guarantee.

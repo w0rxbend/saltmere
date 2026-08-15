@@ -1,8 +1,8 @@
 ---
-title: "EPaxos: leaderless consensus that only orders the commands that conflict"
+title: "EPaxos: leaderless consensus that orders only the commands that conflict"
 date: 2026-07-31
 track: distributed-systems
-summary: "Multi-Paxos and Raft funnel every write through one leader, which caps throughput and forces wide-area clients to round-trip to a possibly-distant node. EPaxos removes the leader entirely: any replica commits any command, and it only pays to order two commands when they actually interfere. This article covers the dependency-graph idea, the one-round-trip fast path, and the fast-quorum subtlety that a later paper had to fix."
+summary: "Multi-Paxos and Raft funnel every write through one leader, which caps throughput and forces wide-area clients to round-trip to a possibly-distant node. Egalitarian Paxos removes the leader: any replica commits any command, and ordering is paid for only when two commands interfere. This article covers the dependency-graph idea, the one-round-trip fast path, and the fast-quorum subtlety that a later paper had to fix."
 reading_time: 6
 tags: [consensus, epaxos, paxos, leaderless, quorums, replication]
 sources:
@@ -14,49 +14,87 @@ sources:
     url: "https://arxiv.org/abs/2511.02743"
 ---
 
-Every leader-based consensus protocol shares one structural cost: a single replica orders all writes. Multi-Paxos and Raft elect a stable leader, and for each command it drives Θ(N) messages while everyone else waits. That leader is a throughput ceiling and, in a geo-distributed cluster, a latency trap — a client in Frankfurt talking to a leader in Oregon eats a transatlantic round trip on every write, even though a replica sits next door. **Egalitarian Paxos (EPaxos)**, from Moraru, Andersen and Kaminsky (SOSP 2013), asks why any replica should be special. Its answer: none should be.
+**Gist.** Leader-based state-machine replication agrees on a single total order of all commands, so one replica orders every write and distant clients pay a round trip to reach it. **Egalitarian Paxos (EPaxos)**, from Moraru, Andersen and Kaminsky (SOSP 2013), agrees instead on a *partial* order: each command is committed by whichever replica the client contacted, carrying the set of already-seen commands it interferes with, and non-interfering commands are never ordered against one another. The cost is that the committed structure is a **dependency graph rather than a log** — every replica must topologically sort it before execution, cycles are possible, and recovering a command whose proposer crashed is substantially harder than recovering a Raft log entry.
 
-## Order less, not more
+## Ordering less, not more
 
-The insight is that state-machine replication over-orders. Consensus traditionally agrees on a single total order of *all* commands, but most pairs of commands commute — `PUT x` and `PUT y` can be applied in either order with identical results. You only need to agree on the relative order of commands that **interfere** (touch the same key, and at least one writes).
+Every leader-based protocol shares one structural cost: a single replica orders all writes. Multi-Paxos and Raft elect a stable leader, and for each command that leader drives Θ(N) messages while the other replicas wait. The leader is a throughput ceiling, and in a geo-distributed cluster it is a latency trap: a client in Frankfurt talking to a leader in Oregon incurs a transatlantic round trip on every write even when a replica sits nearby.
 
-So EPaxos doesn't build one log. Each command is proposed by whichever replica the client picked — that replica becomes the **command leader** for that one instance — and it carries two attributes:
+The observation behind EPaxos is that state-machine replication over-orders. Most pairs of commands commute — `PUT x` and `PUT y` produce the same state in either order — so agreement is required only between commands that **interfere**, meaning they touch the same key and at least one of them writes.
+
+EPaxos therefore builds no single log. Each command is proposed by whichever replica the client picked; that replica becomes the **command leader** for that one instance, and the instance carries two attributes:
 
 - `deps`: the set of already-seen instances that interfere with this command.
-- `seq`: a sequence number larger than the `seq` of everything in `deps`, used to break cycles when the dependency graph has them.
+- `seq`: a sequence number strictly larger than the `seq` of every instance in `deps`, used to break ties when the dependency graph contains cycles.
 
-Committed commands form a **directed dependency graph**, not a line. At execution time each replica topologically sorts that graph (breaking cycles by `seq`), and independent commands are free to execute in parallel. Load is spread perfectly: with no distinguished leader, every replica does an equal share, and a client always talks to its *nearest* replica.
+Committed commands form a **directed dependency graph**, not a line. At execution time each replica finds the strongly connected components of that graph, orders each component internally by `seq`, and executes components in dependency order; independent commands may execute in parallel. Because no replica is distinguished, load is spread evenly and a client always talks to its *nearest* replica.
+
+Two commands proposed concurrently by different command leaders can each observe the other absent and each end up in the other's `deps` — the source of the cycles. The `seq` attribute exists precisely so that such a component still has a deterministic order that every replica computes identically.
 
 ## The fast path: one round trip
 
-Here is the common case. A replica receives command C, computes `deps` and `seq` from what it has seen locally, and sends a `PreAccept` to a fast-path quorum. If every replica in that quorum agrees with the proposed `deps`/`seq` — meaning no concurrent interfering command showed up — the command **commits in a single round trip**. No leader, no second phase.
+In the common case a replica receives command C, computes `deps` and `seq` from what it has seen locally, and sends `PreAccept` to a fast-path quorum. If every replica in that quorum returns the *same* `deps` and `seq` that were proposed — meaning no concurrent interfering command was known to any of them — the command **commits in a single round trip**. There is no leader election and no second phase.
 
-If replicas disagree (a conflict raced in), the command leader unions the returned dependencies and runs a second `Accept` phase to fix the order — the **slow path**, still just two round trips and no election. Conflicts are the only thing that costs extra, and only conflicting commands pay.
+If any reply differs, a conflicting command raced in. The command leader unions the returned dependency sets, takes the maximum returned `seq`, and runs an `Accept` phase over a classic majority to fix that order — the **slow path**, still two round trips and still no election. **Only conflicting commands pay the extra round trip**; a non-conflicting workload never leaves the fast path.
 
-```python
-def propose(cmd):
-    deps = interfering_instances_seen_locally(cmd)   # by key overlap
-    seq  = 1 + max((i.seq for i in deps), default=0)
+### Implementation sketch (Scala)
 
-    replies = send_preaccept(cmd, deps, seq, to=fast_quorum())
+```scala
+final case class InstanceId(replica: Int, slot: Long)
+final case class Command(key: String, isWrite: Boolean)
+final case class Attrs(deps: Set[InstanceId], seq: Long)
+final case class PreAcceptReply(attrs: Attrs)
 
-    if all(r.deps == deps and r.seq == seq for r in replies):
-        commit(cmd, deps, seq)          # FAST PATH: 1 round trip
-    else:
-        deps = union(r.deps for r in replies)         # merge conflicts
-        seq  = 1 + max(r.seq for r in replies)
-        send_accept(cmd, deps, seq, to=majority())    # SLOW PATH
-        commit(cmd, deps, seq)
+def interferes(a: Command, b: Command): Boolean =
+  a.key == b.key && (a.isWrite || b.isWrite)
+
+trait Transport:
+  def preAccept(id: InstanceId, cmd: Command, a: Attrs, q: Set[Int]): Seq[PreAcceptReply]
+  def accept(id: InstanceId, cmd: Command, a: Attrs, q: Set[Int]): Unit
+  def commit(id: InstanceId, cmd: Command, a: Attrs): Unit
+
+def localAttrs(cmd: Command, log: Map[InstanceId, (Command, Attrs)]): Attrs =
+  val deps = log.collect { case (id, (other, _)) if interferes(cmd, other) => id }.toSet
+  val seq  = 1L + log.view.filterKeys(deps).values.map(_._2.seq).maxOption.getOrElse(0L)
+  Attrs(deps, seq)
+
+def propose(id: InstanceId, cmd: Command, log: Map[InstanceId, (Command, Attrs)],
+            fastQuorum: Set[Int], classicQuorum: Set[Int])(using t: Transport): Attrs =
+  val proposed = localAttrs(cmd, log)
+  val replies  = t.preAccept(id, cmd, proposed, fastQuorum)
+
+  if replies.forall(_.attrs == proposed) then
+    t.commit(id, cmd, proposed)                  // fast path: one round trip
+    proposed
+  else
+    // union, not merge: a dependency reported by any replica must be kept
+    val merged = Attrs(
+      deps = replies.map(_.attrs.deps).reduce(_ union _) union proposed.deps,
+      seq  = (proposed.seq +: replies.map(_.attrs.seq)).max)
+    t.accept(id, cmd, merged, classicQuorum)     // slow path: two round trips
+    t.commit(id, cmd, merged)
+    merged
 ```
 
-## The quorum subtlety worth knowing
+The sketch omits recovery, which is where the protocol's difficulty concentrates.
 
-Fast-path and slow-path quorums differ, and this is where EPaxos gets genuinely tricky. For N = 2F+1 replicas, the classic (slow-path) quorum is the usual majority, F+1 — so N=5 needs 3. The *basic* EPaxos fast path needs a larger quorum, 2F (4 out of 5), because a recovering replica must be able to reconstruct what a crashed command leader might have committed on the fast path. The paper also describes a fully-optimized variant that shrinks the fast quorum to F + ⌊(F+1)/2⌋ (3 for N=5).
+## The quorum subtlety
 
-That optimized quorum is exactly where later work found trouble. *Making Democracy Work* (OPODIS 2025) showed that EPaxos's recovery procedure had subtle correctness bugs and clarified the conditions the fast path must satisfy, offering a simpler, verified reformulation. The takeaway for a practitioner: EPaxos's *idea* — leaderless, conflict-only ordering with a one-round-trip common case — is sound and influential (it shows up in the lineage of protocols behind systems like Accord/Cassandra), but the fault-recovery corner is where you must trust a carefully-checked implementation rather than rolling your own from the 2013 pseudocode.
+Fast-path and slow-path quorums differ in size, and this is the most error-prone part of the protocol. For **N = 2F+1** replicas the classic (slow-path) quorum is the usual majority, **F+1** — three out of five. The *basic* EPaxos fast path requires a larger quorum, **2F** (four out of five), because a replica performing recovery must be able to reconstruct what a crashed command leader could have committed on the fast path. The paper also describes a fully optimized variant that shrinks the fast quorum to **F + ⌊(F+1)/2⌋**, which is three for N = 5.
 
-## When it wins
+The recovery procedure that has to reconstruct such a fast-path commit is where later work found trouble. *Making Democracy Work: Fixing and Simplifying Egalitarian Paxos* (OPODIS 2025) reports correctness problems in the EPaxos recovery procedure and proposes a simplified reformulation. The practical consequence: the *idea* — leaderless, conflict-only ordering with a one-round-trip common case — is sound and has been influential, but the fault-recovery corner warrants a carefully checked implementation rather than a fresh transcription of the 2013 pseudocode.
 
-EPaxos pays off precisely when Raft hurts: geo-distributed clusters where client locality matters, and workloads with low interference (sharded or key-partitioned access) so most commands take the fast path. When conflicts are dense, the dependency graph thickens and you approach slow-path costs — at which point a single leader's simplicity may win back the argument.
+## Where it wins
 
-**Try next:** clone `efficient/epaxos`, start a 5-replica cluster, and run a YCSB-style workload twice — once with keys drawn uniformly (low interference) and once with a hot 1% of keys (high interference). Watch the fraction of commands taking the slow path and the p99 latency move together; that curve is the whole trade-off made visible.
+EPaxos pays off in the conditions that penalise Raft: geo-distributed clusters where client locality dominates latency, and workloads with low interference — sharded or key-partitioned access — so that most commands take the fast path. As conflicts grow denser the dependency graph thickens, the strongly connected components grow, and costs approach the slow path; at that point the operational simplicity of a single leader becomes the stronger argument.
+
+A direct way to observe the trade-off is to start a five-replica cluster from `efficient/epaxos` and run the same YCSB-style workload twice: once with keys drawn uniformly (low interference) and once concentrated on a small hot subset (high interference), tracking the fraction of commands taking the slow path alongside tail latency.
+
+## Pitfalls
+
+- Treating the fast quorum as a majority: with N = 5 a three-replica `PreAccept` agreement is sufficient only under the optimized variant's conditions, and using it with basic EPaxos leaves a recovering replica unable to distinguish a fast-path commit from an uncommitted proposal.
+- Computing `deps` against a partially applied local log: an instance the proposer has not yet seen is omitted from `deps`, and the resulting disagreement demotes the command to the slow path rather than causing an error — the symptom is a slow-path rate far above the measured conflict rate.
+- Merging `PreAccept` replies by intersection or by taking the last reply: dependencies reported by a single replica are dropped, and two replicas can then execute interfering commands in opposite orders.
+- Executing a committed command before its transitive dependencies have committed: the command appears committed while its `deps` contain instances still in progress, so execution must block until the whole reachable subgraph is committed.
+- Ignoring cycles: a plain topological sort has no valid output on the dependency graph, because concurrent interfering commands can list each other; components must be ordered internally by `seq`.
+- Implementing recovery from the 2013 pseudocode: the OPODIS 2025 paper reports correctness bugs in that procedure, so failures involving a crashed command leader are exactly the case least likely to have been exercised in testing.

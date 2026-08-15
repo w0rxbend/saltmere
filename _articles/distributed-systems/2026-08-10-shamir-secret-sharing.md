@@ -2,8 +2,8 @@
 title: "Shamir's Secret Sharing: Splitting a Key So No One Holds It"
 date: 2026-08-10
 track: distributed-systems
-summary: "Shamir's (t,n) threshold scheme splits a secret into n shares so that any t of them reconstruct it and any t-1 reveal nothing. This article explains the polynomial-over-a-prime-field math in plain terms, builds a ~40-line runnable Python implementation using Lagrange interpolation, shows why the finite field is non-negotiable, and connects it to real systems like Vault unseal keys and HSM key ceremonies."
-reading_time: 6
+summary: "Shamir's (t,n) threshold scheme splits a secret into n shares so that any t of them reconstruct it and any t-1 reveal nothing. This article explains the polynomial-over-a-prime-field construction, builds a ~40-line runnable Python implementation using Lagrange interpolation, shows why the finite field is non-negotiable, and connects it to real systems like Vault unseal keys and HSM key ceremonies."
+reading_time: 7
 tags: [cryptography, secret-sharing, distributed-systems, security, python]
 sources:
   - title: "How to Share a Secret (Adi Shamir, Communications of the ACM, 1979)"
@@ -16,33 +16,35 @@ sources:
     url: "https://www.zkdocs.com/docs/zkdocs/protocol-primitives/shamir/"
 ---
 
+**Gist.** A secret that must never leak and must never be lost cannot safely live with one holder, and copying it to five holders creates five ways to leak it. Shamir's **(t, n) threshold scheme** encodes the secret as the constant term of a degree-`t-1` polynomial over a prime field and distributes `n` evaluations of it, so that **any `t` shares reconstruct the secret by interpolation and any `t-1` shares are consistent with every possible secret**. The cost is that the scheme provides confidentiality only: it carries no integrity check, so a shareholder who submits a corrupted share silently steers reconstruction to a wrong value.
+
 ## The problem: a secret nobody should hold alone
 
-Suppose you have one thing that must never leak and must never be lost: a root encryption key, the master password to a treasury, the recovery key for a certificate authority. Hand it to one person and they are a single point of both failure and betrayal. Copy it to five people and you have five ways for it to leak.
+The objects at stake are root encryption keys, treasury master passwords, and certificate-authority recovery keys. A single holder is a single point of both failure and betrayal; wholesale replication multiplies the exposure surface without removing the failure mode.
 
-What you actually want is a *quorum*: split the secret among `n` people so that any `t` of them, cooperating, can rebuild it, but any `t-1` of them together learn absolutely nothing. That is a **(t, n) threshold scheme**, and Adi Shamir described an elegant one in a two-page 1979 paper, *How to Share a Secret* (Communications of the ACM, vol. 22, no. 11, pp. 612–613).
+The required property is a *quorum*: split the secret among `n` participants so that any `t` cooperating participants rebuild it and any `t-1` of them learn nothing. Adi Shamir described such a scheme in a two-page 1979 paper, *How to Share a Secret* (Communications of the ACM, vol. 22, no. 11, pp. 612–613).
 
 ## The one idea: a polynomial is pinned down by enough points
 
-The whole scheme rests on a fact you already know from school geometry. Two points determine a unique line. Three points determine a unique parabola. In general, a polynomial of degree `t-1` is uniquely determined by any `t` distinct points on it — and `t-1` points leave infinitely many polynomials still possible.
+The scheme rests on a fact from school geometry. Two points determine a unique line; three points determine a unique parabola. In general **a polynomial of degree `t-1` is uniquely determined by any `t` distinct points on it, and `t-1` points leave one candidate polynomial for every possible value of the remaining coefficient** — infinitely many over the reals, exactly `p` of them over a field of size `p`.
 
-Shamir turns that into a sharing scheme:
+The construction:
 
-1. Put your secret `S` in as the **constant term** of a polynomial.
-2. Fill the other `t-1` coefficients with **random** numbers. This gives a polynomial `q(x)` of degree `t-1` whose value at `x = 0` is exactly `S`.
-3. Evaluate it at `n` distinct non-zero points. Each pair `(x, q(x))` is one **share**.
+1. Place the secret `S` as the **constant term** of a polynomial.
+2. Fill the remaining `t-1` coefficients with **random** elements. The result is a polynomial `q(x)` of degree `t-1` with `q(0) = S`.
+3. Evaluate `q` at `n` distinct non-zero points. Each pair `(x, q(x))` is one **share**.
 
-To reconstruct, collect any `t` shares, interpolate the unique degree-`t-1` polynomial through them, and read off its value at `x = 0`. Fewer than `t` shares? The constant term could still be *anything*, so you have learned nothing. That "nothing" is precise, not hand-wavy: the scheme is **information-theoretically secure**. Even an attacker with unlimited compute and `t-1` shares gains zero information about `S`, because for every candidate secret there is exactly one consistent polynomial.
+Reconstruction collects any `t` shares, interpolates the unique degree-`t-1` polynomial through them, and reads off its value at `x = 0`. With fewer than `t` shares the constant term remains unconstrained. That statement is exact rather than informal: the scheme is **information-theoretically secure**. An adversary with unlimited compute and `t-1` shares gains no information about `S`, because **for every candidate secret there is exactly one polynomial consistent with the held shares**.
 
 ## Why a prime field, not plain arithmetic
 
-Here is the part people get wrong on the first try. If you build the polynomial over ordinary real numbers or floats, the scheme leaks. The magnitude of a share correlates with the coefficients; rounding error corrupts reconstruction; and the "any secret is equally possible" argument collapses because the reals are not finite.
+Built over the reals or over floating point, the construction leaks. Share magnitude correlates with the coefficients, rounding error corrupts reconstruction, and the "every secret is equally possible" argument fails because the reals are not finite.
 
-So Shamir does all arithmetic **modulo a prime `p`**. In his words, "the set of integers modulo a prime number p forms a field in which interpolation is possible." A field is what interpolation needs: you can add, subtract, multiply, and — crucially — *divide* by any non-zero element, because every non-zero element has a modular inverse. Pick a prime `p` larger than both the secret and `n`, draw the random coefficients uniformly from `[0, p)`, and every share is now a uniformly distributed field element that reveals nothing on its own. This is the difference between a cute demo and a real cryptographic primitive.
+Shamir therefore performs all arithmetic **modulo a prime `p`**, noting that "the set of integers modulo a prime number p forms a field in which interpolation is possible." Interpolation requires a field precisely because it divides: **every non-zero element must have a modular inverse**, which holds modulo a prime and fails modulo a composite. Choosing `p` larger than both the secret and `n`, and drawing the random coefficients uniformly from `[0, p)`, makes **each individual share a uniformly distributed field element** whenever `t >= 2`. At `t = 1` there are no random coefficients and every share equals the secret.
 
 ## A ~40-line implementation
 
-Below is a complete, runnable implementation. It uses the 521-bit Mersenne prime `2^521 - 1` as the field, so any secret up to 521 bits fits directly (encode bytes as a big integer). Reconstruction is Lagrange interpolation evaluated at `x = 0`, with modular inverses computed via Fermat's little theorem (`a^(p-2) mod p`, valid because `p` is prime).
+The implementation below is complete and runnable. It uses the 521-bit Mersenne prime `2^521 - 1` as the field, so any secret smaller than `2^521 - 1` fits directly once its bytes are encoded as a big integer. Reconstruction is Lagrange interpolation evaluated at `x = 0`, with modular inverses computed via Fermat's little theorem (`a^(p-2) mod p`, valid because `p` is prime).
 
 ```python
 import secrets
@@ -88,20 +90,61 @@ if __name__ == "__main__":
     print("recovered:", reconstruct(shares[0:3]) == s)
 ```
 
-Two lines are load-bearing security decisions. First, shares are evaluated at `x = 1..n`, never `x = 0`: the share at `x = 0` *is* the secret, so handing it out defeats the entire scheme. ZKDocs lists this exact off-by-one — looping from `0` instead of `1` — as a real bug that has "destroyed the security of the system entirely" in production code. Second, the `x` coordinates must be distinct modulo `p`; duplicates make the denominator `(xi - xj)` zero and the modular inverse undefined.
+Two lines are load-bearing security decisions. First, **shares are evaluated at `x = 1..n`, never at `x = 0`**: the share at `x = 0` *is* the secret, so distributing it defeats the scheme. ZKDocs lists this off-by-one — looping from `0` instead of `1` — among the implementation pitfalls that void the scheme's security. Second, **the `x` coordinates must be distinct modulo `p`**; duplicates drive the denominator `(xi - xj)` to zero and leave the modular inverse undefined.
 
-## What this gets you (and what it doesn't)
+### Implementation sketch (Scala)
 
-Shamir lists several properties that fall out for free. Each share is no larger than the secret. You can add or revoke shareholders without touching anyone else's share. You can *refresh* all shares to new random polynomials with the same constant term, so shares captured last year are useless after a re-share. And you can weight participants by giving important ones several shares — a crude hierarchy.
+The same interpolation on the Java Virtual Machine (JVM), using `BigInt.modInverse` in place of Fermat exponentiation. Argument validation and error handling are omitted.
 
-What it does **not** give you is integrity. Plain Shamir assumes honest shareholders; a malicious holder can submit a corrupted share and quietly steer reconstruction to a wrong value without detection. Defending against that needs *verifiable* secret sharing (e.g. Feldman or Pedersen commitments), which layers a cryptographic check on top of this same polynomial core.
+```scala
+val Prime: BigInt = (BigInt(1) << 521) - 1
+
+/** Horner evaluation of a polynomial whose head coefficient is the secret. */
+def evalPoly(coeffs: Vector[BigInt], x: BigInt, p: BigInt = Prime): BigInt =
+  coeffs.foldRight(BigInt(0))((c, acc) => (acc * x + c).mod(p))
+
+def split(secret: BigInt, n: Int, t: Int, p: BigInt = Prime): Vector[(BigInt, BigInt)] =
+  // BigInt(numbits, rnd) takes a scala.util.Random, which can wrap a SecureRandom.
+  val rnd    = new scala.util.Random(new java.security.SecureRandom())
+  val coeffs = secret +: Vector.fill(t - 1)(BigInt(p.bitLength + 64, rnd).mod(p))
+  // x = 0 is the secret itself, so evaluation starts at 1.
+  (1 to n).toVector.map(i => (BigInt(i), evalPoly(coeffs, BigInt(i), p)))
+
+/** Lagrange interpolation of the shares at x = 0. */
+def reconstruct(shares: Vector[(BigInt, BigInt)], p: BigInt = Prime): BigInt =
+  shares.indices.foldLeft(BigInt(0)) { (acc, i) =>
+    val (xi, yi) = shares(i)
+    val (num, den) = shares.indices.filter(_ != i).foldLeft((BigInt(1), BigInt(1))) {
+      case ((nAcc, dAcc), j) =>
+        val xj = shares(j)._1
+        ((nAcc * -xj).mod(p), (dAcc * (xi - xj)).mod(p))
+    }
+    // den is invertible because p is prime and the x coordinates are distinct.
+    (acc + yi * num * den.modInverse(p)).mod(p)
+  }
+```
+
+Sampling from `BigInt(p.bitLength + 64, rnd).mod(p)` bounds the modular bias: reducing a uniform `k`-bit draw modulo `p` favours the low range by roughly `2^-(k - bitLength(p))`, so 64 spare bits push the skew far below any detectable level. For this particular prime the shortcut of drawing exactly `bitLength(p)` bits happens to be near-uniform, because `2^521 - 1` sits one below a power of two; for a prime that is not adjacent to a power of two the same shortcut is measurably biased, and the extra bits cost nothing.
+
+## Properties the construction provides, and the one it does not
+
+Shamir lists several consequences of the construction. Each share is no larger than the secret. Shareholders can be added or revoked without altering anyone else's share. **Re-sharing under a fresh random polynomial with the same constant term invalidates every previously captured share** while leaving the secret unchanged. Participants can be weighted by issuing several shares to one holder, which encodes a coarse hierarchy in the share count.
+
+The scheme does **not** provide integrity. Plain Shamir assumes honest shareholders; a malicious holder who submits a modified `y` value shifts the interpolated constant term, and **reconstruction returns a wrong secret with no signal that anything failed**. Detecting that requires *verifiable* secret sharing — for example Feldman or Pedersen commitments — which layers a cryptographic check over the same polynomial core.
 
 ## Where it runs in production
 
-- **Vault unseal keys.** HashiCorp Vault keeps its data encrypted at rest under a keyring, which is encrypted by a root key, which is itself encrypted by an unseal key. Vault never stores that unseal key whole — it splits it with Shamir's scheme, and `vault operator init` defaults to **5 key shares with a threshold of 3**. Restart a Vault node and it comes up *sealed*; operators from different machines each enter a share until three arrive and the root key can be decrypted. (Auto-unseal offloads this step to a KMS/HSM, but the Shamir path is still the classic bootstrap.)
-- **HSM and CA key ceremonies.** When a hardware security module or a root certificate authority is initialized, the master key is split among officers who each store a smart card or token in separate safes. Recovery requires a quorum to physically gather — a governance control encoded in `t`.
-- **Multi-party computation and threshold signing.** Shamir sharing is the substrate under many MPC and threshold-signature protocols: parties hold shares of a private key and jointly produce signatures without any single machine ever reconstructing the key.
+- **Vault unseal keys.** HashiCorp Vault keeps data encrypted at rest under a keyring, which is encrypted by a root key, which is in turn encrypted by an unseal key. Vault does not keep the unseal key: it splits the key with Shamir's scheme and hands the shares to operators, and `vault operator init` defaults to **5 key shares with a threshold of 3**. After a restart a node comes up *sealed*, and operators supply shares until the threshold is met and the root key can be decrypted. Auto-unseal delegates this step to a key management service or hardware security module (HSM).
+- **HSM and certificate-authority key ceremonies.** When an HSM or a root certificate authority is initialized, the master key is split among officers who each store a smart card or token separately. Recovery requires a quorum to gather physically — a governance control encoded in `t`.
+- **Multi-party computation and threshold signing.** Shamir sharing is the substrate under many multi-party computation and threshold-signature protocols, in which parties hold shares of a private key and jointly produce signatures without any single machine reconstructing the key.
 
-The throughline is the same in all three: split the thing that must not leak so that trust is a quorum, not a person.
+## Pitfalls
 
-**Try next:** Extend the code above to operate on real bytes end to end — encode an arbitrary secret string as a big integer (`int.from_bytes`), split it with `n=5, t=3`, serialize each share to hex, then reconstruct from any three and decode back with `int.to_bytes`. Then deliberately corrupt one share's `y` value and watch reconstruction return silent garbage — that failure is exactly the integrity gap that verifiable secret sharing exists to close.
+- **Evaluating a share at `x = 0`.** The holder of that share holds the secret outright; ZKDocs records loops starting at `0` rather than `1` as an implementation pitfall that voids the scheme's security.
+- **Repeated `x` coordinates among the submitted shares.** The Lagrange denominator `(xi - xj)` becomes zero, and the modular inverse of zero does not exist, so reconstruction raises or returns nonsense rather than a secret.
+- **Arithmetic over the reals or floating point instead of a prime field.** Rounding corrupts reconstruction, and share magnitude correlates with the coefficients, so the information-theoretic argument no longer holds.
+- **A composite modulus.** Non-zero elements sharing a factor with the modulus have no inverse, so interpolation fails for particular share sets and succeeds for others.
+- **A modulus smaller than the secret or than `n`.** A secret at or above `p` is silently reduced and reconstructs to the wrong value; `n >= p` forces a repeated or zero `x` coordinate.
+- **Biased coefficient sampling.** Drawing coefficients from a non-uniform distribution — for example a general-purpose pseudorandom generator, or a bit-width barely above `bitLength(p)` reduced modulo a prime that is not close to a power of two — breaks the assumption that each share is a uniform field element.
+- **Treating a successful reconstruction as authentication.** Plain Shamir has no integrity check, so a corrupted share yields a wrong secret without any error; the failure surfaces later, as a decryption that produces garbage.
+- **Assuming re-sharing rotates the secret.** Refreshing the polynomial invalidates old shares but leaves the constant term unchanged; a secret already exposed stays exposed.

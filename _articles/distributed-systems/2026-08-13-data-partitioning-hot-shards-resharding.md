@@ -2,7 +2,7 @@
 title: "Data Partitioning: Hot Shards, Key Salting, and Resharding"
 date: 2026-08-13
 track: distributed-systems
-summary: "Range vs hash vs directory partitioning and how to pick a partition key, what to do when one shard melts (salting, split-and-scatter, DynamoDB adaptive capacity), how real systems reshard (fixed partition counts, dynamic splitting, Vitess-style copy-and-cutover), and local vs global secondary indexes."
+summary: "Range, hash and directory partitioning and the criteria for a partition key; mitigations when one shard melts (salting, split-and-scatter, DynamoDB adaptive capacity); resharding schemes (fixed partition counts, dynamic splitting, Vitess-style copy-and-cutover); and local vs global secondary indexes."
 reading_time: 6
 tags: [sharding, partitioning, hot-keys, resharding, secondary-indexes]
 sources:
@@ -18,73 +18,106 @@ sources:
     url: "https://www.notion.com/blog/sharding-postgres-at-notion"
 ---
 
-When a dataset or write load outgrows one machine, you partition (shard) it. The interview has four checkpoints: how keys map to partitions, how you pick the key, what you do when one partition melts, and how you move data when the shard count changes.
+**Gist.** When a dataset or its write load exceeds one machine, it is partitioned (sharded) across many, and the mapping from key to partition decides both locality and skew. The mechanisms in use are range assignment, hash assignment and an explicit directory, each combined with a rebalancing scheme that moves data when the partition count changes. The cost is paid in three places: cross-partition reads when the access pattern does not align with the key, residual hot partitions when one key dominates, and a copy-catch-up-verify-cutover migration every time the layout changes.
 
 ## Three ways to map keys to partitions
 
-**Range partitioning** assigns contiguous key ranges to partitions (Bigtable/HBase tablets, DynamoDB sort-key ranges). Range scans are cheap — adjacent keys are colocated — but monotonic keys (timestamps, sequential IDs) aim every insert at the last partition: a permanently hot tail.
+**Range partitioning** assigns contiguous key ranges to partitions (Bigtable and HBase tablets, DynamoDB sort-key ranges). Range scans are cheap because adjacent keys are colocated. The failure mode is structural: a **monotonic key** — a timestamp or a sequential identifier — always sorts into the highest range, so every insert lands on the last partition, producing a permanently hot tail that adding partitions does not relieve.
 
-**Hash partitioning** routes by `hash(key)`, spreading load evenly and destroying range locality; scans become scatter-gather. Cassandra and DynamoDB hash the partition key; Citus hash-distributes rows by a distribution column and explicitly warns against distributing on timestamps for exactly the locality-vs-skew reason.
+**Hash partitioning** routes by `hash(key)`. It spreads load evenly and destroys range locality, so any scan over a key interval becomes scatter-gather across all partitions. Cassandra and DynamoDB hash the partition key; Citus hash-distributes rows by a distribution column, and its documentation states plainly, "Do not choose a timestamp as the distribution column" — because hashing scatters adjacent times across shards, so a query over a time range touches all of them.
 
-**Directory-based partitioning** keeps an explicit lookup table from key (or key bucket) to shard. Most flexible — you can move any tenant anywhere — but the directory is extra infrastructure on every request path. Notion is the canonical write-up: **480 logical shards mapped onto 32 physical Postgres instances**, partitioned by `workspace_id`; 480 was chosen for its many divisors so hosts could grow 32 → 40 → 48 by remapping whole logical shards, never resplitting rows.
+**Directory-based partitioning** keeps an explicit lookup table from key, or from a key bucket, to shard. It is the most flexible arrangement — any tenant can be relocated by editing one row — at the cost of an extra service on every request path, which must itself be highly available. Notion's account is the reference write-up: **480 logical shards mapped onto 32 physical PostgreSQL instances**, partitioned by workspace ID, 15 logical shards to an instance. The write-up gives the reason for the count directly: "480 is divisible by a lot of numbers — which provides flexibility to add or remove physical hosts while preserving uniform shard distribution." A power-of-two count would instead force the host count to double.
 
-## Picking the partition key
+## Selecting the partition key
 
-Three tests, in order:
+Three tests, applied in order.
 
-1. **Cardinality and spread**: many distinct values, no value dominating. `user_id` passes; `country` fails (one value can be 30% of traffic).
-2. **Access alignment**: your dominant query should touch one partition. Multi-tenant SaaS almost always wants `tenant_id` (Citus's primary recommendation), which also **co-locates** a tenant's rows across tables so joins stay node-local. Notion's `workspace_id` is the same decision.
-3. **No built-in hotspots**: monotonic keys under range partitioning, or a compound key whose first component is low-cardinality, recreate the hot tail.
+1. **Cardinality and spread.** Many distinct values, none dominating. `user_id` satisfies this; `country` does not, since a single value can carry a large share of traffic.
+2. **Access alignment.** The dominant query should touch one partition. Multi-tenant applications generally partition on `tenant_id`, which is Citus's primary recommendation, because it also **co-locates** a tenant's rows across tables so joins remain node-local. Notion's `workspace_id` is the same decision.
+3. **Absence of built-in hotspots.** A monotonic key under range partitioning, or a compound key whose leading component has low cardinality, reintroduces the hot tail regardless of the remaining components.
 
 ## Hot shards and the celebrity problem
 
-Even a good key can't save you from Justin Bieber: one partition key whose traffic exceeds a single partition's capacity. DynamoDB makes the limits concrete — about **3,000 RCU and 1,000 WCU per physical partition** — and layers mitigations:
+A well-chosen key does not defend against a single key whose traffic exceeds one partition's capacity. DynamoDB documents the per-partition limits — throttling begins above **3,000 read operations or 1,000 write operations per second on a single partition** — and layers three mitigations:
 
-- **Burst capacity**: up to ~5 minutes of unused throughput retained to absorb spikes.
-- **Adaptive capacity**: instantly shifts table throughput toward hot partitions, no configuration.
-- **Split for heat**: persistently hot partitions are split in two, and the split point follows *traffic*, not the key-range midpoint — it can isolate a single hot item on its own partition. DynamoDB even detects when splitting won't help (a monotonically increasing sort key just moves the heat to the new partition) and declines.
+- **Burst capacity**: DynamoDB "currently retains up to five minutes (300 seconds) of unused read and write capacity", consumable during a spike. The documentation notes these details might change.
+- **Adaptive capacity**: throughput is raised for partitions receiving more traffic, automatically and at no cost, **bounded by the table's total provisioned capacity and by the partition maximum**. Under consistently high traffic to one item, the documented behaviour is that DynamoDB may rebalance until that partition holds only that item, which raises its ceiling to the partition maximum of 3,000 RCU and 1,000 WCU but no further.
+- **Split for heat**: a persistently hot partition is divided, and **the split point is calculated from recent traffic patterns rather than taken as the midpoint**. Two documented cases where the split is declined or constrained: a monotonically increasing sort key, since the writes after the split would all land on the second partition anyway; and a table carrying a local secondary index (LSI), where the split point can fall only between item collections.
 
-When the platform doesn't do this for you, the app-level equivalents are:
+Where the platform provides no such mechanism, the application-level equivalents are:
 
-- **Key salting (write sharding)**: turn one hot key into N sub-keys; writes pick a salt, reads fan out and merge. You're trading read cost for write spread — keep N small.
+- **Key salting, also called write sharding**: one hot key becomes N sub-keys; a write picks a salt, and a read fans out over all N and merges. This exchanges read cost for write spread, and **read amplification is exactly N**, so N stays small.
+- **Split-and-scatter**: detect the hot range, split that partition alone, and distribute the pieces across nodes — the manual form of split-for-heat.
+- **Caching in front**: a celebrity record is read-heavy and cacheable, so reads are absorbed before reaching the shard.
 
-```text
-SALTS = 8                                     # 1 hot key -> 8 sub-keys
-write(key, val):  put(f"{key}#{rand(SALTS)}", val)
-read(key):        merge(get(f"{key}#{i}") for i in range(SALTS))
+### Implementation sketch (Scala)
+
+The load-bearing property of salting is that the write path is O(1) and the read path is O(N); nothing about the storage engine changes.
+
+```scala
+final case class Salted(fanout: Int):
+  require(fanout >= 1)
+
+  /** Writes go to one randomly chosen sub-key, so write cost stays O(1). */
+  def writeKey(key: String): String =
+    s"$key#${scala.util.Random.nextInt(fanout)}"
+
+  /** Reads must visit every sub-key: read amplification is exactly `fanout`. */
+  def readKeys(key: String): Vector[String] =
+    Vector.tabulate(fanout)(i => s"$key#$i")
+
+// Counter example: the merge is a fold, so the sub-values must be commutative.
+final class SaltedCounter(
+    store: scala.collection.concurrent.Map[String, java.util.concurrent.atomic.AtomicLong],
+    s: Salted):
+
+  // getOrElseUpdate on a concurrent Map is atomic; a read-modify-write on a
+  // plain `Long` value would lose concurrent increments to the same sub-key.
+  def increment(key: String, by: Long): Unit =
+    store.getOrElseUpdate(s.writeKey(key), java.util.concurrent.atomic.AtomicLong(0L)).addAndGet(by)
+
+  def total(key: String): Long =
+    s.readKeys(key).foldLeft(0L)((acc, k) => acc + store.get(k).fold(0L)(_.get()))
 ```
 
-- **Split-and-scatter**: detect the hot range and split just that partition (manual split-for-heat), scattering the pieces across nodes.
-- **Cache in front**: a celebrity's profile is read-heavy and cache-friendly; absorb reads before they reach the shard.
+Only values whose merge is associative and commutative — counters, sets, append-only lists — survive this transformation unchanged. A value read for compare-and-set does not, because the salt destroys the single point of serialization. The total is a fold over sub-keys that are updated independently, so it is not a point-in-time snapshot: increments landing on an already-visited sub-key during the fan-out are missed.
 
 ## Resharding: changing the partition count
 
-- **Fixed partition count**: create far more logical partitions than nodes up front (Notion's 480; Riak and Elasticsearch use the same trick) and rebalance by moving *whole partitions*. Simple and predictable; the cost is guessing the count up front, and Notion still needed a double-write + three-day backfill + verification migration (with five minutes of planned downtime) to get onto the scheme.
-- **Dynamic splitting**: partitions split when too big or too hot (HBase regions, DynamoDB split-for-heat). No up-front guess; the trade is transient unavailability/movement at split time and unsplittable item collections if constraints (like DynamoDB LSIs) pin them.
-- **Consistent hashing**: bound the fraction of keys that move when nodes join or leave — the [ring mechanics are covered here](/articles/distributed-systems/2026-07-25-consistent-hashing-ring); in interviews, just say "virtual nodes, 1/n of keys move" and move on.
+- **Fixed partition count.** Far more logical partitions than nodes are created up front (Notion's 480; Riak and Elasticsearch use the same arrangement) and rebalancing moves *whole partitions*. The behaviour is predictable, and the cost is the up-front estimate of the count. Reaching the scheme is itself a migration: Notion reports double-writing, a three-day backfill, verification, and five minutes of planned downtime.
+- **Dynamic splitting.** Partitions split when they grow too large or too hot (HBase regions, DynamoDB split-for-heat). No estimate is required up front; the cost is movement and transient unavailability at split time, plus item collections that cannot be split when an LSI pins them.
+- **Consistent hashing.** The fraction of keys that move when a node joins or leaves is bounded; the [ring mechanics are covered here](/articles/distributed-systems/2026-07-25-consistent-hashing-ring).
 
-Whatever the scheme, live resharding follows the Vitess shape: **copy** source-shard data to destination shards, let **replication catch up** with ongoing writes, **verify** source against destination, then **cut over** serving and drop the sources — expansion and merge both work this way, without stopping writes.
+Live resharding follows the shape Vitess documents: **copy** source-shard data to the destination shards, allow **replication to catch up** with writes that arrived during the copy, **verify** source against destination, then **cut over** serving traffic and delete the sources. Vitess documents both directions this way: splitting shards into smaller pieces, and merging neighbouring shards into bigger ones.
 
 ## Secondary indexes under partitioning
 
 | | Local (document-partitioned) | Global (term-partitioned) |
 |---|---|---|
 | **Index lives** | On each partition, covering its own rows | Partitioned by the *indexed value* itself |
-| **Write** | One partition, atomic with the row | Cross-partition, usually async (DynamoDB GSIs are eventually consistent) |
+| **Write** | One partition, atomic with the row | Cross-partition, usually asynchronous (DynamoDB global secondary indexes are eventually consistent) |
 | **Read by indexed field** | Scatter-gather across all partitions | One index partition |
-| **Hot-spot risk** | Reads amplify with partition count | A popular term makes a hot index partition |
-| **Examples** | Cassandra secondary indexes, DynamoDB LSI | DynamoDB GSI, global indexes in Vitess/CockroachDB |
+| **Hot-spot risk** | Reads amplify with partition count | A popular term produces a hot index partition |
+| **Examples** | Cassandra secondary indexes, DynamoDB LSI | DynamoDB global secondary index (GSI), Vitess lookup vindexes |
 
-Rule of thumb: local indexes keep writes clean and taxes reads; global indexes make indexed reads cheap and push complexity (and eventual consistency) into writes. DynamoDB's LSI carries an extra operational footgun: its presence prevents adaptive capacity from splitting an item collection across partitions.
+A local index keeps the write path atomic and taxes the read path in proportion to the partition count; a global index makes the indexed read a single-partition operation and moves the cost, and the eventual consistency, into the write path. The DynamoDB LSI carries a further operational consequence: its presence prevents an item collection from being split across partitions, so the adaptive mechanism above cannot relieve heat on that collection.
 
-## Comparison table
+## Comparison
 
 | | Range | Hash | Directory |
 |---|---|---|---|
-| **Locality / scans** | Excellent | None (scatter-gather) | Whatever you design |
+| **Locality / scans** | Preserved | None (scatter-gather) | Determined by the mapping |
 | **Skew risk** | High (monotonic keys) | Low, until a single hot key | Low — remap at will |
 | **Resharding** | Split ranges | Consistent hashing or fixed partitions | Update the mapping |
-| **Extra infra** | Range metadata | None | Lookup service (must be HA) |
-| **Used by** | HBase/Bigtable, DynamoDB sort keys | Cassandra, DynamoDB, Citus | Notion, Vitess vindex lookups |
+| **Extra infrastructure** | Range metadata | None | Lookup service (must be highly available) |
+| **Used by** | HBase, Bigtable, DynamoDB sort keys | Cassandra, DynamoDB, Citus | Notion, Vitess vindex lookups |
 
-**Try next:** simulate the celebrity problem — hash 10 M synthetic events across 16 buckets with one key receiving 20% of traffic, plot per-bucket load, then re-run with an 8-way salt on that key and measure the p99 bucket load drop.
+## Pitfalls
+
+- **A timestamp as the leading component of a range-partitioned key** sends every insert to the last partition; the remaining components never influence placement, so the hot tail persists at any partition count.
+- **Salting a value that is read-modify-written** loses the single serialization point: two concurrent updates landing on different salts cannot be reconciled by the merge, and one is lost.
+- **Choosing the salt fan-out N too large** makes every read of that key an N-way fan-out, converting a write hotspot into a latency problem on the read path.
+- **Attaching a local secondary index in DynamoDB** pins the item collection to one partition, so a hot collection cannot be relieved by split-for-heat.
+- **Assuming adaptive capacity or split-for-heat resolves a monotonically increasing sort key**: the documented behaviour is that the split is declined, because the heat would move to the new partition rather than be divided.
+- **Under-provisioning the logical partition count** in a fixed-count scheme forces a full re-partition of rows later, which is the migration the scheme exists to avoid.
+- **Treating the directory service as incidental** places a mandatory lookup on every request path; its unavailability is total unavailability of the data tier.
