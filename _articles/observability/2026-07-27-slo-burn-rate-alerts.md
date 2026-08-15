@@ -2,8 +2,8 @@
 title: "Burn-Rate Alerting: Multi-Window SLO Alerts in Prometheus"
 date: 2026-07-27
 track: observability
-summary: "Define an SLI, an SLO target, and an error budget, then build the Google SRE Workbook's multi-window multi-burn-rate alerts in Prometheus with real recording and alerting rules."
-reading_time: 7
+summary: "Derives the service level indicator, objective and error budget, then constructs the Google SRE Workbook's multi-window multi-burn-rate alerts as Prometheus recording and alerting rules."
+reading_time: 8
 tags: [slo, error-budget, burn-rate, prometheus, alerting, sre]
 sources:
   - title: "Google SRE Workbook — Alerting on SLOs"
@@ -101,7 +101,7 @@ The alert disjoins the severity rows and conjoins the window pair within each ro
 
 The `and` in the Prometheus query language is a set intersection on label sets, not a Boolean scalar operator: it yields the left-hand samples whose label set also appears on the right. Both sides must therefore carry identical labels after aggregation, which is why each recording rule aggregates `by (job)` and nothing else. The `3d`/`6h` pair at burn rate 1 belongs in a separate rule with `severity: ticket`.
 
-Generators such as Sloth and Pyrra emit exactly this rule shape from a compact SLO specification, so the full window matrix is rarely hand-written; the derivation above is what makes the emitted constants auditable.
+Generators such as Sloth and Pyrra generate rules of this shape from a compact SLO specification, so the full window matrix is rarely hand-written; the derivation above is what makes the emitted constants auditable.
 
 ### Implementation sketch (Scala)
 
@@ -148,10 +148,10 @@ The ring makes the cost of one evaluation `O(w)` bucket reads for window `w`, or
 
 ## Pitfalls
 
-- **A ratio over a window with no traffic produces no sample.** In Prometheus, `0 / 0` is `NaN` and the comparison drops the series, so a service that has stopped serving entirely — the worst outage — silently fails to satisfy the alert expression. Pair burn-rate alerts with a separate absence or low-traffic alert.
+- **A ratio over a window with no traffic yields `NaN`, which no comparison passes.** In Prometheus, `0 / 0` evaluates to `NaN`, and every comparison against `NaN` is false, so the series is dropped from the alert expression's result — meaning a service that has stopped serving entirely — the worst outage — silently fails to satisfy the alert expression. Pair burn-rate alerts with a separate absence or low-traffic alert.
 - **Averaging short-window ratios does not reconstruct the long-window ratio.** The 3-day error ratio equals the traffic-weighted mean of its constituent ratios; an unweighted mean over 5-minute ratios overweights low-traffic minutes and inflates the apparent burn overnight.
 - **`rate()` extrapolates at series boundaries.** For counters that appear, reset, or vanish inside the window, `rate()` extrapolates to the window edges and can report a value the raw samples do not support — visible as brief burn spikes immediately after a deployment rolls new pods.
 - **Adding `for:` to a multi-window alert double-counts the delay.** The long window already supplies persistence; a `for: 15m` on top adds latency without adding precision and can push a 52-second detection to a quarter hour.
-- **The short window must divide the long one, and the recording interval must divide the short one.** A 5-minute window evaluated on a 5-minute rule interval still consumes every scrape inside the range, but consecutive evaluations no longer overlap: the ratio is refreshed once per window rather than rolling, so detection and reset are quantised to the full window length and the short window stops being short in practice.
+- **An evaluation interval as long as the short window quantises detection to that window.** A 5-minute range evaluated on a 5-minute rule interval still consumes every scrape inside the range, but consecutive evaluations no longer overlap: the ratio is refreshed once per window rather than rolling, so detection and reset are quantised to the full window length and the short window stops being short in practice.
 - **Deleting or renaming a recording rule silently disables the alert.** A missing series makes the `and` intersection empty, so the alert evaluates to no samples and never fires; only rule-level unit tests (`promtool test rules`) catch this.
 - **Budget arithmetic assumes a rolling window, but many dashboards render a calendar month.** A burn that exhausts the budget on the 29th resets on the 1st under a calendar view while the rolling alert continues to fire, producing contradictory reports during the same incident.

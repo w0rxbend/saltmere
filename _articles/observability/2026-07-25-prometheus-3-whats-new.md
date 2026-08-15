@@ -1,8 +1,8 @@
 ---
-title: "Prometheus 3.0: what actually changed, and what it breaks"
+title: "Prometheus 3.0: what changed, and what it breaks"
 date: 2026-07-25
 track: observability
-summary: "The first major Prometheus release in seven years ships a native OTLP endpoint, UTF-8 names, and a rewritten UI — plus a quiet PromQL change that can silently drop samples. Here's what to touch before you upgrade."
+summary: "The first major Prometheus release in seven years ships a native OTLP endpoint, UTF-8 names, and a rewritten UI — plus a quiet PromQL change that shifts query results without erroring."
 reading_time: 5
 tags: [prometheus, otlp, promql, remote-write]
 sources:
@@ -18,11 +18,11 @@ sources:
     url: "https://grafana.com/blog/prometheus-3-0-and-opentelemetry-a-practical-guide-to-storing-and-querying-otel-data/"
 ---
 
-Prometheus 3.0 landed on **14 November 2024** — the first major bump since 2.0 in 2017. Most of the headline items are additive (a new UI, an OTLP receiver, UTF-8 names), so it's tempting to treat it as a routine upgrade. Don't: one PromQL change alters query results, and a pile of long-standing feature flags now error on startup. Here's the operator's-eye view.
+**Gist.** Prometheus 3.0, released **14 November 2024**, is the first major version since 2.0 in 2017, and most of its surface is additive: an OpenTelemetry Protocol (OTLP) receiver, UTF-8 metric and label names, Remote Write 2.0, a rewritten web interface. The one change that is not additive is a redefinition of the PromQL range selector interval, which is now **left-open and right-closed** where 2.x was left-closed and right-closed. That change costs nothing at startup and produces no error; it alters the sample set feeding `rate()` and similar functions at range boundaries, so the cost is paid in silently different numbers on dashboards and alert thresholds.
 
-## Prometheus can now receive OTLP directly
+## Native OTLP ingestion
 
-The change that matters most if you run OpenTelemetry: Prometheus can ingest OTLP metrics natively, no `prometheusreceiver` in a Collector required. It's off by default. Turn it on with a flag and a small config block:
+Prometheus 3.0 accepts OTLP metrics directly, removing the requirement for an OpenTelemetry Collector translating them first — previously the usual path was a Collector with the `prometheusremotewrite` exporter, or a Collector exposing a scrape endpoint for Prometheus to poll. The receiver is **off by default** and is enabled by a command-line flag rather than by configuration alone:
 
 ```bash
 prometheus --web.enable-otlp-receiver \
@@ -32,8 +32,8 @@ prometheus --web.enable-otlp-receiver \
 ```yaml
 # prometheus.yml
 otlp:
-  # keep dots in names instead of rewriting them to underscores
-  translation_strategy: NoTranslation
+  # keep dots in names instead of escaping them to underscores
+  translation_strategy: NoUTF8EscapingWithSuffixes
   promote_resource_attributes:
     - service.name
     - service.namespace
@@ -42,25 +42,55 @@ otlp:
     - k8s.pod.name
 ```
 
-Point any OTLP/HTTP exporter at `http://<prometheus>:9090/api/v1/otlp/v1/metrics`. `promote_resource_attributes` lifts the resource attributes you actually query on into labels; leaving `translation_strategy` at the default sanitizes names to the classic `[a-zA-Z_:][a-zA-Z0-9_:]*` form, while `NoTranslation` keeps the original dotted names and leans on the next feature.
+Exporters speaking OTLP over HTTP target `http://<prometheus>:9090/api/v1/otlp/v1/metrics`.
 
-## UTF-8 names and Remote Write 2.0
+Two settings carry the weight. `promote_resource_attributes` lifts named OpenTelemetry *resource* attributes — properties of the emitting entity, not of the individual data point — into Prometheus labels, which is what makes them available to selectors and aggregations. Attributes not promoted are not queryable as labels. `translation_strategy` decides how the OTLP name is mapped: the **default, `UnderscoreEscapingWithSuffixes`, escapes names into the classic `[a-zA-Z_:][a-zA-Z0-9_:]*` form**, replacing characters such as dots with underscores and appending unit and type suffixes, while `NoUTF8EscapingWithSuffixes` keeps the suffixes but preserves the original dotted name, and therefore depends on the UTF-8 name support described below.
 
-UTF-8 metric and label names are now allowed **by default** — `http.server.request.duration` is a legal series name, not just `http_server_request_duration`. Query the awkward ones with the new quoted syntax: `{"http.server.request.duration"}`.
+The interaction between the two is the trap. Choosing `NoUTF8EscapingWithSuffixes` produces series whose names cannot be written as bare PromQL identifiers, so every existing query, recording rule and dashboard expression referring to the underscored form stops matching.
 
-Remote Write 2.0 is the other big protocol jump: it carries metadata, exemplars, created timestamps, and native histograms in-band, and interns repeated strings to shrink payloads. Senders and receivers negotiate the version, so a 3.0 sender still talks to a 2.x receiver — but you only get the new fields when both ends are 3.0.
+## UTF-8 names and the quoted selector
 
-## The breaking change hiding in PromQL
+UTF-8 metric and label names are permitted **by default** in 3.0. `http.server.request.duration` is a legal series name, not only its sanitized cousin `http_server_request_duration`. Because the PromQL grammar cannot parse a dotted name as a bare identifier, such names are selected with quoted syntax placed inside the matcher braces:
 
-Range and lookback selectors are now **left-open and right-closed** (previously left-closed and right-closed). In practice a `rate(x[5m])` evaluation can include one fewer sample at the boundary, so subqueries and tightly-aligned ranges may return slightly different values than on 2.x. Nothing errors — the numbers just shift. Two more to grep for before upgrading:
+```promql
+{"http.server.request.duration"}
+```
 
-- Regex `.` now matches newlines. A matcher like `msg=~".*"` behaves differently; use `[^\n]` for the old meaning.
-- `holt_winters` was renamed `double_exponential_smoothing` and moved behind `--enable-feature=promql-experimental-functions`.
+The quoted form is the metric name expressed as a matcher on the reserved `__name__` label rather than as an identifier token, which is why it composes with ordinary label matchers in the same braces.
 
-## Feature flags that now refuse to start... or do they
+## Remote Write 2.0
 
-Several flags graduated to always-on, and passing them to `--enable-feature` now emits a warning rather than failing — but you should still delete them from your unit files: `agent`, `remote-write-receiver`, `promql-at-modifier`, `promql-negative-offset`, `new-service-discovery-manager`, `expand-external-labels`, `no-default-scrape-port`, `auto-gomemlimit`, `auto-gomaxprocs`. Agent mode and the remote-write receiver are now first-class, not experimental. Other operational notes: HTTP/2 for remote write is now **off** by default, Alertmanager must be 0.16.0+, logs are emitted via `slog` (structured) instead of go-kit, and a TSDB downgrade only works back to 2.55+.
+Remote Write 2.0 is the second protocol change. It carries **metadata, exemplars, created timestamps, and native histograms in-band**, and it interns repeated strings so that label names and values repeated across series are transmitted once and referenced. Sender and receiver **negotiate the protocol version over HTTP headers**, so a 3.0 sender remains able to write to a receiver that speaks only Remote Write 1.0; the new fields appear only when both ends support 2.0. A mixed fleet therefore degrades to the older payload rather than failing, which makes the absence of exemplars downstream a configuration symptom rather than a connectivity one.
 
-Native histograms — the big storage-efficiency win — remain **experimental** and off by default; enable per-instance with `--enable-feature=native-histograms` and expect the format to keep evolving. The rewritten UI (cleaner, with a PromLens-style query tree) is default; if a dashboard breaks, `--enable-feature=old-ui` buys you time.
+One operational default changed alongside it: **HTTP/2 for remote write is off by default** in 3.0.
 
-**Try next:** on a staging Prometheus, enable `--web.enable-otlp-receiver`, push one OTLP metric with a dotted name, and confirm you can graph it with `{"my.metric.name"}` — then diff a `rate()` panel against your 2.x instance to see the range-selector change in the wild.
+## The PromQL changes that alter results
+
+The range selector interval is now **left-open and right-closed**. A window that in 2.x included the sample exactly at its left boundary now excludes it. For a `rate(x[5m])` evaluated on a scrape interval that divides evenly into the range, this can mean **one fewer sample in the window**, and subqueries or ranges tightly aligned to the scrape schedule are the most exposed. No error is raised; the value changes.
+
+Two further changes are grep-able before an upgrade:
+
+- **Regular-expression `.` now matches newlines.** A matcher such as `msg=~".*"` therefore matches multi-line values it previously skipped. `[^\n]` restores the earlier meaning.
+- **`holt_winters` was renamed `double_exponential_smoothing`** and moved behind `--enable-feature=promql-experimental-functions`. A rule file still using the old name is an unknown function, not a silently different result.
+
+## Feature flags and version floors
+
+Several long-standing experimental flags graduated to always-on behaviour: `agent`, `remote-write-receiver`, `promql-at-modifier`, `promql-negative-offset`, `new-service-discovery-manager`, `expand-external-labels`, `no-default-scrape-port`, `auto-gomemlimit`, `auto-gomaxprocs`. Passing them to `--enable-feature` **emits a warning rather than failing startup**, so a stale unit file keeps working while accumulating log noise; removing them is cleanup, not a migration blocker. Agent mode and the remote-write receiver are first-class features in 3.0, no longer experimental.
+
+Other constraints an upgrade plan must respect:
+
+- **Alertmanager must be 0.16.0 or newer.**
+- Logging is emitted through Go's structured `slog` package instead of go-kit, so log-parsing rules keyed to the old line format need revisiting.
+- **A TSDB downgrade only works back to 2.55 or newer.** An instance upgraded from an older 2.x and then rolled back further than 2.55 cannot read its own on-disk time-series database, which makes 2.55 the mandatory staging point for a reversible upgrade.
+
+**Native histograms** — the high-resolution histogram format — remain **experimental and off by default**, enabled per instance with `--enable-feature=native-histograms`, and the format continues to evolve. The rewritten user interface, which includes a PromLens-style query tree, is the default; `--enable-feature=old-ui` restores the previous one.
+
+## Pitfalls
+
+- Setting `translation_strategy: NoUTF8EscapingWithSuffixes` while dashboards still reference underscored names produces empty panels with no error: the series exist under their dotted names, and the underscored selectors match nothing.
+- An OTLP resource attribute absent from `promote_resource_attributes` is not a label, so aggregations grouping by it collapse every series into one group rather than failing.
+- A dotted metric name written as a bare PromQL identifier is a parse error; it must appear inside braces in quoted form.
+- Exemplars and created timestamps silently disappear when either end of a remote-write link speaks only protocol version 1.0, because version negotiation downgrades the payload instead of rejecting the connection.
+- `rate()` panels compared across a 2.x and a 3.0 instance differ at range boundaries because of the left-open interval, so alert thresholds tuned against 2.x values may fire or stop firing after the upgrade.
+- A matcher relying on `.` to stop at a newline now spans the whole value, widening the match set without any syntax change.
+- Rolling back to a 2.x release older than 2.55 leaves the TSDB unreadable by the downgraded binary.

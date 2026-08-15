@@ -1,9 +1,9 @@
 ---
 title: "Exemplars: the sticky note a metric leaves for a trace"
 date: 2026-07-26
+summary: "A histogram reports that the 99th percentile regressed but not which request caused it. Exemplars attach a sampled trace identifier to a metric sample so a dashboard can link from the graph to the trace. This covers the exposition format, the storage flag, and the wiring."
 track: observability
-summary: "A histogram tells you P99 got worse; it can't tell you which request caused it. Exemplars attach a sampled trace_id to a metric sample so Grafana can jump straight from the graph to the offending trace. Here's the format, the flags, and the wiring."
-reading_time: 5
+reading_time: 6
 tags: [exemplars, prometheus, opentelemetry, grafana, tracing, metrics, openmetrics]
 sources:
   - title: "OpenMetrics specification (Exemplars)"
@@ -18,42 +18,38 @@ sources:
     url: "https://github.com/prometheus/client_golang/blob/main/examples/exemplars/main.go"
 ---
 
-You've stared at this graph before: a latency histogram, P99 line creeping up over the last ten minutes. Something got slow. The histogram is very sure about *that*. It has no opinion on *which request*. It's an aggregate — thousands of observations folded into bucket counts — and aggregates are, definitionally, information you already threw away the specific in order to get.
+**Gist.** A latency histogram is an aggregate: thousands of observations folded into bucket counts, with the identity of each observation discarded by construction, so it can report that a percentile regressed but not which request regressed it. An exemplar restores one link by attaching a small label set — conventionally a trace identifier (`trace_id`) — plus the observed value to the bucket the observation landed in, letting a dashboard deep-link from a point on the graph into the corresponding distributed trace. The cost is that the link is sampled and bounded: **at most one exemplar per bucket sample**, stored in a fixed-size in-memory buffer that is opt-in, so the connection is best-effort and every stage in the pipeline fails to an empty state rather than an error.
 
-Meanwhile your tracing backend has exactly the request you want: full span tree, DB calls, exact duration. But you have no way to ask it "show me the one that pushed P99 over 400ms" — traces don't know what a percentile is either. Two systems, each holding half of the answer, with no wire between them.
+## What an exemplar is
 
-Exemplars are that wire.
+An exemplar is a single sampled data point attached to a metric sample: a set of labels, the exact value observed, and optionally a timestamp. It is not a summary. It is one specific measurement retained alongside the bucket it fell into.
 
-## What an exemplar actually is
-
-An exemplar is a single sampled data point attached to a metric sample: a small set of labels (almost always including a `trace_id`) plus the exact value that was observed, and optionally a timestamp. It's not a summary or an aggregate — it's one specific measurement, kept alongside the bucket it landed in, as a receipt.
-
-The OpenMetrics spec defines the syntax precisely. On a histogram, exemplars ride on the bucket line:
+The [OpenMetrics specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md) defines the syntax. On a histogram, an exemplar rides on the bucket line, after a `#` separator:
 
 ```
 http_request_duration_seconds_bucket{le="0.5"} 129389 # {trace_id="a1b2c3d4e5f6"} 0.372 1690000000.928
 ```
 
-Per the [OpenMetrics spec](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md), that trailing `# {...} value timestamp` block is the exemplar: the label set is capped at 128 UTF-8 characters combined, the sample value must fall inside the bucket's range, and each bucket line carries **at most one** exemplar — the client library keeps the most recent (or a randomly sampled) observation per bucket, it doesn't try to remember all of them. Exemplars are only legal on Histogram bucket samples, GaugeHistogram bucket samples, and Counter totals — you can't hang one off an arbitrary Gauge.
+The specification constrains this construct in three ways that determine how it behaves in practice:
 
-That last constraint is the whole design: exemplars aren't a general-purpose tracing sidecar, they're scoped to exactly the metric types where "which specific sample landed here" is a meaningful question — the ones a percentile can hide a slow outlier inside.
+- The exemplar's **label set is capped at 128 UTF-8 characters combined** (names and values together). A trace identifier fits; an attempt to carry a request body or a stack fragment does not.
+- The **sample value must fall inside the bucket's range**. An exemplar on the `le="0.5"` bucket asserts an observation at or below 0.5 seconds.
+- Each bucket line carries **at most one exemplar**. A client library retains one observation per bucket — the most recent, or one chosen by sampling — and discards the rest.
 
-## The problem in one sentence
+Exemplars are legal only on Histogram bucket samples, GaugeHistogram bucket samples, and Counter totals. They cannot be attached to an arbitrary Gauge.
 
-A histogram answers "how bad, in aggregate." An exemplar answers "show me one instance of how bad, and give me a key to look it up." Without it, going from "P99 regressed" to "here's the trace" means grepping logs by timestamp and hoping, or eyeballing the tracing UI's own latency histogram and guessing which span matches the metric dashboard's time window. With it, you click the dot.
+## The invariant the pipeline must preserve
 
-## How they flow through the stack
-
-Three independent pieces have to agree to make this work end to end:
+Four independent components must each cooperate, and the identifier must survive unchanged through all of them. The label emitted by the client library, serialized on the `/metrics` endpoint, parsed and stored by Prometheus, and named in the dashboard's data-source configuration must be **the same label name and the same identifier value**. Any stage that drops it breaks the link without reporting a fault.
 
 | Stage | Component | Responsibility |
 |---|---|---|
-| Emit | App + OTel/Prometheus client library | Attach the active `trace_id` to the histogram observation |
-| Expose | `/metrics` endpoint | Serialize the exemplar using OpenMetrics exposition format |
-| Scrape + store | Prometheus | Parse the exemplar, persist it (opt-in) |
-| Render | Grafana | Draw the exemplar as a marker on the graph, deep-link to the trace |
+| Emit | Application plus OpenTelemetry (OTel) or Prometheus client library | Attach the active `trace_id` to the histogram observation |
+| Expose | `/metrics` endpoint | Serialize the exemplar in OpenMetrics exposition format |
+| Scrape and store | Prometheus | Parse the exemplar and persist it (opt-in) |
+| Render | Grafana | Draw the exemplar as a marker and deep-link to the trace |
 
-**Emit.** A Prometheus client library exposes exemplar support through an `ObserveWithExemplar`-style call (in Go, the histogram's `ExemplarObserver` interface). Inside a traced request handler you pull the current span's trace ID and pass it as the exemplar label:
+**Emit.** A Prometheus client library exposes exemplar support through an `ObserveWithExemplar`-style call — in Go, the histogram's `ExemplarObserver` interface. Inside a traced handler, the current span's trace identifier is read from the context and passed as an exemplar label:
 
 ```go
 requestDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -71,17 +67,17 @@ func recordRequest(ctx context.Context, start time.Time) {
 }
 ```
 
-OpenTelemetry SDKs do the equivalent automatically for metrics recorded inside an active span context — the exemplar sampling and trace-context attachment happens in the SDK, not in application code, which is the whole point of using OTel instrumentation instead of hand-rolled client calls.
+OpenTelemetry SDKs perform the equivalent attachment for metrics recorded inside an active span context, keeping the sampling decision inside the SDK rather than in application code.
 
-**Expose.** The metrics endpoint only serializes exemplars if the scrape negotiates the OpenMetrics text format (`Accept: application/openmetrics-text`) rather than the older plain Prometheus text format — exemplars don't exist in the legacy exposition format at all. This is invisible to you in practice: Prometheus requests OpenMetrics automatically, but if you're eyeballing `/metrics` with `curl` and not seeing exemplars, that's usually why.
+**Expose.** The endpoint serializes exemplars only when the scrape negotiates the OpenMetrics text format via `Accept: application/openmetrics-text`. **The legacy Prometheus text exposition format has no representation for exemplars at all**, so a manual `curl` that does not send the header retrieves a valid but exemplar-free response. Prometheus requests OpenMetrics itself.
 
-**Scrape and store.** This is the step people forget, because it's an opt-in feature flag, not a default. Prometheus must be started with:
+**Scrape and store.** Exemplar storage is an opt-in feature flag rather than a default:
 
 ```
 --enable-feature=exemplar-storage
 ```
 
-Per the [Prometheus feature flags docs](https://prometheus.io/docs/prometheus/latest/feature_flags/), exemplar storage is a fixed-size, in-memory circular buffer — exemplars are not kept forever, and a single `trace_id`-only exemplar costs roughly 100 bytes. The buffer size is tunable in the config file:
+Per the [Prometheus feature flags documentation](https://prometheus.io/docs/prometheus/latest/feature_flags/), exemplar storage is a **fixed-size in-memory circular buffer**, so exemplars are retained only until overwritten, and a single exemplar carrying only a `trace_id` costs roughly 100 bytes. The buffer size is set in the configuration file:
 
 ```yaml
 storage:
@@ -89,9 +85,9 @@ storage:
     max_exemplars: 100000
 ```
 
-Without the flag, Prometheus scrapes and stores the histogram normally and silently drops every exemplar line it parses. There's no warning — the metric just looks exemplar-free, which is the most common reason "exemplars aren't showing up" turns out to be a missing flag rather than a missing trace_id.
+Without the flag, Prometheus scrapes and stores the histogram normally and drops every exemplar line it parses, with no warning emitted. The resulting series is indistinguishable from one that was never instrumented.
 
-**Render.** In Grafana, exemplar support is a property of the Prometheus data source, on by default once the underlying data has exemplars. The [Grafana docs](https://grafana.com/docs/grafana/latest/fundamentals/exemplars/) describe them rendering as small marker points overlaid on the time series; hovering shows the trace ID and a button to jump into the configured trace data source. To turn that button into a real deep link, the data source's **Exemplars** config needs:
+**Render.** In Grafana, exemplar support is configured on the Prometheus data source. The [Grafana documentation](https://grafana.com/docs/grafana/latest/fundamentals/exemplars/) describes them rendering as marker points overlaid on the time series, with a hover panel showing the trace identifier and a button that opens the configured trace data source. The deep link requires the data source's exemplars configuration to map a label to a destination:
 
 ```yaml
 exemplarTraceIdDestinations:
@@ -99,16 +95,50 @@ exemplarTraceIdDestinations:
     name: trace_id
 ```
 
-`name` must match the label the client library used (`trace_id` above), and `datasourceUid` points at your Tempo or Jaeger data source. Get the label name wrong and the dots render but the link goes nowhere.
+`name` must equal the label name the client library used, and `datasourceUid` identifies the Tempo or Jaeger data source. A mismatched `name` still renders the markers; the link resolves to nothing.
 
-## Enabling it end to end — the checklist
+### Implementation sketch (Scala)
 
-1. Instrument histograms with exemplars (native OTel SDK, or `ObserveWithExemplar` in a Prometheus client library), tagging the sample with the request's live `trace_id`.
-2. Confirm `/metrics` serves OpenMetrics format — check for `# {trace_id=...}` lines when scraped with `Accept: application/openmetrics-text`.
-3. Start Prometheus with `--enable-feature=exemplar-storage`; size the buffer via `storage.exemplars.max_exemplars` if the default is too small for your exemplar volume.
-4. In Grafana's Prometheus data source, set `exemplarTraceIdDestinations` to point `trace_id` at your Tempo/Jaeger data source UID.
-5. Query the histogram in Explore or a dashboard panel and confirm dots appear with working "Query with Tempo" links.
+The retention rule — one exemplar per bucket, overwritten by later observations in the same bucket — is the load-bearing mechanism. A minimal histogram implementing it:
 
-Each step fails silently if skipped, which is exactly why exemplars have a reputation for "not working" — the failure mode is always an empty state, never an error.
+```scala
+final case class Exemplar(labels: Map[String, String], value: Double, ts: Double)
 
-**Try next:** wire the exemplar's timestamp into a Tempo TraceQL query filtered to ±5s of the spike, so the deep link lands on a short list of candidate traces instead of a single point-in-time guess.
+final class ExemplarHistogram(bounds: Vector[Double]):
+  // bounds are the upper inclusive edges (`le`); the final +Inf bucket is implicit.
+  private val counts    = Array.fill(bounds.length + 1)(0L)
+  private val exemplars = Array.fill[Option[Exemplar]](bounds.length + 1)(None)
+
+  private def bucketOf(v: Double): Int =
+    val i = bounds.indexWhere(v <= _)
+    if i < 0 then bounds.length else i
+
+  def observe(v: Double, labels: Map[String, String], ts: Double): Unit =
+    val i = bucketOf(v)
+    counts.indices.drop(i).foreach(j => counts(j) += 1) // cumulative buckets
+    if labelBudget(labels) <= 128 then
+      exemplars(i) = Some(Exemplar(labels, v, ts)) // last writer per bucket wins
+
+  private def labelBudget(labels: Map[String, String]): Int =
+    labels.foldLeft(0)((n, kv) => n + kv._1.length + kv._2.length)
+
+  def expose(name: String): String =
+    (bounds.map(_.toString) :+ "+Inf").zipWithIndex.map { case (le, i) =>
+      val ex = exemplars(i).fold("") { e =>
+        val ls = e.labels.map((k, v) => s"""$k="$v"""").mkString(",")
+        s" # {$ls} ${e.value} ${e.ts}"
+      }
+      s"""${name}_bucket{le="$le"} ${counts(i)}$ex"""
+    }.mkString("\n")
+```
+
+Two properties follow directly from the array layout. An observation increments every cumulative bucket at or above its own index but writes its exemplar to **exactly one** slot, so a rare slow request leaves its receipt only in the bucket that first contains it. And because the write is an unconditional overwrite, the exemplar surviving a scrape interval is the last qualifying observation in that bucket, not the slowest one.
+
+## Pitfalls
+
+- Prometheus started without `--enable-feature=exemplar-storage` parses exemplar lines and discards them silently; the symptom is a correctly populated histogram with no markers and no log entry naming exemplars.
+- Fetching `/metrics` with a plain `curl` shows no exemplars because the default request does not negotiate `application/openmetrics-text`, and the legacy format cannot encode them; the endpoint is not at fault.
+- A label set exceeding **128 UTF-8 characters** violates the OpenMetrics constraint, so attaching span attributes alongside `trace_id` can push the exemplar past the cap.
+- Naming the label `traceID` in the client library while `exemplarTraceIdDestinations.name` says `trace_id` renders markers whose link target is empty — the failure appears in the click, not in the graph.
+- The exemplar buffer is fixed-size and in-memory: at high observation rates the exemplar for an old spike is overwritten before an investigation reaches it, and a Prometheus restart empties it entirely.
+- An exemplar identifies *an* observation in the bucket, not the worst one; treating the linked trace as the p99 outlier is unsound when the bucket is wide.

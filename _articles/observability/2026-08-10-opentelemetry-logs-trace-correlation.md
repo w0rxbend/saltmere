@@ -2,7 +2,7 @@
 title: "OpenTelemetry Logs: Correlating Logs with Traces via the Bridge API"
 date: 2026-08-10
 track: observability
-summary: "Unlike metrics and traces, OTel logs are built to wrap the logging library you already have. Here's the LogRecord data model, why you never call the Logs Bridge API directly, and a working Python appender that auto-stamps every log with the active span's trace_id and span_id."
+summary: "Unlike metrics and traces, the OpenTelemetry logs signal is specified as a bridge over an existing logging library. This article covers the LogRecord data model, the reason the Logs Bridge API is not an application-facing surface, and a Python appender that stamps every record with the active span's trace_id and span_id."
 reading_time: 6
 tags: [opentelemetry, logs, otlp, traces, correlation, python, observability]
 sources:
@@ -18,43 +18,45 @@ sources:
     url: "https://opentelemetry.io/docs/specs/status/"
 ---
 
-Metrics and traces arrived in OpenTelemetry as greenfield APIs: you instrument your code by calling `tracer.start_as_current_span(...)` or incrementing a counter, and there was rarely a prior standard to displace. Logs are different. Every service already logs — through `logging` in Python, Logback or Log4j in Java, `log/slog` in Go — and nobody wants to rewrite thousands of log statements. So OTel took the opposite design stance: **the logs signal is a bridge over your existing logging library, not a replacement for it.** That single decision explains almost everything that looks odd about the OTel logs API.
+**Gist.** A log line and a trace span describing the same request are two disconnected records unless they share identifiers. OpenTelemetry (OTel) solves this by specifying its logs signal as a **bridge**: an appender installed into the existing logging library translates each native record into an OTel `LogRecord` and copies the **trace context of the currently active span** into the record's `TraceId`, `SpanId` and `TraceFlags` fields. The cost is that correlation holds only where the appender can observe an active span in the current context — records emitted outside a span, or on a thread or task the context did not propagate to, arrive with those fields empty and remain uncorrelated.
+
+Metrics and traces entered OTel as greenfield application-facing interfaces: instrumentation means calling `tracer.start_as_current_span(...)` or incrementing a counter. Logging is not greenfield. Services already log through `logging` in Python, Logback or Log4j in Java, `log/slog` in Go. The OTel logs specification takes the corresponding position: **the logs signal wraps an existing logging library rather than replacing it.** That stance accounts for the shape of the API described below.
 
 ## The log data model
 
-OTel first defines a vendor-neutral shape that any log line can be projected into. A **LogRecord** (data model status: **Stable**) has these fields:
+The specification first defines a vendor-neutral record shape into which any log line can be projected. A **LogRecord** (data model status: **Stable**) carries:
 
 - **Timestamp** — when the event occurred.
-- **ObservedTimestamp** — when the collection layer observed it; falls back to `Timestamp` and is used when the original event time is unknown.
-- **TraceId**, **SpanId**, **TraceFlags** — the trace-context fields. This is the correlation payload.
-- **SeverityNumber** and **SeverityText** — a normalized numeric severity plus the original level string.
-- **Body** — the log message itself (a string, or structured data).
+- **ObservedTimestamp** — when the collection layer observed the event; where the original event time is unknown it stands in as an approximation of `Timestamp`.
+- **TraceId**, **SpanId**, **TraceFlags** — the trace-context fields, and the entire correlation payload.
+- **SeverityNumber** and **SeverityText** — a normalized numeric severity alongside the original level string.
+- **Body** — the message itself, either a string or structured data.
 - **Attributes** — key/value pairs specific to this event.
-- **Resource** — what emitted the log (`service.name`, `k8s.pod.name`, …), shared across all telemetry from that process.
-- **InstrumentationScope** and **EventName** round out the record.
+- **Resource** — the identity of the emitting entity (`service.name`, `k8s.pod.name`, and similar), shared across all telemetry from that process.
+- **InstrumentationScope** and **EventName** complete the record.
 
-`SeverityNumber` is the quiet workhorse. Every language and library spells levels differently — `WARNING` vs `WARN` vs `30`. OTel maps them onto a fixed ordinal scale so backends can filter consistently: **TRACE 1–4, DEBUG 5–8, INFO 9–12, WARN 13–16, ERROR 17–20, FATAL 21–24**. The four steps per band let a bridge preserve nuance (e.g. `WARN` = 13, `WARN3` = 15) while still sorting cleanly.
+`SeverityNumber` exists because level vocabularies differ across ecosystems: `WARNING`, `WARN` and a bare integer may all denote the same band. The specification maps them onto a fixed ordinal scale so that a backend can filter uniformly: **TRACE 1–4, DEBUG 5–8, INFO 9–12, WARN 13–16, ERROR 17–20, FATAL 21–24**. The four steps per band allow a bridge to preserve intra-band gradations — `WARN` at 13, `WARN3` at 15 — while the total order remains sortable.
 
-The three fields that make this article worth reading are **TraceId**, **SpanId**, and **TraceFlags**. From the spec: `TraceId` is the "Request trace ID as defined in W3C Trace Context ... Can be set for logs that are part of request processing," and "If SpanId is present TraceId SHOULD be also present." `TraceFlags` carries the W3C sampled flag. All three are optional — but when they are populated, a log line stops being an isolated string and becomes a node hanging off a specific span in a specific trace. That is what lets you click a span in Grafana/Tempo and jump straight to the logs Loki recorded for it.
+The three fields that make correlation possible are **TraceId**, **SpanId** and **TraceFlags**. The specification states that `TraceId` is the "Request trace ID as defined in W3C Trace Context ... Can be set for logs that are part of request processing," and that "If SpanId is present TraceId SHOULD be also present." `TraceFlags` carries the trace flags as defined by W3C Trace Context, of which the sampled bit is the only one that specification defines. **All three are optional.** When populated, the log line ceases to be an isolated string and becomes a record attached to one span within one trace, which is the precondition for navigating from a span in a trace viewer to the log lines a log store recorded for it.
 
-## Why you don't call the Logs API directly
+## Why the Logs API is not called directly
 
-Here is the part that trips people up. OTel has a **Logs Bridge API**, and its spec (**Status: Stable**) is blunt about who it is for:
+OTel defines a **Logs Bridge API** whose specification (**Status: Stable**) states its intended caller explicitly:
 
 > "The API is not intended to be called by application developers directly. It is provided for logging library authors to build log appenders, which use this API to bridge between existing logging libraries and the OpenTelemetry log data model."
 
-Contrast that with the Tracing API, which *is* your application-facing surface. For logs there is no ergonomic `otel_log.info("hello")` you sprinkle through your code. Instead the flow is:
+This differs from the Tracing API, which is an application-facing surface. There is no ergonomic per-statement logging call to distribute through application code. The flow instead has four stages:
 
-1. You keep calling your normal logger (`logging.getLogger(__name__).error(...)`).
-2. An **appender** (a.k.a. bridge) — a handler plugged into your logging library — receives each record.
-3. The appender translates it into an OTel `LogRecord` via the Bridge API's `Logger.emit(...)`, filling in severity, body, attributes, **and the trace context from the currently active span**.
-4. The **LoggerProvider** / SDK batches and exports those records over OTLP.
+1. Application code continues to call its normal logger, for example `logging.getLogger(__name__).error(...)`.
+2. An **appender** — a handler installed into the logging library — receives each native record.
+3. The appender translates that record into an OTel `LogRecord` through the Bridge API's `Logger.emit(...)`, populating severity, body, attributes, **and the trace context read from the currently active span**.
+4. The **LoggerProvider** and SDK batch those records and export them over the OpenTelemetry Protocol (OTLP).
 
-You configure the appender and SDK once at startup; individual log statements stay untouched. (The spec deliberately avoids baking the word "bridge" or "appender" into the API names, leaving room for a future user-facing logging API — but today, wrapping an existing library is the intended path.)
+The appender and SDK are configured once at process startup; individual log statements are unmodified. Neither "bridge" nor "appender" appears in the API surface itself, which is `LoggerProvider`, `Logger` and `emit`. Wrapping an existing library is the path the current specification describes; whether OTel later adds an application-facing logging API is not settled by this document.
 
 ## Concrete setup: Python
 
-Python's SDK ships a `LoggingHandler` that is exactly this appender for the stdlib `logging` module. Wire it up alongside a tracer:
+The Python SDK ships `LoggingHandler`, an appender for the standard-library `logging` module. It is installed alongside a tracer:
 
 ```python
 import logging
@@ -95,15 +97,15 @@ with tracer.start_as_current_span("charge-card"):
     log.error("gateway declined the card")   # <-- carries trace_id + span_id
 ```
 
-The critical line is the last one. Because it runs inside `start_as_current_span`, the `LoggingHandler` reads the **active span from the current context** and stamps that record's `TraceId`, `SpanId`, and `TraceFlags` automatically. A log emitted *outside* any span simply leaves those fields empty. You changed no log statements — only startup wiring — and correlation is now free.
+The final statement is the load-bearing one. Because it executes inside `start_as_current_span`, the `LoggingHandler` reads the **active span from the current context** and stamps that record's `TraceId`, `SpanId` and `TraceFlags`. A log emitted outside any span leaves those fields empty; **the appender has no other source for them, so correlation is a property of context propagation rather than of the logging call**. No log statement changed — only startup wiring.
 
-Note the `_logs` module underscore: the API is stable, but Python still exposes the SDK internals under a leading underscore in several releases. `OTLPLogExporter` pushes records to `localhost:4317` (or wherever `OTEL_EXPORTER_OTLP_ENDPOINT` points) — normally a Collector.
+The leading underscore in `opentelemetry._logs` and `opentelemetry.sdk._logs` reflects that the Python packages expose these modules as private in several releases even though the specification is stable; module paths can therefore move between versions. `OTLPLogExporter` sends records to `localhost:4317` by default, or to whatever `OTEL_EXPORTER_OTLP_ENDPOINT` names — typically a Collector.
 
-**Java** follows the same pattern with a named appender instead of a handler: add `OpenTelemetryAppender` from `io.opentelemetry.instrumentation.logback.appender.v1_0` to `logback.xml` (there's a Log4j2 equivalent), and it copies the active span context onto every event. Same idea, different logging ecosystem — which is the whole point of the bridge model.
+**Java** follows the same pattern with a named appender rather than a handler: `OpenTelemetryAppender` from `io.opentelemetry.instrumentation.logback.appender.v1_0` is declared in `logback.xml`, with a Log4j2 equivalent available, and it copies the active span context onto each event. The mechanism is identical; only the host logging ecosystem differs, which is what the bridge model is for.
 
 ## The Collector path
 
-The appender sends OTLP logs to a Collector, which receives, processes, and re-exports them:
+The appender exports OTLP logs to a Collector, which receives, processes and re-exports them:
 
 ```yaml
 receivers:
@@ -127,10 +129,14 @@ service:
       exporters: [otlphttp/loki]
 ```
 
-The `trace_id`/`span_id` fields survive this hop as first-class LogRecord attributes. In Loki they land as **structured metadata** (not labels — high cardinality), so in Grafana a `{service_name="checkout"} | trace_id="..."` query pulls exactly the logs for one trace, and Tempo's "Logs for this span" link works because both signals agree on the same IDs. Correlation is not a Grafana feature bolted on afterward; it is the trace context riding inside each LogRecord from the moment the appender created it.
+The `trace_id` and `span_id` fields survive this hop as first-class LogRecord fields. In Loki they are stored as **structured metadata rather than labels**, since trace identifiers are high-cardinality and labels form the index. A Grafana query of the form `{service_name="checkout"} | trace_id="..."` then selects the logs belonging to a single trace, and a trace viewer's per-span log link resolves because both signals carry identical identifiers. **Correlation is not a query-layer join heuristic; it is the trace context carried inside each LogRecord from the moment the appender constructed it.**
 
-## Why this matters
+## Pitfalls
 
-The payoff of the bridge design is that trace-log correlation costs you almost nothing at the code level. You do not adopt a new logging API, you do not thread trace IDs through function calls by hand, and you do not maintain a custom log formatter that greps the context. You install an appender, point an exporter at a Collector, and every log written inside a span is automatically joined to that span. When an alert fires on a span with an error, the logs are already sitting on it.
-
-**Try next:** Run the Python snippet against a local Collector (`otel/opentelemetry-collector-contrib`) wired to Loki + Tempo + Grafana, emit one log inside a span and one outside it, then confirm in Grafana that only the in-span log carries a `trace_id` — and that clicking the span surfaces it.
+- **A log line emitted outside an active span has empty `TraceId` and `SpanId`.** The appender copies the context that is current at emission time and has no fallback; startup logs, background schedulers and shutdown hooks are the usual sources of uncorrelated records.
+- **Context that does not propagate across a thread, executor or async task boundary silently drops correlation.** The log line is still exported, so the failure appears as missing rows in a trace-filtered query rather than as an error.
+- **Attaching `trace_id` as a Loki label instead of structured metadata inflates the label index**, because every trace creates a distinct label value and therefore a distinct stream.
+- **Adding `LoggingHandler` to a logger that also propagates to the root logger, which itself carries the handler, emits each record twice.** The duplicate carries the same trace context, so it is indistinguishable in a correlated view.
+- **Calling the Logs Bridge API from application code contradicts its documented scope**; the specification designates it for logging-library authors building appenders, not for per-statement use in application code.
+- **A severity mapping that collapses a level band to a single ordinal discards intra-band ordering.** Downstream filters expressed against the 1–24 scale then cannot distinguish, for example, `WARN` from `WARN3`.
+- **`ObservedTimestamp` is not the event time.** Reading it as the event time reorders records whenever collection lags emission, such as after a batch export backlog.

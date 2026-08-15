@@ -1,9 +1,9 @@
 ---
-title: "OCB: Build the OpenTelemetry Collector You Actually Need"
+title: "OCB: Compiling a Minimal OpenTelemetry Collector Distribution"
 date: 2026-08-15
 track: observability
-summary: "The contrib Collector ships hundreds of components you will never enable — each one attack surface, binary weight, and CVE exposure. The OpenTelemetry Collector Builder (ocb) compiles a distribution from a ~20-line manifest of pinned components. Here's a complete builder-config.yaml, the build commands, and how the official k8s distro is assembled the same way."
-reading_time: 5
+summary: "The contrib Collector compiles in hundreds of components that a given deployment never enables — each one binary weight, configuration surface, and CVE triage load. The OpenTelemetry Collector Builder (ocb) generates and compiles a distribution from a short manifest of pinned components. This article covers a complete builder-config.yaml, the build steps, per-component stability levels, and how the official k8s distribution is assembled from the same format."
+reading_time: 6
 tags: [opentelemetry, collector, ocb, otel-collector-builder, distributions, supply-chain]
 sources:
   - title: "OpenTelemetry docs — Build a custom collector with OCB"
@@ -18,21 +18,21 @@ sources:
     url: "https://www.dash0.com/guides/custom-opentelemetry-collector"
 ---
 
-Most teams run `otelcol-contrib` in production because it's the distribution that has everything. That's exactly the problem. Contrib bundles hundreds of components — every receiver from Kafka to vCenter, exporters for a dozen vendors you don't use — and each one is compiled-in Go code: extra binary size, slower CVE triage (a vulnerability in *any* vendored component pages *you*), and configuration surface an attacker or a well-meaning teammate can enable. The project's own answer is the **OpenTelemetry Collector Builder (`ocb`)**: declare the handful of components you actually use in a manifest, compile a distribution containing only those. As of **v0.158.0** (August 2026), `ocb` ships as a binary alongside the official distros in the `opentelemetry-collector-releases` repo.
+**Gist.** The OpenTelemetry Collector is a static Go binary whose component set is fixed at compile time, so the widely deployed `otelcol-contrib` distribution carries the code for hundreds of receivers, processors, exporters and connectors regardless of how few a given pipeline enables. The **OpenTelemetry Collector Builder (`ocb`)** inverts this: a manifest lists the components required, and `ocb` generates a Go module registering exactly those and compiles it. The cost is an owned build pipeline — a Go toolchain, a version bump on every Collector release, and responsibility for the component selection that a vendor distribution would otherwise make.
 
-## Why the fat distro is a liability
+## The property that makes distribution choice load-bearing
 
-Three concrete reasons, in the order they usually bite:
+The Collector has no plugin loader. A component is available to configuration if and only if it was **registered in the binary at build time**; the YAML configuration selects among registered components rather than loading new ones. Three consequences follow, in the order they typically surface.
 
-1. **Attack surface.** Every registered component is reachable from YAML. A collector that physically contains only `otlp`, `batch`, and your one exporter cannot be misconfigured into scraping cloud metadata or opening a Zipkin port.
-2. **Vulnerability management.** Contrib's go.mod pulls in hundreds of transitive dependencies. Your scanner will flag CVEs in components you never enable, and you'll ship patch releases for them anyway because the binary contains the code.
-3. **Size and startup.** Fewer components means a smaller image to pull on every node — this matters at DaemonSet scale — and a faster, smaller process.
+1. **Configuration surface equals compiled surface.** Every registered component is reachable from YAML. A binary that contains only the OpenTelemetry Protocol (OTLP) receiver, the batch processor and one exporter **cannot** be configured to open a Zipkin port or scrape a cloud metadata endpoint, because that code is absent. Restricting the binary is therefore a stronger control than restricting the configuration file, which can be edited.
+2. **Vulnerability triage covers the whole module graph.** Contrib's `go.mod` pulls the transitive dependencies of every bundled component. A scanner reports findings against code that is present in the binary irrespective of whether the enclosing component is enabled, so patch releases are driven by components the deployment never instantiates.
+3. **Image size and process footprint.** Fewer compiled components mean a smaller image to pull, which is amplified when the Collector runs as a DaemonSet with one pod per node.
 
-The independent guides (Dash0's is a good one) all converge on the same recommendation: contrib is for evaluation; production wants a custom or purpose-built distro.
+The independent guides converge on the same split: contrib for evaluation, a curated or purpose-built distribution for production.
 
-## The manifest: pin everything
+## The manifest
 
-`ocb` consumes a single YAML manifest. Component versions follow the Collector's release train — core and contrib components at `v0.158.0`, stable confmap providers on the `v1.x` line (`v1.48.0` pairs with 0.158.0). A complete, working `builder-config.yaml` for a typical trace/metrics gateway:
+`ocb` consumes a single YAML manifest with a `dist` block and one list per component kind. Versions follow the Collector's release train: core and contrib components share the `v0.x` series — **`v0.158.0`** at the time of writing — while the stable `confmap` providers are versioned on the separate **`v1.x`** line. Both lines are cut in the same release, and the `v1.x` version that pairs with a given `v0.x` release is the one listed in that release's notes — it is not derivable from the `v0.x` number. A manifest for a trace-and-metrics gateway:
 
 ```yaml
 dist:
@@ -61,11 +61,13 @@ providers:
   - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.48.0
 ```
 
-Note the mix: core components come from `go.opentelemetry.io/collector/...`, contrib ones from the `opentelemetry-collector-contrib` module — the manifest is where you cherry-pick contrib without swallowing it whole. The `transformprocessor` and `spanmetricsconnector` above are the OTTL and span-metrics pieces we've covered before; they slot in as one line each.
+The two module prefixes matter. Core components live under `go.opentelemetry.io/collector/...`; contrib components live under `github.com/open-telemetry/opentelemetry-collector-contrib/...`. **The manifest is the point at which individual contrib components are taken without taking the contrib distribution**, one line per component — the transform processor (the OpenTelemetry Transformation Language, OTTL) and the span-metrics connector enter this way.
 
-## Build and run
+The `providers` list is easy to under-populate. Confmap providers implement the URI schemes the configuration loader understands; omitting `envprovider` removes the ability to resolve `${env:...}` references in the configuration, and omitting `fileprovider` removes `file:` resolution. **A missing provider surfaces as a configuration-resolution failure at startup, not as a build error**, because the manifest and the runtime configuration are checked at different times.
 
-Grab `ocb` for your platform from the collector-releases page and build:
+## Build
+
+The `ocb` binary is published on the `opentelemetry-collector-releases` releases page alongside the official distributions.
 
 ```bash
 curl -sLO https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.158.0/ocb_0.158.0_linux_amd64
@@ -77,14 +79,27 @@ chmod +x ocb_0.158.0_linux_amd64 && mv ocb_0.158.0_linux_amd64 ocb
 ./otelcol-acme/otelcol-acme --config collector-config.yaml
 ```
 
-`ocb` generates a real Go module (`main.go`, `components.go`, `go.mod`) and runs `go build` — you need Go ≥ 1.24 on the build machine, or run it in a multi-stage Dockerfile and copy the static binary into a distroless image. Because the output is ordinary Go source, you can also vendor it, run `govulncheck` against it, and get supply-chain attestation over a dependency set you chose, not one chosen for you. Rebuilding on each Collector release is a one-line version bump — worth automating in CI.
+The build is two phases. `ocb` first **generates an ordinary Go module** — `main.go`, `components.go` and `go.mod` — in `output_path`, where `components.go` is the generated registry mapping each component's type name to its factory; it then invokes `go build`. This requires **a Go toolchain on the build machine** at the version the Collector's own modules require, which in container workflows means a multi-stage Dockerfile whose first stage holds the toolchain and whose final stage carries only the resulting binary into a distroless image.
 
-## Stability is per-component, per-signal
+Because the intermediate artefact is plain Go source over a dependency set fixed by the manifest, the generated module can be vendored, scanned with `govulncheck`, and attested like any other first-party Go build. Tracking upstream is then a version edit across the manifest's `gomod` lines per Collector release, which is the part worth automating in continuous integration (CI).
 
-The other reason to hand-pick: components mature at very different rates. The Collector defines six stability levels — **development**, **alpha**, **beta**, **stable**, plus **deprecated** and **unmaintained** — and they're assessed *per signal*: a receiver can be stable for metrics while its traces support is still beta. Alpha components may change configuration "with minimal notice"; unmaintained ones can be removed after three months without a code owner. Contrib happily ships all of these side by side. A curated manifest forces you to look up each component's badge in its README once, instead of discovering an alpha config break during an upgrade.
+## Stability is per component and per signal
 
-## Official distros are just manifests too
+Hand-picking components forces an explicit encounter with their maturity, which varies widely inside a single distribution. The Collector's `component-stability.md` defines six levels — **development**, **alpha**, **beta**, **stable**, plus **deprecated** and **unmaintained** — and applies them **per signal**, so one component can be stable for metrics while its traces support is beta. Two of the levels carry concrete operational consequences: **an alpha component's configuration may change in breaking ways between releases**, and **a component left without an active code owner is marked unmaintained and may eventually be removed**. Contrib ships components at all of these levels side by side, so its inclusion of a component implies nothing about that component's stability. A curated manifest moves the reading of each component's stability badge to authoring time rather than to the upgrade that breaks.
 
-This isn't a niche workflow — it's how the project builds its own artifacts. The `opentelemetry-collector-releases` repo contains a `distributions/` directory where each official distro (`otelcol` core, `otelcol-contrib`, `otelcol-k8s`, the minimal `otelcol-otlp`, the eBPF profiler distro) is defined by exactly the same `manifest.yaml` format and built with `ocb` in CI. The **k8s distribution** is the instructive one: instead of contrib's everything, it pins a Kubernetes-shaped subset — `k8s_cluster`, `k8sobjects`, `kubeletstats`, `hostmetrics` and OTLP receivers; `k8sattributes`, `resourcedetection`, tail-sampling and transform processors; the `spanmetrics` and `servicegraph` connectors; the `opamp` extension for fleet management — a few dozen components instead of several hundred. Copying that manifest and deleting what you don't need is a legitimate way to start. (If you'd rather not own a build pipeline at all, that's essentially the pitch of vendor distros like Grafana Alloy — same components, someone else's curation.)
+## The official distributions use the same format
 
-**Try next:** run `go tool nm` or just `ls -lh` on `otelcol-contrib` versus your `ocb` output for the same pipeline config, then point `govulncheck ./...` at the generated module — the delta in binary size and reachable CVEs is the business case in two numbers.
+This is the project's own build path, not a side workflow. The `opentelemetry-collector-releases` repository holds a `distributions/` directory in which each official distribution — `otelcol` core, `otelcol-contrib`, `otelcol-k8s`, the minimal `otelcol-otlp`, and the eBPF profiler distribution — is defined by a `manifest.yaml` in exactly the format above and built with `ocb` in CI.
+
+The **k8s distribution** is the informative example of curation against a deployment shape. It pins the receivers a cluster deployment reads from — `k8s_cluster`, `k8sobjects`, `kubeletstats`, `hostmetrics`, `filelog` and OTLP — alongside the Kubernetes-aware processors `k8sattributes` and `resourcedetection`, and stops there: a component count in the tens rather than the hundreds, and no entry for the many contrib components that have nothing to do with Kubernetes. Copying that manifest and deleting the unused entries is a supported starting point. Vendor distributions such as Grafana Alloy occupy the other end of the same trade-off: the same upstream components under someone else's curation, with no build pipeline to own.
+
+A direct measurement of the difference is available without instrumentation: compare `ls -lh` on `otelcol-contrib` against the `ocb` output for an identical pipeline configuration, then run `govulncheck ./...` against the generated module. The delta in binary size and in reachable findings is the case for or against the custom build.
+
+## Pitfalls
+
+- **A component enabled in the Collector configuration but absent from the manifest fails at startup**, not at build time, with an unknown-type error — the manifest and the runtime configuration are separate files with no cross-check.
+- **Omitting a confmap provider silently removes a URI scheme.** Without `envprovider`, `${env:...}` references do not resolve and the Collector refuses to start, even though the build succeeded.
+- **Mixing version lines produces module resolution failures.** Core and contrib components use the `v0.x` series while stable confmap providers use `v1.x`; pinning a provider to a `v0.x` version, or leaving one component behind on an upgrade, breaks the build rather than degrading at runtime.
+- **Contrib membership is not a stability signal.** A component may be alpha for the signal in use, and alpha configuration may change in breaking ways between releases, so an upgrade that only bumps versions can still invalidate the configuration file.
+- **A component left without an active code owner can be marked unmaintained and later removed**, so a manifest pinned to an old release can fail to build against a newer one because the module path no longer exists.
+- **The build machine needs the Go toolchain, not only the runtime.** A CI image that carries only the collector binary cannot run `ocb`, which shells out to `go build` after generating sources.

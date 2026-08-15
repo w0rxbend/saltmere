@@ -2,8 +2,8 @@
 title: "ClickStack: wide events in ClickHouse as an observability stack"
 date: 2026-08-13
 track: observability
-summary: "ClickStack bundles an OpenTelemetry collector, ClickHouse, and the HyperDX UI into one open-source observability stack — betting that wide events in a columnar store beat three separate silos for logs, metrics, and traces. Here's the architecture, the verified cost numbers behind the hype, a one-command quick start, and where the Grafana LGTM stack still wins."
-reading_time: 5
+summary: "ClickStack bundles an OpenTelemetry collector, ClickHouse, and the HyperDX user interface into one open-source observability stack, on the premise that wide events in a columnar store replace three separate silos for logs, metrics, and traces. This article covers the architecture, the sourced cost figures, a single-container start, and the areas where the Grafana LGTM stack remains ahead."
+reading_time: 6
 tags: [clickstack, clickhouse, hyperdx, wide-events, opentelemetry]
 sources:
   - title: "ClickStack: A High-Performance OSS Observability Stack on ClickHouse (May 2025)"
@@ -18,58 +18,69 @@ sources:
     url: "https://tasrieit.com/blog/what-is-clickstack-clickhouse-observability-explained-2026"
 ---
 
-The three-silo model — metrics in a TSDB, logs in a log store, traces in a trace store — is an artifact of storage engines, not of how debugging actually works. When a sensor fleet's ingestion latency spikes, the question is always the same: *which* requests, from *which* devices, hitting *which* code path? Answering it across three databases means three query languages and correlation by timestamp squinting. The **wide events** camp argues you should instead record one fat, context-rich event per unit of work — user, service, HTTP path, status, cache result, device ID — and put it in a store that can aggregate arbitrary columns fast. That store, increasingly, is ClickHouse: it already sat under Signoz, Uptrace, and half the in-house Datadog replacements. **ClickStack** is ClickHouse Inc. making that architecture official.
+**Gist.** The conventional three-silo model — metrics in a time-series database (TSDB), logs in a log store, traces in a trace store — forces correlation across three engines and three query languages, with timestamps as the only join key. ClickStack replaces the three silos with one **wide event** per unit of work, stored in ClickHouse as a columnar table and queried with SQL, so correlation becomes a `WHERE` clause rather than a cross-system reconciliation. The cost is that everything now depends on one general-purpose analytical engine: metrics, alerting, and dashboarding are handled by components far younger than the Prometheus and Grafana equivalents they displace.
 
-## What ClickStack actually is
+## The wide-event premise
 
-ClickHouse acquired **HyperDX** in March 2025 and announced ClickStack that May. It's three known quantities glued together properly:
+A wide event records one row per unit of work, carrying the full context of that work — service, HTTP path, status, cache result, device identifier, firmware version — rather than splitting that context across a counter increment, a log line, and a span. The premise is that debugging questions are usually **aggregation-shaped**: which requests, from which devices, on which code path. Answering such a question needs a store that can group by an arbitrary column cheaply, which is what a columnar engine does. ClickHouse already sat beneath Signoz, Uptrace, and a number of in-house Datadog replacements before ClickHouse Inc. packaged the pattern.
 
-- an **OpenTelemetry collector** (custom distribution, preconfigured with ClickHouse-optimized schemas) as the only ingestion path — OTLP in, nothing proprietary;
+## Components
+
+ClickHouse acquired **HyperDX** in March 2025 and announced ClickStack that May. Three components:
+
+- an **OpenTelemetry (OTel) collector** — a custom distribution preconfigured with ClickHouse-oriented schemas — as the sole ingestion path, speaking the OpenTelemetry Protocol (OTLP) and nothing proprietary;
 - **ClickHouse** as the single store for logs, traces, metrics, and session replays;
-- **HyperDX** as the UI: Lucene-style search for grep-brain moments, full SQL when you need joins, plus dashboards, alerts, and trace waterfalls.
+- **HyperDX** as the interface: Lucene-style search, full SQL for joins, dashboards, alerts, and trace waterfalls.
 
-Development happens at a real clip — the HyperDX repo shipped **v2.34.0 on August 7, 2026**, and the all-in-one image moved from `docker.hyperdx.io` to `clickhouse/clickstack-all-in-one`. Everything is open source (HyperDX MIT, ClickHouse and the collector Apache-2.0), with a managed version now available in ClickHouse Cloud.
+The HyperDX repository continues to publish tagged releases, and the all-in-one image is distributed as `clickhouse/clickstack-all-in-one`. Licensing is open source throughout — HyperDX under MIT, ClickHouse and the collector under Apache-2.0 — with a managed variant in ClickHouse Cloud.
 
-The load-bearing feature is ClickHouse's native **JSON column type**: wide events have sparse, ever-changing attribute sets, and the JSON type stores each path as a real subcolumn. ClickHouse's published numbers claim ~10x faster searches and ~100x less data scanned versus stuffing attributes into string blobs — which is what makes "just log everything with full context" economically survivable. High cardinality stops being a billing incident (as it is in a labels-based TSDB) and becomes just another column to `GROUP BY`.
+The load-bearing storage feature is ClickHouse's native **JSON column type**. Wide events have sparse and continually changing attribute sets; the JSON type stores **each JSON path as a distinct subcolumn**, so a query touching one attribute reads that attribute's column rather than parsing every event body. ClickHouse's published figures claim roughly **10x faster searches and about 100x less data scanned** compared with holding attributes in string blobs. The consequence that matters operationally: **high cardinality stops being a storage-model problem**. In a labels-based TSDB every distinct label value creates a new time series, so a device identifier as a label multiplies series count; in a columnar table a device identifier is one more column to `GROUP BY`, and its cost is the compressed size of that column.
 
-## The cost numbers, sourced
+## The cost figures, and their provenance
 
-The pitch is mostly a compression pitch, and the numbers hold up better than most vendor math because several are from operators:
+The argument is largely a compression argument, and several of the numbers come from operators rather than from marketing:
 
-- ClickHouse's internal "LogHouse" holds **43+ PB of OpenTelemetry data**; the team claims a **~200x cost reduction** versus their prior Datadog bill.
-- Independent write-ups measuring columnar-vs-Lucene storage put ClickHouse at **12–19x better compression than Elasticsearch** with 5–30x faster analytical queries; Didi's published Elasticsearch migration saw 30% cost reduction and 4x query speedup.
-- ClickHouse's own cost-optimization playbook is concrete about mechanism: Delta+ZSTD codecs on timestamps (~50% storage cut on those columns), then tiered storage moving parts older than a week to S3, so retention becomes an object-storage bill instead of a block-storage one.
+- ClickHouse's internal deployment, **LogHouse**, holds **petabytes of OpenTelemetry data**; the team claims a **~200x cost reduction** versus its prior Datadog spend. This is a self-reported figure from the vendor's own operations.
+- Published comparisons of columnar storage against Lucene-based indexing report ClickHouse compressing observability data substantially better than Elasticsearch, with correspondingly faster analytical queries; the reported ratios vary widely by dataset and are not from a neutral benchmark. Didi's published Elasticsearch migration reports a **30% cost reduction and a 4x query speedup** — a narrower result than the compression ratios alone would suggest.
+- ClickHouse's cost-optimization guidance is specific about mechanism rather than outcome: **Delta encoding followed by ZSTD compression on timestamp columns**, which exploits the near-monotonic ordering of timestamps to shrink those columns, and **tiered storage** that moves parts older than a configured age to S3. The second changes the shape of the bill: retention beyond the hot window is charged as object storage rather than block storage.
 
-Rule of thumb from people running it: a single 8-core/16 GB node handles 10–100 GB/day comfortably. For an IoT backend logging one wide event per MQTT ingest, that's a lot of fleet per node.
+Reported operational sizing from practitioners: a single **8-core, 16 GB node handles 10–100 GB/day**. That range spans an order of magnitude and reflects event width and query load, not a benchmark.
 
-## Quick start: OTLP in, search out
+## Single-container start
 
-One container gives you the whole stack — ClickHouse, the collector, HyperDX, and a MongoDB for app state:
+One container runs the whole stack — ClickHouse, the collector, HyperDX, and a MongoDB instance for application state:
 
 ```bash
 docker run -p 8080:8080 -p 4317:4317 -p 4318:4318 \
   clickhouse/clickstack-all-in-one:latest
 ```
 
-Open `http://localhost:8080`, create a user, and grab the **ingestion API key** from Team Settings. Then point any OTel SDK or collector at it:
+Port 4317 is OTLP over gRPC, 4318 is OTLP over HTTP, 8080 is the interface. After creating a user at `http://localhost:8080`, the **ingestion API key** is read from Team Settings and supplied as an OTLP header by any instrumented process:
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-export OTEL_EXPORTER_OTLP_HEADERS="authorization=<YOUR_INGESTION_API_KEY>"
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=<INGESTION_API_KEY>"
 export OTEL_SERVICE_NAME=mqtt-ingest
 python app.py   # any OTLP-instrumented process
 ```
 
-Spans and logs appear in HyperDX within seconds, searchable with `level:error device_id:aq-*` or with SQL against the underlying `otel_logs` / `otel_traces` tables. For production the docs split the same components apart — collector fleet, ClickHouse cluster, stateless HyperDX — scaling ingest and query independently.
+Spans and logs become searchable within seconds, either through Lucene-style expressions such as `level:error device_id:aq-*` or through SQL against the underlying `otel_logs` and `otel_traces` tables. The production topology documented by ClickHouse separates the same components — a collector fleet, a ClickHouse cluster, and stateless HyperDX instances — so ingest and query scale independently.
 
-## Honest trade-offs vs the LGTM stack
+## Comparison with the LGTM stack
 
-This journal leans Grafana: [Loki's structured metadata](/articles/observability/2026-07-30-loki-3-structured-metadata-otel), [Tempo's TraceQL metrics](/articles/observability/2026-07-30-tempo-traceql-metrics), [native histograms](/articles/observability/2026-07-30-prometheus-native-histograms). Where does ClickStack actually beat it, and where not?
+This journal has covered the Grafana side in detail: [Loki's structured metadata](/articles/observability/2026-07-30-loki-3-structured-metadata-otel), [Tempo's TraceQL metrics](/articles/observability/2026-07-30-tempo-traceql-metrics), and [Prometheus native histograms](/articles/observability/2026-07-30-prometheus-native-histograms).
 
-**ClickStack wins on:** unified querying — one table, real SQL joins across signals, versus LogQL + TraceQL + PromQL linked at the UI layer. High-cardinality analytics — `GROUP BY device_id` over millions of devices is ClickHouse's home turf and Prometheus's nightmare. Operational surface — two or three components versus the five-plus of a full LGTM deployment. Retention economics for *rich* data, because columnar compression works best exactly when events are wide.
+**ClickStack is ahead on** unified querying: one table and genuine SQL joins across signals, rather than LogQL, TraceQL, and PromQL correlated at the interface layer. It is ahead on high-cardinality analytics, where grouping by a device identifier across millions of devices is a columnar scan rather than a series explosion. It presents a smaller operational surface — two or three components against the five or more of a full LGTM deployment. Its retention economics improve precisely as events get wider, because columnar compression benefits from repeated values in a column.
 
-**LGTM wins on:** metrics maturity — PromQL, recording rules, native histograms, and the entire exporter/alerting ecosystem have a decade of sharpening; ClickStack's metrics story is the youngest part of the stack. Alerting — Alertmanager routing/silencing is far ahead of HyperDX alerts. Dashboards — Grafana's community library has no equivalent. And cheap-and-shallow logging: if you mostly grep recent logs and rarely aggregate, Loki's index-almost-nothing model on object storage is hard to underprice.
+**LGTM is ahead on** metrics maturity: PromQL, recording rules, native histograms, and the exporter and alerting ecosystem have a decade of refinement behind them, and metrics are the youngest part of ClickStack. Alertmanager's routing and silencing exceed HyperDX alerting. Grafana's community dashboard library has no ClickStack equivalent. For shallow log usage — mostly grep over recent data, rarely aggregated — Loki's index-almost-nothing model over object storage is difficult to undercut, because ClickStack pays columnar write and merge costs for analytical capability that such a workload never exercises.
 
-The deeper difference is philosophical: LGTM keeps three purpose-built engines and correlates between them; ClickStack bets one general columnar engine plus wide events makes correlation a non-problem. If your debugging is aggregation-shaped ("p99 by firmware version by region"), the second bet pays off.
+The structural difference is which correlation cost is paid: LGTM maintains three purpose-built engines and correlates between them at query time; ClickStack maintains one general columnar engine and makes correlation a property of the row.
 
-**Try next:** Run the all-in-one container next to your existing collector, add a second OTLP exporter so the same spans flow to both Tempo and ClickStack for a week, then take your last real incident and try answering it in each — time-to-answer, not feature lists, is the honest benchmark.
+## Pitfalls
+
+- **Attributes written into a string body rather than a JSON column lose subcolumn extraction.** Symptom: queries scan the full event body and the reported ~100x scan reduction does not appear. Cause: the JSON type stores each path as a subcolumn only when the path exists as JSON, not as serialized text inside another field.
+- **Treating LogHouse's ~200x figure as a portable estimate.** Symptom: projected savings that do not materialize. Cause: the number is ClickHouse Inc.'s own workload compared against its own prior Datadog contract; Didi's independently published migration reports 30%, not 200x.
+- **Sizing from the 10–100 GB/day per-node figure without accounting for event width.** Symptom: an 8-core node that keeps up in staging falls behind in production. Cause: the range is practitioner rule-of-thumb spanning an order of magnitude, and wide events with many distinct paths consume more of it.
+- **Expecting the all-in-one image to be a production topology.** Symptom: no way to scale ingest independently of query. Cause: the image colocates the collector, ClickHouse, HyperDX, and MongoDB in one container; the documented production layout separates them.
+- **Migrating metrics first.** Symptom: missing recording-rule, exporter, and alert-routing equivalents. Cause: metrics and alerting are the least mature parts of ClickStack, while ingest and log or trace search are the parts the compression figures describe.
+- **Assuming tiered storage is transparent to query latency.** Symptom: queries over older windows slow noticeably. Cause: parts older than the configured age reside in S3, and reads then include object-storage round trips rather than local block reads.

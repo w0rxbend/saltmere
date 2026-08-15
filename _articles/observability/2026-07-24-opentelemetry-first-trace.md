@@ -1,8 +1,8 @@
 ---
-title: "Your first distributed trace: OpenTelemetry from zero to a flame graph"
+title: "A first distributed trace: OpenTelemetry from zero to a flame graph"
 date: 2026-07-24
 track: observability
-summary: "Metrics tell you something is slow; traces tell you where. Here's the smallest end-to-end setup that turns a request into a waterfall you can actually read."
+summary: "Metrics report that something is slow; traces report where. The smallest end-to-end setup that turns one request into a readable waterfall."
 reading_time: 5
 tags: [opentelemetry, tracing, otel, spans, context-propagation]
 sources:
@@ -14,27 +14,36 @@ sources:
     url: "https://www.w3.org/TR/trace-context/"
 ---
 
-The three "pillars" framing of observability undersells traces. A metric says p99 latency doubled. A log says a specific request errored. A **trace** says: this request spent 4 ms in your handler, 190 ms waiting on the payments service, which spent 180 ms in a single SQL query. That causal waterfall is the thing that ends arguments in incident channels — and OpenTelemetry (OTel) is now the vendor-neutral default for producing it.
+**Gist.** A latency metric reports that the 99th percentile doubled and a log reports that one request failed, but neither attributes the time to a component. A **trace** solves the attribution problem by recording each unit of work as a timed *span* and linking spans into a causal tree that survives process boundaries, carried by a propagated identifier. The cost is that the identifier must be threaded through **every** boundary the request crosses — HTTP calls, database drivers, queues, thread pools — and any boundary that drops it silently truncates the tree rather than raising an error.
 
 ## The three moving parts
 
-1. **SDK** in your service creates *spans* (timed units of work) and joins them into *traces*.
-2. **Context propagation** carries the trace id across process boundaries — over HTTP it's the W3C `traceparent` header — so a span in service B knows it's a child of a span in service A.
-3. **Collector** receives spans over OTLP and forwards them to a backend (Jaeger, Tempo, a vendor). Your app talks only to the collector; swapping backends never touches app code.
+1. **Software development kit (SDK).** In-process code that creates spans and joins them into a trace. A span holds a name, a start and end timestamp, a status, and a set of key/value **attributes**.
+2. **Context propagation.** The mechanism that carries the trace identifier across a process boundary. Over HTTP, OpenTelemetry (OTel) defaults to the W3C Trace Context headers, so a span created in service B can name a span in service A as its parent.
+3. **Collector.** A separate process that receives spans over the OpenTelemetry Protocol (OTLP) and forwards them to a backend such as Jaeger or Tempo. The application addresses only the collector, so changing backends is a collector configuration change rather than an application change.
+
+## The identifier that makes the tree
+
+W3C Trace Context defines the `traceparent` header as four hyphen-separated hex fields: a version, a **16-byte trace identifier**, an **8-byte parent span identifier**, and a one-byte set of trace flags whose least significant bit is the *sampled* flag. A companion `tracestate` header carries vendor-specific key/value data alongside it.
+
+Two invariants follow directly from that encoding.
+
+- **The trace identifier is constant for the whole trace.** Every span in the tree carries the same value; the parent span identifier is what changes at each hop. Reassembly at the backend is therefore a group-by on the trace identifier followed by a parent-pointer join, not an ordering problem.
+- **The sampling decision travels with the request.** A downstream service reads the sampled flag out of the incoming header rather than deciding independently. If service A samples a request out and service B samples it in, the result is a fragment whose parent span was never exported — a **span whose parent identifier resolves to nothing**, which most user interfaces render as an orphan root.
 
 ## A minimal instrumented service
 
-Auto-instrumentation gets you 80% for free. In Python:
+Automatic instrumentation supplies the boundary spans without source changes. In Python:
 
 ```bash
 pip install opentelemetry-distro opentelemetry-exporter-otlp
-opentelemetry-bootstrap -a install          # pulls instrumentation for your libs
+opentelemetry-bootstrap -a install          # installs instrumentation for detected libraries
 OTEL_SERVICE_NAME=checkout \
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
-  opentelemetry-instrument python app.py     # wraps Flask, requests, psycopg, ...
+  opentelemetry-instrument python app.py    # wraps Flask, requests, psycopg, ...
 ```
 
-That alone produces spans for every inbound request and outbound HTTP/DB call, with context propagated between them. For the parts that matter to *you*, add manual spans:
+That produces a span for every inbound request and every outbound HTTP or database call, with context propagated between them. Domain work inside a handler is invisible to it and needs a manual span:
 
 ```python
 from opentelemetry import trace
@@ -42,23 +51,65 @@ tracer = trace.get_tracer(__name__)
 
 with tracer.start_as_current_span("price-basket") as span:
     span.set_attribute("basket.items", len(items))
-    total = compute(items)          # your real work
+    total = compute(items)
     span.set_attribute("basket.total", total)
 ```
 
-Attributes are the payoff: filtering traces by `basket.items > 100` to find the slow ones is what turns tracing from a demo into a debugging tool.
+Attributes are what makes the recorded spans queryable: **filtering traces by `basket.items > 100` selects the population whose latency is in question**, whereas a span name alone only selects the code path.
 
-## Run the backend in one command
+## Running a backend
 
 ```bash
 docker run -d --name jaeger -p 16686:16686 -p 4317:4317 \
   jaegertracing/all-in-one:latest
 ```
 
-Point `OTEL_EXPORTER_OTLP_ENDPOINT` at it, hit your endpoint a few times, open `http://localhost:16686`, and there's your waterfall. The all-in-one image is the collector *and* the UI, so it's the fastest possible path to a first trace; graduate to a standalone Collector when you have more than one service.
+The all-in-one image exposes the OTLP receiver on **4317** and the query user interface on **16686**, so a single container closes the loop from instrumented process to waterfall. It collapses the collector and the backend into one process; a standalone Collector is the configuration once more than one service exports.
 
-## The one habit that makes traces worth it
+## Asynchronous boundaries
 
-Propagate context across **every** async boundary — message queues, background jobs, the ESP32-to-backend MQTT hop from the IoT track. A trace that stops at the queue is a trace with a hole in it. OTel has propagators for exactly this; inject the trace context into the message on publish and extract it on consume, and a single trace can span "sensor reading published" all the way to "row written." That is when observability stops being dashboards and starts being *cause and effect*.
+Automatic instrumentation covers boundaries whose libraries ship instrumentation. A message queue is a boundary where the request context and the consumer execution are separated in time, and unless the trace context is written into the message on publish and read back on consume, the consumer starts a fresh trace. The observable symptom is **a producer trace that ends at the enqueue call and a consumer trace with no parent**, describing the same logical operation under two unrelated trace identifiers. OTel exposes propagators for this: an `inject` call writes the headers into a carrier the transport can hold, and an `extract` call rebuilds the parent context on the other side.
 
-**Try next:** add one manual span with two attributes to your hottest endpoint, generate load, and sort traces by duration in Jaeger. The slowest trace almost always shows you something the averages were hiding.
+### Implementation sketch (Scala)
+
+Propagation across a carrier the SDK does not know about — message headers as a plain map — reduces to supplying a setter and a getter.
+
+```scala
+import io.opentelemetry.api.OpenTelemetry
+import io.opentelemetry.context.Context
+import io.opentelemetry.context.propagation.{TextMapGetter, TextMapSetter}
+import scala.jdk.CollectionConverters.*
+
+final case class Message(body: Array[Byte], headers: Map[String, String])
+
+class Propagation(otel: OpenTelemetry):
+  private val propagator = otel.getPropagators.getTextMapPropagator
+
+  // The setter mutates a carrier; a mutable builder stands in for the immutable Map.
+  def inject(msg: Message): Message =
+    val carrier = scala.collection.mutable.Map.from(msg.headers)
+    val setter: TextMapSetter[scala.collection.mutable.Map[String, String]] =
+      (c, key, value) => c.update(key, value)
+    propagator.inject(Context.current(), carrier, setter)
+    msg.copy(headers = carrier.toMap)
+
+  def extract(msg: Message): Context =
+    val getter = new TextMapGetter[Map[String, String]]:
+      def keys(c: Map[String, String]): java.lang.Iterable[String] = c.keys.asJava
+      def get(c: Map[String, String], key: String): String = c.get(key).orNull
+    propagator.extract(Context.current(), msg.headers, getter)
+
+// On consume: extract, then make the result current for the span that follows.
+// val scope = propagation.extract(msg).makeCurrent()
+```
+
+The load-bearing part is the pairing: **whatever keys `inject` writes must survive the transport intact and be visible to `get`**. A broker that lowercases, strips, or truncates headers breaks extraction without any error, because a missing `traceparent` is indistinguishable from a request that legitimately starts a new trace.
+
+## Pitfalls
+
+- A span left unended never exports; the trace shows the parent and the siblings but not the work in question. Ending a span requires an exit path that runs on exceptions as well as on success.
+- The process exits before the batching exporter flushes, and the final traces of a short-lived job are missing entirely. Shutting the tracer provider down explicitly is what forces the flush.
+- Context is stored per execution context, so work handed to another thread or a callback loses the current span, and the child attaches to whatever context that thread happened to hold — commonly none.
+- High-cardinality attributes such as a user identifier or a full URL with query parameters multiply storage and index size at the backend; the same field placed in a metric label rather than a span attribute multiplies time series.
+- Independent sampling decisions at each service produce orphan spans, because the sampled flag arriving in `traceparent` is the decision and re-deciding discards the parent.
+- Instrumenting only the outer boundary yields a waterfall whose largest bar is the handler itself, which locates the service but not the operation inside it.

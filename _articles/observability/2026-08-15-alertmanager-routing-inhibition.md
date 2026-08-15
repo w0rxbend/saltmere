@@ -2,8 +2,8 @@
 title: "Alertmanager Beyond the Default Route: Trees, Grouping, Inhibition, and Silences"
 date: 2026-08-15
 track: observability
-summary: "The default Alertmanager config dumps every alert into one receiver, and the three timing knobs — group_wait, group_interval, repeat_interval — are the most misunderstood settings in the Prometheus stack. Here's how the routing tree actually walks, how inhibition kills the notification storm when a node dies, and when to use silences versus time intervals. Current as of Alertmanager 0.33." 
-reading_time: 5
+summary: "The default Alertmanager configuration delivers every alert to a single receiver, and the three timing parameters — group_wait, group_interval, repeat_interval — govern per-group notification behaviour rather than per-alert. This article walks the routing tree, the grouping state machine, the inhibition join key, and the difference between silences and time intervals. Current as of Alertmanager 0.33.1."
+reading_time: 6
 tags: [alertmanager, prometheus, alerting, routing, inhibition, on-call]
 sources:
   - title: "Alertmanager — Configuration reference (route, inhibit_rules, time_intervals)"
@@ -18,43 +18,62 @@ sources:
     url: "https://github.com/prometheus/alertmanager#high-availability"
 ---
 
-Your burn-rate alerts are precise, multiwindow, severity-labeled — and they all land in the same Slack channel as `KubeletTooManyPods`, because nobody ever edited the routing tree. Alertmanager (currently **0.33.1**, July 2026) is where alert *quality* becomes notification *quality*, and almost all of its power lives in four config blocks: the route tree, the grouping timers, inhibition rules, and time intervals.
+**Gist.** Prometheus decides *when* a condition is true; Alertmanager decides *who hears about it and how often*, and an unedited configuration collapses that decision into one receiver for every alert. Four configuration blocks carry the behaviour: the `route` tree (a depth-first, first-match-wins dispatch), the grouping timers, `inhibit_rules` (a source alert mutes matching targets while it fires), and `time_intervals` (recurring mute or active windows). The cost is latency and silence: grouping delays the first notification by `group_wait`, and inhibition deliberately withholds true alerts whose cause is already paging someone.
+
+Version discussed: **Alertmanager 0.33.1**.
 
 ## The routing tree walks depth-first, first match wins
 
-The `route` block is a tree. Every alert enters at the root (which must match everything — never put matchers on it) and walks children **depth-first**. The first child whose **matchers** all pass wins; the alert descends into that child and its sub-routes, inheriting any field the child doesn't override. Siblings after the match are never evaluated — unless the matching route sets **`continue: true`**, in which case the walk resumes with the next sibling. That's the fan-out mechanism: an audit route with `continue: true` can copy every critical alert to a webhook *and* let it proceed to the team route that actually pages someone.
+The `route` block is a tree. Every alert enters at the **root**, which the configuration reference documents as the entry point for all alerts and which therefore carries no matchers of its own. The walk proceeds **depth-first**: the first child whose **matchers all pass** wins, the alert descends into that child and is then offered to that child's own sub-routes, and **siblings after the winning match are never evaluated**.
 
-Two things bite people: children inherit `group_by`, timers, and receiver from their parent, so an override three levels up silently applies below; and matcher order is routing policy — put specific routes before general ones.
+Two properties of the walk are load-bearing.
 
-## What the three timers actually control
+**Inheritance.** A child route inherits every field it does not itself set — `receiver`, `group_by`, all three timers, `mute_time_intervals`. An override set three levels above therefore applies silently to leaves that never mention it. Reading a leaf route in isolation does not determine its behaviour; the path from the root does.
 
-These are per-*group*, not per-alert. A group is the set of firing alerts that share values for the labels in **`group_by`** (e.g. `[alertname, cluster, service]`; the special value `[...]` disables grouping entirely).
+**`continue: true`.** A matching route with `continue: true` does not terminate the sibling scan: the alert is dispatched down that branch *and* the walk resumes with the next sibling. This is the only fan-out mechanism in the tree. An audit branch placed first with `continue: true` copies every matching alert to a webhook and still allows the team branch below it to page.
 
-| Timer | Default | What it really controls |
-|-------|---------|-------------------------|
-| `group_wait` | 30s | How long to sit on a *brand-new* group before the first notification — the buffer that turns 40 near-simultaneous alerts into one page |
-| `group_interval` | 5m | Minimum wait before notifying again about a group whose *contents changed* (new alert joined, or one resolved) |
-| `repeat_interval` | 4h | How long before re-sending a notification for a group that *hasn't changed at all* — the "are you still ignoring this?" nag |
+Because the scan stops at the first match, **matcher order is routing policy**. A general route placed above a specific one shadows it permanently, and the configuration is still valid — nothing reports the dead branch.
 
-So: `group_wait` is paid once per group, `group_interval` gates change notifications, and `repeat_interval` gates pure repeats (it's effectively rounded up to a multiple of `group_interval`, since repeats are only evaluated on group ticks). Short `group_wait` (10s) for pages where seconds matter; long `repeat_interval` (24h+) for ticket-queue receivers so the queue isn't spammed.
+## The three timers are per group, not per alert
 
-## Inhibition: let the root cause mute its symptoms
+A **group** is the set of currently firing alerts that share identical values for every label named in **`group_by`** — for example `[alertname, cluster, service]`. Each group is an independent state machine holding its own timers. The special value `'...'` aggregates by all labels, so each distinct alert forms its own group and no aggregation occurs.
 
-An **inhibition rule** suppresses target alerts while a source alert fires — the classic being "node down mutes everything on that node." The **`equal`** list is the join key: source and target must carry identical values for those labels, otherwise one dead node would mute the whole fleet.
+| Timer | Default | Governs |
+|-------|---------|---------|
+| `group_wait` | 30s | Delay between the creation of a **new** group and its first notification |
+| `group_interval` | 5m | Minimum delay before notifying again about a group whose **membership changed** (an alert joined or resolved) |
+| `repeat_interval` | 4h | Minimum delay before re-sending a notification for a group that has **not changed** |
 
-Inhibition is evaluated cluster-wide and continuously; when the source resolves, the targets un-mute on their own. It's the right tool for *causal* relationships you know at config time. One caveat: make sure the source alert can't inhibit itself into oblivion via a chain (a target of one rule being the source of another is legal and occasionally surprising).
+The sequence for a group's lifetime: the first alert creates the group and starts `group_wait`; alerts arriving inside that window join the group and are delivered in the same notification. After the first notification the group ticks every `group_interval`. On each tick, a membership change produces a notification; an unchanged group produces one only if `repeat_interval` has elapsed. Because repeats are evaluated on group ticks, **`repeat_interval` is effectively rounded up to a multiple of `group_interval`**: setting `repeat_interval: 6m` against `group_interval: 5m` yields repeats every 10 minutes, not every 6.
 
-## Silences vs. time intervals
+The practical consequences are asymmetric. A short `group_wait` (10s) reduces the fixed delay on paging routes at the cost of splitting a correlated burst across more notifications. A long `repeat_interval` (24h or more) suits ticket-queue receivers, where a repeat creates a duplicate record rather than a reminder.
 
-**Silences** are ad-hoc and data-driven: created in the UI or via `amtool silence add`, they're matcher-based, have an expiry, and are replicated across the HA cluster. Use them for "we're migrating this database tonight."
+## Inhibition: the `equal` list is the join key
 
-**Time intervals** are config-driven and recurring: named schedules in the top-level `time_intervals` block (the old top-level `mute_time_intervals` section is deprecated), referenced from routes via `mute_time_intervals` (route goes quiet during the window) or `active_time_intervals` (route only fires during the window). That's how you express "warnings go to Slack only during business hours" without anyone having to remember to re-create a silence every Friday.
+An **inhibition rule** suppresses **target** alerts for as long as at least one matching **source** alert is firing. The canonical case is a node-down alert muting the per-service alerts on that node.
 
-## One realistic config
+```yaml
+inhibit_rules:
+  - source_matchers: [alertname = NodeDown]
+    target_matchers: [severity =~ "warning|info"]
+    equal: [cluster, instance]
+```
+
+**`equal` is what scopes the rule.** Source and target must carry identical values for every label listed. Omitting it, or listing a label the target alerts do not carry, makes a single firing source match every candidate target — one dead node then mutes the entire fleet's warnings. This is the dominant failure mode of inhibition, and it is silent: the alerts are evaluated and fire in Prometheus, and are never notified.
+
+Evaluation is continuous: each Alertmanager applies the rules to the alerts it currently holds, so when the source resolves the targets un-mute without further action. Inhibition encodes **causal relationships known at configuration time**; it is not a rate limiter. A target of one rule may be the source of another, producing chains whose suppression set is not visible from any single rule.
+
+## Silences and time intervals solve different problems
+
+**Silences** are ad-hoc and data-driven. They are created through the web interface or `amtool silence add`, match on labels, carry an explicit expiry, and are replicated across the high-availability cluster. They suit one-off events such as a planned migration.
+
+**Time intervals** are configuration-driven and recurring. Named schedules live in the top-level `time_intervals` block — the older top-level `mute_time_intervals` section is **deprecated** — and routes reference them either through `mute_time_intervals` (the route is quiet during the window) or `active_time_intervals` (the route notifies only during the window). A recurring rule such as "warnings reach Slack during business hours only" therefore survives in version control rather than depending on a silence being recreated.
+
+## One configuration exercising all four blocks
 
 ```yaml
 route:
-  receiver: default-slack            # root: no matchers, catches strays
+  receiver: default-slack            # root: no matchers, catches unmatched alerts
   group_by: [alertname, cluster, service]
   group_wait: 30s
   group_interval: 5m
@@ -62,25 +81,25 @@ route:
   routes:
     - matchers: [severity = critical]
       receiver: audit-webhook
-      continue: true                 # log every page, then keep routing
+      continue: true                 # fan-out: record, then keep walking siblings
     - matchers: [team = payments]
       receiver: payments-slack
       routes:
         - matchers: [severity = critical]
           receiver: payments-pagerduty
-          group_wait: 10s
+          group_wait: 10s            # overrides the root's 30s for this leaf only
           repeat_interval: 1h
         - matchers: [severity = warning]
           receiver: payments-slack
           active_time_intervals: [business-hours]
     - matchers: [alertname = Watchdog]
       receiver: deadmans-switch
-      repeat_interval: 5m            # heartbeat: absence = Prometheus is down
+      repeat_interval: 5m            # heartbeat: absence indicates a broken path
 
 inhibit_rules:
   - source_matchers: [alertname = NodeDown]
     target_matchers: [severity =~ "warning|info"]
-    equal: [cluster, instance]       # only mute alerts on *that* node
+    equal: [cluster, instance]       # mute only alerts sharing that node
 
 time_intervals:
   - name: business-hours
@@ -97,10 +116,23 @@ receivers:
   - name: deadmans-switch
 ```
 
+The `Watchdog` route inverts the usual polarity: the alert always fires, so **the absence of its notification** is the signal that the path from Prometheus through Alertmanager to the receiver is broken. It is the only route exercised while the system is healthy.
+
 ## High availability: gossip, not load balancing
 
-Run Alertmanager as a cluster with `--cluster.peer=am-0:9094 --cluster.peer=am-1:9094 ...` and the instances form a **gossip mesh** (memberlist protocol) that replicates silences and the notification log. Crucially, you do **not** load-balance in front of it — every Prometheus sends every alert to **all** Alertmanagers. Deduplication happens on the way out: peers stagger their dispatch by cluster position, and a peer that sees (via gossip) that the notification already went out suppresses its own copy. Worst case during a partition is a duplicate page — the design deliberately prefers double-notify over never-notify.
+Alertmanager instances started with `--cluster.peer=am-0:9094 --cluster.peer=am-1:9094` form a **gossip mesh** over the memberlist protocol, replicating silences and the notification log. Each Prometheus server is configured with **all** Alertmanager addresses and sends every alert to **every** peer; placing a load balancer in front defeats the design, because a peer that never receives an alert cannot take over notification for it.
 
-This article pairs with the earlier SLO burn-rate piece: burn-rate rules produce well-labeled `severity: critical|warning` alerts, and the tree above is where those labels start earning their keep.
+Deduplication happens on the send path rather than the receive path. Peers stagger dispatch by their position in the cluster, and a peer that observes through gossip that a notification has already been sent suppresses its own copy. A partitioned peer stops receiving the others' notification log entries, so the documented failure mode of the design is a duplicated notification rather than a missing one.
 
-Try next: add a `Watchdog` dead-man's-switch route pointing at an external heartbeat service (Healthchecks.io or PagerDuty's dead-man integration) — it's the only alert that tests the path *from* Prometheus *through* Alertmanager while everything is healthy.
+This pairs with the earlier SLO burn-rate article: burn-rate rules emit alerts labelled `severity: critical|warning`, and the tree above is where those labels determine delivery.
+
+## Pitfalls
+
+- **There is no fallback path above the root.** An alert that matches no child route is delivered by the root's own `receiver`; if that receiver is a placeholder nobody watches, the alert is dispatched and unread.
+- **A general route placed above a specific one shadows it forever.** The scan stops at the first match, the specific route is never evaluated, and configuration validation reports nothing.
+- **`continue: true` omitted from an audit branch swallows the alert.** The alert is delivered to the audit webhook and the sibling team routes are never reached, so nobody is paged.
+- **An inhibition rule without `equal` mutes fleet-wide.** One firing source suppresses every target matching `target_matchers` regardless of node or cluster; the alerts fire in Prometheus and are never notified.
+- **`repeat_interval` shorter than `group_interval` does not shorten repeats.** Repeats are evaluated only on group ticks, so the effective period is `group_interval` rounded up past the configured value.
+- **An inherited timer from an ancestor route applies to leaves that never mention it.** A leaf's notification cadence cannot be read from the leaf alone.
+- **Load-balancing Prometheus's alert traffic across Alertmanager peers breaks HA.** A peer that never received the alert has no notification to take over, converting the design's duplicate-notification worst case into a missed one.
+- **A time interval without `location` is interpreted in UTC.** A window written as local business hours shifts relative to the operators it is meant to cover wherever local time differs from UTC.

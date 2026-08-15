@@ -2,7 +2,7 @@
 title: "k6: Load Tests as Code, Checks as SLOs"
 date: 2026-08-15
 track: observability
-summary: "Grafana k6 hit 1.0 in May 2025, 2.0 in May 2026, and now sits at 2.2.0: load tests are ES-module JavaScript, thresholds turn latency targets into CI pass/fail gates, and constant-arrival-rate executors model open workloads that don't hide slowdowns behind coordinated omission. Here's the VU-vs-arrival-rate distinction, a full script with an aborting threshold, and the paths to Prometheus remote write and the k6 Operator."
+summary: "Grafana k6 reached 1.0 in May 2025 and 2.0 in May 2026: load tests are ES-module JavaScript, thresholds turn latency targets into CI pass/fail gates, and constant-arrival-rate executors model open workloads that do not hide slowdowns behind coordinated omission. Covers the VU-versus-arrival-rate distinction, a full script with an aborting threshold, and the paths to Prometheus remote write and the k6 Operator."
 reading_time: 6
 tags: [k6, load-testing, slo, thresholds, performance, grafana, ci]
 sources:
@@ -18,26 +18,36 @@ sources:
     url: "https://grafana.com/blog/distributed-performance-testing-for-kubernetes-environments-grafana-k6-operator-1-0-is-here/"
 ---
 
-A load test that lives in a wiki gets run twice a year; a load test that lives in the repo and fails the pipeline gets run on every merge. That's the entire thesis of **Grafana k6**: tests are JavaScript files, pass/fail criteria are declarative **thresholds**, and the binary exits non-zero when your p95 blows the budget. The project graduated to **1.0 in May 2025** after nine years of v0.x, shipped **2.0 in May 2026** (Playwright-compatible browser APIs, a consolidated extensions catalog, an `expect()` assertions API), and currently sits at **v2.2.0**. The engine is Go with an embedded JS runtime, so a laptop drives tens of thousands of requests per second from a single process.
+**Gist.** A load test whose pass criterion lives in a human's judgement is run rarely and interpreted charitably; a load test whose pass criterion is a declarative expression over a metric can gate a pipeline. **Grafana k6** encodes the scenario as a JavaScript module and the criterion as a **threshold**, and exits with a non-zero status code when the threshold is violated. The cost is that the measurement is only as honest as the arrival model chosen: a closed model throttles itself precisely when the target degrades, so the recorded latency understates the incident.
 
-## VUs, and the lie they can tell
+Grafana k6 reached **1.0 in May 2025** after a long sequence of v0.x releases, and shipped **2.0 in May 2026** (Playwright-compatible browser application programming interfaces, a consolidated extensions catalogue, an `expect()` assertions API). The engine is written in Go with an embedded JavaScript runtime, so a single process drives high request rates without one operating-system thread per simulated user.
 
-k6's default unit is the **virtual user (VU)**: a loop that runs your `default` function, waits for each response, then iterates. That's a **closed model** — new work starts only when previous work finishes. It faithfully simulates a fixed pool of users, but it has a dangerous property under degradation: when the target slows down, VUs block on responses, so the *request rate drops exactly when the system is struggling*. Your test throttles itself, latency percentiles look survivable, and the report understates the outage. This is **coordinated omission** — Gil Tene's term for measurements that politely stop sampling whenever the system misbehaves.
+## Virtual users and the closed model
 
-The fix is an **open model**: arrivals happen on schedule regardless of whether earlier requests came back. In k6 that's the `constant-arrival-rate` and `ramping-arrival-rate` **executors** — you specify iterations per unit time, and k6 allocates VUs from a pool to keep that rate honest. If the target degrades, the rate holds, queues build, and the latency you record is the latency real users would see:
+The default unit of execution is the **virtual user (VU)**: a loop that invokes the exported `default` function, waits for each response, and then iterates. That is a **closed model** — a new unit of work begins only after the previous one completes. Concurrency is the controlled variable; **throughput is an output, not an input**.
+
+The consequence under degradation is structural rather than incidental. If a VU's iteration takes *d* seconds, that VU offers 1/*d* iterations per second, so a pool of *n* VUs offers *n*/*d*. When the target slows and *d* doubles, the offered rate halves. **The load generator reduces pressure exactly when the system under test is failing**, and every subsequent latency sample is drawn from a system that is no longer being asked for the original workload. The percentiles that result describe an experiment the test itself altered. This is **coordinated omission**, Gil Tene's term for a measurement process that stops sampling whenever the system misbehaves.
+
+## The open model and arrival-rate executors
+
+An **open model** decouples arrivals from completions: work is started on a schedule regardless of whether earlier work has returned. In k6 this is expressed by the `constant-arrival-rate` and `ramping-arrival-rate` **executors**, which take iterations per unit of time as the controlled variable. k6 draws VUs from a pre-allocated pool to sustain that rate; if the target degrades, the rate is held, queueing accumulates, and the recorded latency includes the queueing delay a real arrival would have experienced.
 
 | | Closed model (`ramping-vus`) | Open model (`constant-arrival-rate`) |
 |---|---|---|
-| You control | number of concurrent users | arrival rate (iters/s) |
-| When target slows | offered load silently drops | offered load holds |
-| Coordinated omission | yes | avoided |
-| Good for | user-pool sims, soak tests | SLO validation, capacity tests |
+| Controlled variable | number of concurrent users | arrival rate (iterations/s) |
+| When target slows | offered load drops | offered load holds |
+| Coordinated omission | present | avoided |
+| Suited to | fixed user-pool simulation, soak tests | SLO validation, capacity tests |
 
-Rule of thumb: validating an SLO ⇒ open model, always.
+The invariant that makes the open model trustworthy is that **the VU pool never binds**. When the pool is exhausted, k6 cannot start a scheduled iteration and records it in the `dropped_iterations` metric. Dropped iterations mean the run silently reverted to a closed model for the duration of the shortfall, and the latency distribution from that window is not comparable to the rest.
 
-## Thresholds are SLOs with an exit code
+## Thresholds as a pass/fail contract
 
-A **threshold** is a boolean expression over a metric that decides the run's fate — effectively the load-test twin of the SLOs you alert on with [burn-rate alerts](/articles/observability/2026-07-27-slo-burn-rate-alerts). A complete script — open-model scenario, checks, a custom Trend, and a threshold that aborts the run early instead of hammering a dying service for 20 more minutes:
+A **threshold** is an expression over an aggregate of a metric — a rate, a count, a percentile of a trend — evaluated at the end of the run. Violation sets a non-zero exit status, which is what makes the test usable as a continuous-integration gate; it is the load-test counterpart of the service-level objectives monitored with [burn-rate alerts](/articles/observability/2026-07-27-slo-burn-rate-alerts).
+
+The division of responsibility is the detail most often misread. **A `check` records a pass ratio and never fails the run**; it produces the `checks` metric and nothing more. Only a threshold decides the outcome, so gating on assertion results requires a threshold over the `checks` rate or over the built-in `http_req_failed`.
+
+The following script combines an open-model scenario, checks, a custom `Trend`, and a threshold configured with `abortOnFail` so a badly degraded target terminates the run rather than absorbing the remaining stages.
 
 ```javascript
 import http from "k6/http";
@@ -50,21 +60,23 @@ export const options = {
   scenarios: {
     checkout: {
       executor: "ramping-arrival-rate",
-      startRate: 50, timeUnit: "1s",       // 50 iters/s, ramping up
+      startRate: 50, timeUnit: "1s",       // 50 iterations/s at start
       preAllocatedVUs: 200, maxVUs: 1000,  // pool k6 may draw from
       stages: [
-        { target: 200, duration: "2m" },   // ramp 50→200 iters/s
+        { target: 200, duration: "2m" },   // ramp 50 -> 200 iterations/s
         { target: 200, duration: "5m" },   // hold
         { target: 0,   duration: "1m" },
       ],
     },
   },
   thresholds: {
-    http_req_failed:   ["rate<0.01"],                  // error budget: 1%
-    http_req_duration: ["p(95)<300", "p(99)<800"],     // ms
+    http_req_failed:     ["rate<0.01"],                // 1% error budget
+    http_req_duration:   ["p(95)<300", "p(99)<800"],   // milliseconds
+    dropped_iterations:  ["count==0"],                 // pool never bound
+    checks:              ["rate>0.99"],                // checks do not gate alone
     checkout_duration: [{
       threshold: "p(99)<1500",
-      abortOnFail: true, delayAbortEval: "30s",        // stop the run early
+      abortOnFail: true, delayAbortEval: "30s",        // ignore warm-up window
     }],
   },
 };
@@ -81,14 +93,19 @@ export default function () {
 }
 ```
 
-The division of labor matters: **checks** record pass ratios but never fail the run; **thresholds** decide success — so you gate on `checks{...}` rates or on the built-in `http_req_failed`. If `maxVUs` gets exhausted, k6 emits `dropped_iterations` — threshold that too (`count==0`), because dropped arrivals mean your open model quietly degraded into a closed one.
+`delayAbortEval` suppresses threshold evaluation for the stated interval after the scenario starts, so a cold cache or an unwarmed connection pool does not abort a run in its first seconds.
 
-## Custom metrics, outputs, scale-out
+## Custom metrics, outputs and distribution
 
-Beyond the built-ins, you get four metric types — `Counter`, `Gauge`, `Rate`, `Trend` — and every metric accepts tags, so thresholds can slice (`http_req_duration{endpoint:checkout}: ["p(95)<300"]`). For where results go, the terminal summary is only the default: `-o experimental-prometheus-rw` streams metrics to any **Prometheus remote write** endpoint (native histograms supported), and 2.0 added a native OpenTelemetry output — meaning your load test emits into the same dashboards, and the same burn-rate math, as production traffic.
+Beyond the built-in metrics, four custom metric types are available — `Counter`, `Gauge`, `Rate` and `Trend` — and every metric accepts tags, so a threshold can be scoped to a subset of samples (`http_req_duration{endpoint:checkout}: ["p(95)<300"]`). The terminal summary is the default output only. The `prometheus-rw` output streams metrics to a **Prometheus remote write** endpoint, with native histograms supported, and an OpenTelemetry output is also available. The consequence is that load-test series land in the same storage, and are queried with the same expressions, as production telemetry.
 
-Past one machine, the **k6 Operator** (1.0, GA'd September 2025) runs distributed tests on Kubernetes: a `TestRun` custom resource fans one script out across N runner pods. The **browser module** (Chromium via CDP, now with substantially Playwright-compatible APIs) measures Core Web Vitals in the same script that drives protocol load — typical pattern: hundreds of HTTP VUs plus a handful of browser VUs to catch frontend regressions under backend load. And when the built-ins run out, **xk6 extensions** compile Go modules into a custom binary — Kafka, SQL, gRPC streaming, MQTT — with 2.0's catalog marking which are officially maintained.
+Beyond one machine, the **k6 Operator** (1.0) executes distributed tests on Kubernetes: a `TestRun` custom resource distributes one script across a set of runner pods. The **browser module** drives Chromium over the Chrome DevTools Protocol (CDP) with substantially Playwright-compatible APIs, allowing frontend measurements to be collected in the same script that generates protocol-level load. Where the built-in protocols are insufficient, **xk6 extensions** compile Go modules into a custom k6 binary — Kafka, SQL, gRPC streaming, MQTT — and the 2.0 catalogue records which extensions are officially maintained.
 
-The failure mode to respect: at high arrival rates, exhaust the *load generator* before you conclude anything about the target — watch k6's own CPU and open-file limits, or your "regression" is a saturated test rig.
+## Pitfalls
 
-**Try next:** pick one endpoint with a written latency SLO, script it with `constant-arrival-rate` at your real production peak rate, set thresholds to the SLO numbers exactly, and wire `k6 run` into CI so the build fails when p95 drifts — then break it on purpose once to confirm the pipeline actually goes red.
+- **A `check` that fails leaves the exit status at zero.** Checks only populate the `checks` metric; without a threshold over that metric or over `http_req_failed`, a pipeline reports success while every assertion fails.
+- **A non-zero `dropped_iterations` count invalidates the latency percentiles for that window.** The VU pool bound, so arrivals were skipped and the scenario degraded from an open model into a closed one — the very condition the arrival-rate executor was chosen to avoid.
+- **`ramping-vus` results cannot be used to validate a latency SLO.** Under degradation the offered rate falls with the VU iteration time, so the percentiles describe a reduced workload rather than the target one.
+- **Saturating the load generator produces a regression that exists only in the test rig.** At high arrival rates the k6 process itself can exhaust CPU or the open-file-descriptor limit, inflating client-side timings; generator CPU and file-descriptor usage must be recorded alongside the target's.
+- **`abortOnFail` without `delayAbortEval` can terminate a run during warm-up.** Percentiles computed over the first few samples are volatile, so a cold start can trip a threshold that steady-state traffic would satisfy.
+- **An untagged threshold aggregates every request in the script.** A single slow endpoint raises the global `http_req_duration` percentile and fails a budget written for a different endpoint; scoping requires a tag selector.

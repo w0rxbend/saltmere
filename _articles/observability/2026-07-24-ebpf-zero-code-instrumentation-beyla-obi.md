@@ -2,8 +2,8 @@
 title: "Traces without touching the code: eBPF auto-instrumentation with Beyla/OBI"
 date: 2026-07-24
 track: observability
-summary: "eBPF lets the kernel watch your process's network calls from the outside, so you can get HTTP and gRPC spans out of a service you can't or won't recompile. Grafana donated Beyla to OpenTelemetry in 2025, where it now lives as OpenTelemetry eBPF Instrumentation (OBI)."
-reading_time: 5
+summary: "eBPF moves the observer into the kernel, so HTTP and gRPC spans can be reconstructed for a process that cannot be recompiled. Grafana donated Beyla to OpenTelemetry in 2025, where it now lives as OpenTelemetry eBPF Instrumentation (OBI)."
+reading_time: 6
 tags: [ebpf, opentelemetry, beyla, obi, tracing, auto-instrumentation]
 sources:
   - title: "Grafana Labs — Why we donated Beyla to OpenTelemetry (May 7, 2025)"
@@ -16,13 +16,19 @@ sources:
     url: "https://grafana.com/blog/2025/08/22/how-to-monitor-your-homelab-with-beyla-ebpf-and-opentelemetry/"
 ---
 
-The friction with distributed tracing has always been the same: you have to *instrument the code*. That's fine for the service you own in Scala, awkward for the vendored binary, and a non-starter for the legacy process nobody wants to touch. eBPF sidesteps the whole problem by moving the observer into the kernel — it watches your process make and receive network calls from the outside and reconstructs spans without a single line of application change.
+**Gist.** Distributed tracing conventionally requires editing the application: a software development kit (SDK) is linked in and spans are placed by hand, which is impossible for a vendored binary or a legacy process nobody will rebuild. **extended Berkeley Packet Filter (eBPF)** relocates the observer into the kernel, where probes attached to the system calls a process uses for network input and output reconstruct request spans without changing the application. The cost is a change of vantage point: the kernel observes bytes crossing socket boundaries, so the resulting spans describe **the edges of a service and nothing about its interior**, and the probes require a kernel that supports them plus elevated privileges.
 
-The tool worth knowing is **Beyla**. In May 2025 Grafana donated it to the OpenTelemetry project, where it became **OpenTelemetry eBPF Instrumentation (OBI)**; Beyla now ships as Grafana's thin distribution of that upstream. Either way it auto-instruments HTTP, HTTP/2, gRPC, SQL, Redis, and Kafka regardless of the app's language, because it hooks the syscalls, not the runtime.
+## What the kernel can see and what it cannot
 
-## Getting a trace out of a service you didn't write
+An eBPF program is bytecode loaded into the running kernel and attached to a hook — here, the entry and exit of the system calls a server uses to accept connections and read and write sockets. Because the hook sits below the language runtime, **coverage does not depend on a per-language agent**: a Java virtual machine (JVM) process, a Python interpreter and a Node process are all observed through the same operating system interface. Go is the exception that shows the rule: Beyla instruments Go services with user-space probes (uprobes) attached to functions inside the binary itself, in addition to the kernel-side hooks it uses generally.
 
-Point Beyla at a running process (by executable name, port, or Kubernetes selector) and tell it where to send OTLP. That's the whole setup:
+From that vantage point the instrumentation parses application-protocol framing out of the byte stream and pairs a request with its response to synthesise a span. The article's subject tool, **Beyla**, does this for HTTP, HTTP/2, gRPC, SQL, Redis, and Kafka. The load-bearing consequence follows from the vantage point rather than from any implementation detail: a span exists **only where a syscall boundary was crossed**. A request that takes 900 ms produces one accurate 900 ms span; it does not decompose into the internal function calls that consumed it, because no syscall separated them.
+
+In May 2025 Grafana donated Beyla to the OpenTelemetry project, where it became **OpenTelemetry eBPF Instrumentation (OBI)**. Beyla continues as Grafana's distribution built on that upstream; the configuration key names differ between the two, so a setting copied from one does not necessarily apply verbatim to the other.
+
+## Attaching to a process
+
+The instrumentation is told which process to watch — by executable name, by listening port, or by Kubernetes selector — and where to send OpenTelemetry Protocol (OTLP) data.
 
 ```bash
 docker run --rm --pid=host --privileged \
@@ -32,14 +38,29 @@ docker run --rm --pid=host --privileged \
   grafana/beyla:latest
 ```
 
-`--pid=host` lets it see the target process; `BEYLA_OPEN_PORT=8080` says "instrument whatever is listening on 8080." Hit that service and spans for every HTTP request start flowing to your collector — method, route, status, and latency — with zero redeploy of the app itself. On Kubernetes you run it as a DaemonSet and select workloads by namespace/label instead of a port.
+Each flag carries weight. **`--pid=host` places the container in the host process identifier (PID) namespace**, without which the target process is not visible for the probes to attach to; a container isolated in its own PID namespace sees only itself. **`--privileged` supplies the capabilities required to load eBPF bytecode into the kernel**, which an unprivileged container does not have. **`BEYLA_OPEN_PORT=8080` selects the instrumentation target by the port it listens on** rather than by name, which is the discriminator available when the binary's name is unknown or shared. `OTEL_SERVICE_NAME` supplies the service identity that an SDK would otherwise have declared in code — nothing in the byte stream reveals what the service calls itself.
 
-For an IoT backend this is the fast path to a baseline: get RED metrics (rate, errors, duration) and traces across a fleet of ingestion services *today*, before anyone finds time to add SDK instrumentation.
+Traffic to the selected process then yields spans carrying method, route, status and latency, with no redeploy of the application. Under Kubernetes the same component runs as a DaemonSet, one instance per node, selecting workloads by namespace and label instead of by port.
 
-## Know the edges before you lean on it
+For a fleet of ingestion services this is the shortest path to a baseline: rate, errors and duration (RED) metrics plus traces across every service at once, ahead of any effort to add SDK instrumentation.
 
-eBPF sees bytes on sockets, so it's excellent at the *boundaries* of a service and blind to what happens *inside* one. It can tell you a request took 900 ms; it cannot tell you which of three internal functions ate 800 of them. Encrypted traffic needs Beyla's TLS support (it reads at the syscall layer before/after crypto for supported stacks), and deep context propagation across many hops is still less complete than hand-placed spans. It also needs a modern kernel and elevated privileges.
+## The boundaries of the technique
 
-The honest framing — which OpenTelemetry itself now makes — is that eBPF and SDKs are complementary, not rivals: eBPF gives you *breadth* (every service, instantly, for free), SDKs give you *depth* (custom spans, business attributes) where a service earns it. Start broad with eBPF, then add SDK spans to the two or three services that actually need internal detail.
+Three limits are worth stating precisely.
 
-**Try next:** run the container above against any local HTTP service (even a one-file Flask app), send OTLP to a local collector or Grafana Tempo, and view your first no-code flame graph. Then instrument that same app with the OTel SDK and compare — the eBPF spans mark the doors, the SDK spans light up the rooms.
+**Interior blindness.** As above, spans mark syscall boundaries. Latency attributable to computation between two socket operations appears as one opaque interval.
+
+**Encryption.** A probe reading the socket write sees ciphertext. Beyla addresses this for supported stacks by probing **the cryptographic library's own read and write functions rather than the socket**, so the bytes are seen in plaintext on either side of encryption — which makes decrypted visibility a property of the specific TLS (Transport Layer Security) library the process links against, not a general guarantee.
+
+**Context propagation.** Correlating spans across many hops is less complete than with hand-placed SDK spans. The kernel observes a socket write; it does not by construction know which incoming request caused it.
+
+OpenTelemetry frames eBPF instrumentation and SDKs as complementary rather than competing. eBPF supplies **breadth** — every service covered without code changes — and SDKs supply **depth** — custom spans and business attributes — for the services where internal detail is worth the work of adding them.
+
+## Pitfalls
+
+- **The container starts and reports nothing.** Without `--pid=host` the process to be instrumented lies in a different PID namespace and is not a candidate for probe attachment; the instrumentation has no target rather than a failing one.
+- **Loading the eBPF program fails outright.** Attaching probes needs elevated privileges and a kernel that supports the hooks; an unprivileged container or an older kernel produces a load failure, not degraded tracing.
+- **Spans appear but payload attributes are absent on HTTPS traffic.** The probe read ciphertext. Decrypted visibility depends on Beyla's TLS support covering the specific stack the application links against; an unsupported stack yields the connection-level span without protocol detail.
+- **A latency regression is visible but not localisable.** eBPF spans bound the request at the service edge. Attributing the time to one of several internal code paths requires SDK spans inside the process; no eBPF configuration change produces them.
+- **Selecting by port instruments the wrong workload.** `BEYLA_OPEN_PORT` matches whatever is listening on that port on the host. When several processes share a port range or a port is reused after a restart, the identity attached to the spans comes from `OTEL_SERVICE_NAME`, which is static and will mislabel the new occupant.
+- **Assuming a trace crosses every hop.** Propagation across multiple services is weaker than with SDK instrumentation, so a trace may terminate at a boundary and appear as several unrelated traces rather than one.

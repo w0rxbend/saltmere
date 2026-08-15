@@ -2,8 +2,8 @@
 title: "OTTL: reshaping and redacting telemetry in the OpenTelemetry Collector"
 date: 2026-07-30
 track: observability
-summary: "The transform processor lets you rewrite spans, metrics, and logs in flight using OTTL — a small statement language with contexts, path expressions, and conditions. It's how you strip PII, normalize attributes, and derive fields before data ever leaves the Collector. Here's the mental model and a config you can drop in."
-reading_time: 5
+summary: "The transform processor rewrites spans, metrics, and logs in flight using OTTL — a statement language built from contexts, path expressions, and conditions. It is the pipeline stage where personally identifiable information is stripped, attributes normalized, and fields derived before data leaves the Collector."
+reading_time: 6
 tags: [opentelemetry, otel-collector, ottl, transform-processor, pii, redaction]
 sources:
   - title: "Transforming telemetry — OpenTelemetry Collector documentation"
@@ -16,49 +16,49 @@ sources:
     url: "https://docs.honeycomb.io/send-data/opentelemetry/collector/handle-sensitive-information"
 ---
 
-Instrumentation gives you *some* telemetry, but rarely in the exact shape you want: an auth token leaks into a span attribute, a URL carries a customer id you can't store, a metric's units are wrong, a log's severity lives in the body instead of the field. Fixing all of that at the source means redeploying every service. Fixing it at the **Collector** — one config, one restart — is why the **transform processor** and its language, **OTTL** (the OpenTelemetry Transformation Language), exist. It's the general-purpose rewrite stage in your pipeline, sitting between receivers and exporters.
+**Gist.** Instrumentation emits telemetry in whatever shape the instrumented library chose: an authorization header lands in a span attribute, a customer identifier rides inside a uniform resource locator (URL), a metric carries the wrong unit, a log's severity sits in the body rather than the severity field. Correcting that at the source requires redeploying every service; the **transform processor** corrects it centrally by running statements written in **OTTL, the OpenTelemetry Transformation Language**, against every record passing through the Collector. The cost is that the rewrite is an ordered, in-process mutation stage: statements execute top to bottom on the hot path, a statement can destroy the input another statement needs, and behaviour on a failed statement depends entirely on the configured error mode.
 
-## OTTL in three ideas
+## The three constructs
 
-**Contexts.** Telemetry is nested — a resource holds spans, a span holds attributes and events; a metric holds data points. OTTL statements run in a **context** that picks the level you're editing: `resource`, `scope`, `span`, `spanevent`, `metric`, `datapoint`, `log`. You group statements under the signal (`trace_statements`, `metric_statements`, `log_statements`) and address a context with `context:` (newer config style) or the older per-context list. The context decides what `attributes[...]` and the path expressions refer to.
+**Contexts.** Telemetry is nested — a resource holds scopes, a scope holds spans, a span holds attributes and events, a metric holds data points. An OTTL statement executes in a **context** naming the level being edited: `resource`, `scope`, `span`, `spanevent`, `metric`, `datapoint`, `log`. Statements are grouped per signal (`trace_statements`, `metric_statements`, `log_statements`) and the level is selected with a `context:` key on each block. Paths in the current style are written with the context as a prefix (`span.attributes["k"]`); the older style omitted the prefix and wrote `attributes["k"]` against the block's context. **The context determines the iteration unit**: a `span` block runs its statements once per span, a `datapoint` block once per data point, so the same edit expressed at a coarser context touches fewer items and at a finer context multiplies the work.
 
-**Paths.** Inside a context you read and write fields with dotted paths: `span.name`, `span.status.code`, `span.attributes["http.route"]`, `resource.attributes["service.name"]`, `log.body`, `metric.unit`. These are both getters and setters — the same path you read is the one you assign.
+**Paths.** Within a context, fields are addressed by dotted paths: `span.name`, `span.status.code`, `span.attributes["http.route"]`, `resource.attributes["service.name"]`, `log.body`, `metric.unit`. **A path is both getter and setter** — the expression that reads a field is the expression that assigns to it.
 
-**Statements and conditions.** A statement is a **function call**, optionally guarded by a `where` clause. `set(...)`, `delete_key(...)`, `keep_keys(...)`, `replace_pattern(...)`, `truncate_all(...)`, `limit(...)` are editors; `where` filters which items they touch using boolean expressions and converters like `IsMatch(...)`. Statements in a block run **top to bottom**, so order matters — derive a value first, then redact the field you derived it from.
+**Statements and conditions.** A statement is a **function call**, optionally guarded by a `where` clause. `set`, `delete_key`, `keep_keys`, `replace_pattern`, `truncate_all` and `limit` are editors that mutate the record; `where` restricts which records an editor touches, using boolean expressions and converters such as `IsMatch`. **Statements inside a block run in declaration order**, which makes ordering a correctness property rather than a stylistic one.
 
-## A config that redacts and normalizes
+## A configuration that redacts and normalizes
 
-Here's a `transform` processor doing four common jobs at once: strip an auth token, scrub an email out of a URL, cap attribute count to control cardinality, and fix a metric's units. Drop it into a Collector (`otelcol-contrib`) pipeline.
+The following `transform` processor performs four independent jobs: removal of an authorization attribute, redaction of an email address embedded in a URL, a bound on attribute count, and correction of a metric unit. It runs under `otelcol-contrib`, the distribution that ships the contrib processors.
 
 ```yaml
 processors:
   transform:
-    error_mode: ignore        # a bad statement skips that item, doesn't crash the batch
+    error_mode: ignore        # a failing statement is logged; the next statement still runs
     trace_statements:
       - context: span
         statements:
           # 1. Remove a sensitive header attribute outright.
           - delete_key(span.attributes, "http.request.header.authorization")
 
-          # 2. Redact an email embedded in the URL, keep the shape.
+          # 2. Redact an email embedded in the URL, preserving the surrounding shape.
           - replace_pattern(span.attributes["url.full"],
               "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+", "[EMAIL]")
 
-          # 3. Derive a coarse status class, THEN you could drop the raw code.
+          # 3. Derive a coarse status class before the raw code can be dropped.
           - set(span.attributes["http.status_class"], "5xx")
               where span.attributes["http.response.status_code"] >= 500
 
-          # 4. Bound attribute cardinality to protect your backend's index.
+          # 4. Bound attribute cardinality reaching the backend index.
           - limit(span.attributes, 40, [])
     metric_statements:
       - context: metric
         statements:
-          # Fix a mislabeled unit reported as bytes but actually mebibytes.
+          # Correct a unit reported as bytes when the values are mebibytes.
           - set(metric.unit, "MiBy") where metric.name == "process.memory.usage_mib"
     log_statements:
       - context: log
         statements:
-          # Promote a severity carried in the body up to the real field.
+          # Promote a severity carried in the body into the severity field.
           - set(log.severity_text, "ERROR")
               where IsMatch(log.body, ".*(exception|panic|fatal).*")
 
@@ -70,10 +70,27 @@ service:
       exporters: [otlphttp]
 ```
 
-A few things worth internalizing from this. `error_mode: ignore` is the safe default in production — a malformed record (missing the attribute a statement expects) is skipped rather than failing the whole batch; use `propagate` in testing when you *want* loud failures. The `where` clause is what keeps a statement surgical: statement 3 only tags server errors, statement 5 only re-severities logs that look like errors. And **statement order is load-bearing** — if you wanted to redact the raw URL *and* derive a route from it, you'd derive first, redact second, because the second statement destroys the input to the first.
+Three properties of this configuration are load-bearing.
 
-## Where it sits vs. its neighbors
+**Error mode selects the failure domain.** The processor documents three modes. With `error_mode: ignore`, an error raised by a statement is logged and evaluation continues with the next statement; `silent` behaves the same way but does not log; with `propagate`, the error is returned up the pipeline and the payload is dropped by the Collector. The practical split is `ignore` where continuity of the telemetry stream matters and `propagate` while a configuration is being tested, because a fault is then impossible to miss.
 
-OTTL shows up in more than the transform processor — the **filter processor** uses OTTL conditions to *drop* telemetry, and the **routing** and **tail-sampling** components (see the tail-based-sampling article here) use OTTL expressions too — so learning the path/condition syntax once pays off across the pipeline. Reach for the transform processor when you need to **modify** data (redact, enrich, normalize, reshape); reach for the filter processor when you need to **remove** it; and keep genuinely high-volume, hot-path redaction as close to the edge as you can. The rule of thumb for PII especially: scrub it in the Collector *before* the exporter, so sensitive fields never reach a backend where they'd be indexed, retained, and subpoena-able.
+**The `where` clause is what keeps an editor surgical.** Statement 3 tags only spans whose response status code is at least 500; the log statement rewrites severity only on bodies matching the pattern. Without a guard, an editor applies to every record the context iterates.
 
-**Try next:** Run `otelcol-contrib` with the config above and a `debug`/`logging` exporter, fire a test span carrying a fake `authorization` header and an email in `url.full` (the `telemetrygen traces` tool is handy), and watch the exported span come out with the header gone and the email replaced by `[EMAIL]` — then add a deliberately wrong path and flip `error_mode` between `ignore` and `propagate` to feel the difference in failure behavior.
+**Order is semantics, not layout.** A pipeline that both derives a route from a URL and redacts that URL must derive first: `replace_pattern` mutates the attribute in place, so a derivation placed after it reads the already-redacted value. The same asymmetry applies to `limit` and `keep_keys`, which remove attributes that later statements would otherwise read.
+
+## Position relative to neighbouring components
+
+OTTL is not confined to the transform processor. The **filter processor** evaluates OTTL conditions to *drop* telemetry, and routing and tail-sampling components accept OTTL expressions as well (see the tail-based-sampling article in this track), so the path and condition syntax is learned once and reused across the pipeline. The division of labour is direct: the transform processor **modifies** records — redact, enrich, normalize, reshape — while the filter processor **removes** them. For personally identifiable information specifically, the placement argument is that a field scrubbed in the Collector before the exporter never reaches a backend that would index and retain it.
+
+**Verification path.** Run `otelcol-contrib` with the configuration above and a `debug` exporter, emit a test span carrying a fabricated `authorization` header and an email address inside `url.full` — `telemetrygen traces` generates such traffic — and confirm the exported span lacks the header and shows `[EMAIL]` in place of the address. Introducing a deliberately wrong path and switching `error_mode` between `ignore` and `propagate` demonstrates the difference in failure behaviour.
+
+## Pitfalls
+
+- A misspelled attribute key is not a syntax error but a key that no record carries, so the statement matches nothing and the intended edit never happens; the telemetry arrives looking untouched rather than raising a failure.
+- `replace_pattern` mutates the attribute in place, so any statement that derives a value from the same attribute must precede it; placed after, it reads the redacted string and derives the wrong value.
+- `limit` and `keep_keys` remove attributes, so a statement ordered after them may find its input already gone even though the path is spelled correctly.
+- The chosen context sets the iteration unit: statements placed in a `datapoint` block execute once per data point rather than once per metric, multiplying the per-record cost of an expensive converter such as a regular-expression match.
+- A regular expression written for redaction matches only what it was written to match; an address format outside the pattern passes through unredacted, and the resulting record looks correctly processed because no statement failed.
+- Statements addressing `resource.attributes` from a `span` context and from a `resource` context differ in how often they run, so an edit expressed at the span level is repeated for every span sharing that resource.
+- `error_mode: propagate` turns one failing statement into a pipeline error that drops the payload, which is the intended behaviour while a configuration is being tested and a source of data loss when left enabled in production.
+- `error_mode: silent` suppresses the log line that `ignore` still emits, so a statement failing on every record leaves no trace at all in the Collector's own output.
