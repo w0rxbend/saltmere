@@ -2,8 +2,8 @@
 title: "Dune3D: a constraint-solver parametric CAD that isn't FreeCAD"
 date: 2026-08-13
 track: cad-3dprint
-summary: "Dune3D is a free, history-based parametric CAD app that glues SolveSpace's 3D constraint solver to the OpenCASCADE kernel and Horizon EDA's editor. Here's the group-based workflow, a STEP export, and an honest look at where it beats FreeCAD."
-reading_time: 5
+summary: "Dune3D is a free, history-based parametric computer-aided design application that joins SolveSpace's 3D constraint solver to the OpenCASCADE geometry kernel and Horizon EDA's editor. The group-based workflow, a STEP export, and the boundary where FreeCAD remains necessary."
+reading_time: 6
 tags: [dune3d, cad, parametric, solvespace, step]
 sources:
   - title: "Dune 3D (official site)"
@@ -18,11 +18,13 @@ sources:
     url: "https://hackaday.com/2024/05/05/dune-3d-open-source-3d-parametric-modeler-from-the-maker-of-horizon-eda/"
 ---
 
-Most open-source parametric CAD is FreeCAD, and FreeCAD's pain points are well documented on this journal — chiefly [topological naming](/articles/cad-3dprint/2026-07-30-freecad-topological-naming), where an edit renames the faces your later features referenced and the model detonates. **Dune3D** takes a different bet. Written by **Lukas Wallmann** (the author of Horizon EDA, the KiCad-adjacent PCB tool), it wires **SolveSpace's constraint solver** to the **OpenCASCADE** geometry kernel behind Horizon EDA's editor UI. Current release: **v1.4.0 "Einstein"** (January 2026), GPL-3.0, Linux and Windows.
+**Gist.** History-based parametric computer-aided design (CAD) breaks when a later feature refers to a face or edge by a name that an earlier edit reassigns — the [topological naming](/articles/cad-3dprint/2026-07-30-freecad-topological-naming) failure that dominates FreeCAD practice. **Dune3D** inverts the layering: a constraint solver holds the relationships between geometric entities, and the geometry kernel is asked only to realise solids from the solved result, so references are carried as constraints rather than as generated names. The cost is scope — no finite-element analysis, no computer-aided manufacturing (CAM), no scripting layer, no assembly workbench — so it models solids and exports them, and nothing else.
 
-## The model: groups are the history
+Dune3D is written by the author of **Horizon EDA**, an electronic design automation package in the same family of tools as KiCad. It combines **SolveSpace's constraint solver** with the **OpenCASCADE** geometry kernel, presented through Horizon EDA's editor interface. The release referenced here is **v1.4.0**, licensed GPL-3.0, with Linux and Windows builds.
 
-There is no feature tree in the FreeCAD sense. A Dune3D document is an ordered list of **groups**, and each group is one operation that consumes the geometry of the groups before it. The core types:
+## The model: the group list is the history
+
+There is no feature tree in the FreeCAD sense. A Dune3D document is an **ordered list of groups**, and each group is a single operation consuming the geometry produced by the groups preceding it. The core group types:
 
 | Group | Does |
 |---|---|
@@ -34,13 +36,17 @@ There is no feature tree in the FreeCAD sense. A Dune3D document is an ordered l
 | Fillet / Chamfer | Round or bevel edges |
 | Mirror, Clone, Pipe | Duplicate / sweep |
 
-Because the history *is* the group list, editing an early group re-solves everything downstream — the ordinary parametric promise. The interesting part is *how* references survive that re-solve.
+The ordering is the invariant. **A group may reference only groups that precede it**, which makes the document a linear dependency chain with no cycles to detect and no resolution order to compute: re-evaluation runs from the edited group to the end of the list. Editing an early group therefore re-solves everything downstream, which is the ordinary parametric promise. What distinguishes Dune3D is the form those downstream references take.
 
-## Sketching is non-modal and 3D
+## Sketching is non-modal and admits 3D constraints
 
-FreeCAD's Sketcher is modal: you enter a 2D sketch, you're locked to that plane, you leave. Dune3D's sketcher is neither. You draw lines, arcs, and Bezier curves directly in the 3D viewport, on any workplane, and — crucially — you can place **constraints in 3D**, between geometry that lives in different groups. Instead of naming a face like `Face6` and hoping it keeps that name, you constrain *to the actual geometric entity*; the solver carries that relationship. This is the structural reason Dune3D sidesteps the topological-naming class of breakage rather than papering over it.
+FreeCAD's Sketcher is modal: entering a sketch locks the interaction to one plane until the sketch is closed. Dune3D's sketcher is not. Lines, arcs, and Bezier curves are drawn directly in the 3D viewport on any workplane, and **constraints may be placed in 3D, between entities belonging to different groups**.
 
-A minimal, real workflow — a constrained plate with a hole, exported as STEP:
+That last property is the load-bearing one. A conventional history modeller records a later feature's attachment as a reference to a named boundary-representation element — `Face6`, `Edge12` — and those names are assigned by the kernel each time the model is rebuilt. Change an earlier feature so that the kernel enumerates faces differently, and `Face6` now denotes some other face, or none; the later feature attaches to the wrong geometry or fails outright. In Dune3D the relationship is instead expressed as a constraint on the geometric entity itself, and **the solver carries that relationship across the re-solve** rather than re-resolving a name. This is a structural avoidance of the topological-naming class of breakage, not a heuristic that repairs names after the fact.
+
+The solver's own contract is the familiar one for constraint-based sketching: entity coordinates are unknowns, constraints are equations relating them, and the sketch reaches the **fully-constrained state when the remaining degrees of freedom reach zero** — which the editor signals on the affected entities. A sketch left with degrees of freedom is not an error; it is an under-determined system whose free entities the solver is at liberty to move when anything nearby changes.
+
+A minimal workflow — a constrained plate with a hole, exported as STEP (Standard for the Exchange of Product model data):
 
 ```
 1. New document. A default workplane (XY) exists.
@@ -48,34 +54,44 @@ A minimal, real workflow — a constrained plate with a hole, exported as STEP:
    - Constrain: two "distance" constraints -> width 60, height 40.
    - Anchor one corner to the origin (coincident constraint).
    - Add a circle; "diameter" constraint = 8; two distances locate its centre.
-   The sketch turns fully-constrained green when DOF = 0.
+   The sketch reports fully constrained when DOF = 0.
 3. Add group -> Extrude. Select the rectangle region, drag/enter 5 mm.
    The circle region becomes a through-hole (subtracted).
 4. Add group -> Chamfer. Pick the top edges, 0.8 mm.
-5. File -> Export -> STEP (AP214).  Fillets/chamfers survive as real BREP.
+5. File -> Export -> STEP.  Fillets/chamfers survive as real BREP.
 ```
 
-Every dimension above is a constraint you can double-click and retype; the model re-solves in place. There's no "spreadsheet of parameters" abstraction like [FreeCAD's](/articles/cad-3dprint/2026-07-30-freecad-spreadsheet-parametric) — the numbers *are* the constraints.
+Two details in that sequence carry weight. The circle becomes a **through-hole by region subtraction at extrude time** — the hole is not a separate feature applied afterwards, so it cannot become detached from the sketch that defines it. And the STEP export carries **boundary representation (BREP)** geometry, meaning fillets and chamfers leave the tool as analytic surfaces rather than as a triangulated approximation; a mesh export such as STL would discard that.
+
+Every dimension in the sequence is a constraint that can be double-clicked and retyped, after which the model re-solves in place. There is no separate parameter-spreadsheet abstraction of the kind [FreeCAD provides](/articles/cad-3dprint/2026-07-30-freecad-spreadsheet-parametric); the dimension values are the constraints. Changing the width constraint from 60 to 90 re-solves the hole position, the chamfer, and the exported solid, because each of those was expressed relative to constrained entities rather than to named faces.
 
 ## Install
 
-Flathub is the path of least resistance on Linux:
+Flathub is the lowest-friction path on Linux:
 
 ```bash
 flatpak install flathub org.dune3d.dune3d
 flatpak run org.dune3d.dune3d
 ```
 
-Windows users grab the installer from the GitHub releases page. Building from source is a straightforward Meson job (`meson setup build && ninja -C build`) if you want bleeding-edge; the deps are OpenCASCADE, GTK4, and glm.
+Windows builds are published as an installer on the GitHub releases page. Building from source is a Meson job (`meson setup build && ninja -C build`); the dependencies are OpenCASCADE, GTK4, and glm.
 
-## How it actually differs from FreeCAD
+## Where the difference is architectural
 
-Wallmann's own "why another 3D CAD" writeup names three FreeCAD frustrations Dune3D is a direct answer to: a **modal 2D-only sketcher**, **no constraints for 3D geometry**, and **fragile referencing**. The upshot:
+The project's own "why another 3D CAD application?" document names three FreeCAD frustrations Dune3D responds to directly: a **modal, 2D-only sketcher**, **no constraints for 3D geometry**, and **fragile referencing**. Three consequences follow.
 
-- **Solver-first, not kernel-first.** SolveSpace decides geometry from constraints; OpenCASCADE just realises the solids. FreeCAD is the reverse, which is where naming fragility creeps in.
-- **One editing paradigm.** Sketching and assembly-style 3D constraints use the same interaction, borrowed from Horizon EDA. No workbench switching.
-- **Deliberately small.** No FEM, no CAM, no Python scripting layer, no assembly workbench. It models solids and exports STEP/STL/DXF. That's the whole scope.
+- **Solver-first rather than kernel-first.** SolveSpace determines geometry from constraints; OpenCASCADE realises the resulting solids. FreeCAD layers these the other way round, which is where naming fragility enters — the identity of a reference is produced by the kernel rather than held by the solver.
+- **One editing paradigm.** Sketching and 3D constraint placement use the same interaction, inherited from Horizon EDA. There is no workbench to switch between.
+- **Deliberately narrow scope.** No finite-element analysis, no CAM, no Python scripting layer, no assembly workbench. The tool models solids and exports them, STEP and STL among the formats.
 
-That scope is the honest caveat. If you need [Path/CAM](/articles/cad-3dprint/2026-08-04-freecad-path-cam-workbench), [TechDraw 2D drawings](/articles/cad-3dprint/2026-07-30-freecad-techdraw-2d-drawings), or a scripting API, Dune3D won't replace FreeCAD — it's a focused solid modeller, not a suite. But for the daily job of *drawing a part and getting a clean STEP into your slicer or a fab quote*, the constraint-driven flow is faster and markedly less likely to blow up on the third edit.
+That scope is the honest caveat rather than a footnote. A workflow requiring [Path/CAM](/articles/cad-3dprint/2026-08-04-freecad-path-cam-workbench), [TechDraw 2D drawings](/articles/cad-3dprint/2026-07-30-freecad-techdraw-2d-drawings), or a scripting application programming interface (API) is not served by Dune3D at v1.4.0; it is a solid modeller, not a suite. For the narrower job of drawing a part and producing a clean STEP for a slicer or a fabrication quote, the constraint-driven flow removes the failure mode that makes the third edit of a FreeCAD model expensive.
 
-**Try next:** `flatpak install flathub org.dune3d.dune3d`, model the plate above, then go back and change the width constraint from 60 to 90 and watch the hole, chamfer, and STEP-ready solid re-solve without a single broken reference — the thing FreeCAD makes you fight for.
+No published benchmark compares edit-propagation times or re-solve robustness between the two tools, so the claim above is architectural, not measured.
+
+## Pitfalls
+
+- **A sketch that never turns green is under-constrained, not merely untidy.** With non-zero degrees of freedom the solver may reposition free entities during a downstream re-solve, so a dimension that appeared correct on screen shifts after an unrelated edit.
+- **Group order constrains what can be referenced.** A group cannot reference geometry from a group later in the list, so a constraint that seems geometrically obvious is unavailable until the referenced group is moved earlier — and moving it changes what it consumes.
+- **Exporting STL discards the analytic geometry.** Fillets and chamfers survive a STEP export as BREP surfaces; the mesh export replaces them with facets, and a downstream tool cannot recover the original radius from that.
+- **Scope gaps are absent features, not missing configuration.** There is no scripting API to automate a repetitive edit and no assembly workbench to hold multiple parts in relation, so those workflows have no in-application workaround.
+- **Regions, not curves, drive extrusion.** An extrude consumes a closed sketch region; a profile with an unclosed gap between endpoints yields no region, and the extrude group produces nothing rather than reporting a broken curve.

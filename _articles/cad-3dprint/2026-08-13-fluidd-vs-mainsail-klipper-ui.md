@@ -1,9 +1,9 @@
 ---
-title: "Fluidd vs Mainsail: picking a Klipper front-end (and running both)"
+title: "Fluidd vs Mainsail: choosing a Klipper front-end, or running both"
 date: 2026-08-13
 track: cad-3dprint
-summary: "Both are Vue front-ends over the same Moonraker API, so the choice is ergonomics, not capability. Here's a straight feature comparison at current versions, plus the KIAUH install and how to run them side by side on one Pi."
-reading_time: 5
+summary: "Both are Vue single-page applications over the same Moonraker API, so the choice is ergonomics rather than capability. A feature comparison, the KIAUH install path, and the nginx and CORS configuration required to serve both from one host."
+reading_time: 6
 tags: [klipper, moonraker, mainsail, fluidd, kiauh]
 sources:
   - title: "Mainsail releases (GitHub)"
@@ -18,40 +18,47 @@ sources:
     url: "https://docs.fluidd.xyz/"
 ---
 
-Mainsail and Fluidd are the two dominant web UIs for Klipper. Neither talks to the printer directly — they're static single-page apps that speak to **[Moonraker](/articles/cad-3dprint/2026-08-07-moonraker-api-printer-monitoring)** over its JSON-RPC/websocket API. Because they share that one backend, anything one can do (upload G-code, edit config, run macros, mesh, timelapse) the other can too. The decision is purely about layout and workflow feel. Current releases as of this writing: **Mainsail v2.18.2** (2026-07-05) and **Fluidd v1.37.4** (2026-08-11) — both actively shipping.
+**Gist.** Klipper exposes no user interface of its own; control passes through Moonraker, an application programming interface (API) server, and the two dominant browser clients — Mainsail and Fluidd — are both static single-page applications (SPAs) speaking that same JSON-RPC protocol over a websocket. Because the backend is shared, feature parity is close to total and the decision reduces to layout and workflow. Running both is possible, and the cost is a second nginx server block, a second port, and a Moonraker cross-origin resource sharing (CORS) allow-list entry for every origin from which a browser will connect.
+
+## Where the state resides
+
+Neither front-end talks to the printer. Both are bundles of static HyperText Markup Language (HTML), JavaScript and Cascading Style Sheets (CSS) served by a web server, which open a websocket to **[Moonraker](/articles/cad-3dprint/2026-08-07-moonraker-api-printer-monitoring)** and issue JSON-RPC requests over it. The consequence is the invariant that governs everything below: **printer state, configuration files, macros and job history are owned by Klipper and Moonraker, not by the client**. A front-end holds a cached projection of that state, refreshed by Moonraker's status-update notifications. Uninstalling a client destroys nothing; installing a second one duplicates no state.
+
+That invariant also explains the real-time mirroring described later. Two clients connected to one Moonraker instance are two subscribers to the same notification stream, so a command issued in one appears in the other on the next update, without either client knowing the other exists.
+
+Both projects release independently and frequently; the current version of each is published on its GitHub releases page, listed in the sources below. The comparison that follows concerns capabilities that have been stable across recent releases of both, not a specific pair of version numbers.
 
 ## Feature comparison
 
 | | Mainsail | Fluidd |
 |---|---|---|
-| Framework | Vue 3 SPA | Vue 3 SPA |
-| Config editor | Built-in, Ace, section-aware | Built-in, Ace, section-aware |
-| Layout | Fixed panel columns, opinionated | Fully drag-to-rearrange dashboard |
-| Macro buttons | Grouped, color/emoji support | Grouped, inline param prompts |
+| Framework | Vue SPA, static bundle | Vue SPA, static bundle |
+| Config editor | Built-in, syntax-highlighted | Built-in, syntax-highlighted |
+| Layout | Column dashboard | Column dashboard |
+| Macro buttons | Grouped into categories | Grouped into categories |
 | Mesh view | 3D bed mesh visualiser | 3D bed mesh visualiser |
-| G-code preview | Yes, per-layer | Yes, per-layer |
+| G-code preview | Yes, per layer | Yes, per layer |
 | Multi-printer | Yes (printer picker) | Yes (instances menu) |
-| Theming | Custom via `.theme/` in config | Built-in color/theme controls |
+| Theming | Custom via `.theme/` in config | Built-in colour and theme controls |
 | Timelapse | moonraker-timelapse plugin | moonraker-timelapse plugin |
-| Feel | Guided, tidy defaults | Denser, more configurable |
 
-The honest summary: **Mainsail** hands you a clean, opinionated layout that's great out of the box and consistent across machines — nice for teaching or a print farm. **Fluidd** lets you drag panels into whatever dashboard you want and packs more onto each screen — nice if you live in the UI and have preferences. Both edit `printer.cfg` in-browser with syntax highlighting and reload/restart buttons, so neither forces you to SSH for a quick tweak.
+The differences that survive scrutiny are presentational: **the two arrange and label the same Moonraker-supplied data differently**, and no published comparison establishes a capability one has and the other lacks. Both include a built-in editor for `printer.cfg` with syntax highlighting and firmware-restart controls, so neither requires a secure shell (SSH) session for a configuration change. Since the differences are matters of layout preference, the reliable way to choose is to run both against the same printer, which the rest of this article describes.
 
-## Install with KIAUH
+## Installation via KIAUH
 
-Nobody should install these by hand. **KIAUH** (Klipper Install And Update Helper) does Klipper, Moonraker, and the front-ends, and wires up the reverse proxy for you:
+**KIAUH** (Klipper Install And Update Helper) installs Klipper, Moonraker and either front-end, and writes the web-server configuration:
 
 ```bash
 cd ~ && git clone https://github.com/dw-0/kiauh.git
 ./kiauh/kiauh.sh
-#  [1] Install  ->  [4] Mainsail   (or [5] Fluidd)
+#  Install menu -> Mainsail (or Fluidd); the menu entry numbers vary by KIAUH version
 ```
 
-Picking Mainsail installs the static bundle to `~/mainsail`, drops an nginx server block, and adds the `[update_manager]` stanza to `moonraker.conf` so Moonraker can update the UI in-place. Fluidd is identical with its own directory and update entry.
+Selecting Mainsail unpacks the static bundle to `~/mainsail`, installs an nginx server block, and adds an `[update_manager]` stanza to `moonraker.conf` so that Moonraker can update the client in place. Fluidd follows the same pattern with its own directory and its own update-manager entry.
 
-## Running both at once
+## Serving both from one host
 
-You do not have to choose — they're just static files behind nginx, so serve each on its own port. KIAUH offers this during install; if you wire it manually, the two server blocks look like:
+Because the clients are static files, coexistence is a web-server question: give each bundle its own listening port and point both at the same Moonraker instance. KIAUH offers this during installation; configured by hand, the two server blocks are structurally identical apart from the port and document root.
 
 ```nginx
 # /etc/nginx/sites-available/mainsail  -> port 80
@@ -73,7 +80,9 @@ server {
 }
 ```
 
-Then add both origins to Moonraker's CORS allow-list so the browser doesn't block the API:
+The `try_files $uri $uri/ /index.html` line is load-bearing for a single-page application: **client-side routing means paths such as `/history` exist only in the browser's router, not on disk**, so a direct request or a page reload would otherwise return HTTP 404. The fallback serves `index.html` for any path that does not resolve to a file, and the router then interprets the path.
+
+The second load-bearing detail is CORS. **A browser treats `http://192.168.1.50` and `http://192.168.1.50:81` as distinct origins because the port differs**, so an origin that is absent from Moonraker's allow-list has its API requests rejected by the browser, not by Moonraker. The symptom is a client that loads its own assets and then shows no printer state at all.
 
 ```ini
 # moonraker.conf
@@ -86,10 +95,16 @@ trusted_clients:
     192.168.1.0/24
 ```
 
-Hit `http://printer.local` for Mainsail and `http://printer.local:81` for Fluidd. Same printer, same state, two windows — genuinely useful when deciding which to keep, since both reflect every command the other sends in real time.
+With both blocks active, `http://printer.local` serves Mainsail and `http://printer.local:81` serves Fluidd against one printer. Each reflects commands issued from the other, which is what makes a side-by-side trial informative rather than merely possible.
 
-## Which to keep
+## Choosing one
 
-There's no wrong answer and no lock-in: your printer's brain is [Klipper + Moonraker](/articles/cad-3dprint/2026-08-07-moonraker-api-printer-monitoring), and the UI is a swappable skin. Run both for a week, then uninstall the loser in KIAUH (`[6] Remove`) to reclaim the port. Config, macros, and history live in Moonraker, so nothing is lost either way.
+Switching cost is bounded by the invariant stated at the top: configuration, macros and job history are held by Klipper and Moonraker. Removing a client through KIAUH's remove menu frees its port and its document root and leaves printer state untouched, so a trial period followed by removal of the unused client costs nothing beyond disk space and one update-manager entry during the trial.
 
-**Try next:** clone KIAUH, install both Mainsail on :80 and Fluidd on :81, add the second origin to `cors_domains`, and drive one print from each in split-screen — you'll know your pick within a layer or two.
+## Pitfalls
+
+- **A front-end loads but shows no temperatures, no job and no console output.** Its origin is missing from `cors_domains`; adding the second port as a separate entry is required, since a port change makes a new origin.
+- **Reloading the page on a sub-path such as `/history` returns HTTP 404.** The nginx `location /` block lacks the `try_files ... /index.html` fallback that SPA client-side routing depends on.
+- **The second client is unreachable from another machine on the local network while working locally.** The extra port is not opened on the host firewall; the first client works because port 80 was already permitted.
+- **Both clients appear installed, but only one updates from the interface.** Only one `[update_manager]` stanza was written to `moonraker.conf`; the client installed outside KIAUH has no update entry.
+- **Changes made in one client do not appear in the other.** The two are pointed at different Moonraker instances, or one server block proxies `/websocket`, `/printer`, `/api` and `/server` to a different backend than the other.

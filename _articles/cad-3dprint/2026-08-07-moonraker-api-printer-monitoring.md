@@ -2,7 +2,7 @@
 title: "Scripting a print with the Moonraker API: querying and subscribing to live telemetry"
 date: 2026-08-07
 track: cad-3dprint
-summary: "Moonraker is the HTTP/WebSocket layer that Mainsail and Fluidd talk to. The same API is open to your own scripts — query temps over REST, subscribe to a live status feed over WebSocket, and you have the raw material for a dashboard or a Prometheus exporter."
+summary: "Moonraker is the HTTP/WebSocket layer that Mainsail and Fluidd talk to. The same API is open to external scripts — temperatures over REST, a live delta-encoded status feed over WebSocket, and the raw material for a dashboard or a Prometheus exporter."
 reading_time: 6
 tags: [moonraker, klipper, 3d-printing, api, monitoring]
 sources:
@@ -18,13 +18,13 @@ sources:
     url: "https://github.com/scross01/prometheus-klipper-exporter"
 ---
 
-Klipper does the real-time work — stepping motors, running the PID loops — but it doesn't speak HTTP. That job belongs to **Moonraker**, the API server that sits in front of Klipper's Unix socket and exposes it to the network. When Mainsail shows you a bed temperature or Fluidd draws a progress bar, it's polling Moonraker. The useful thing for anyone who likes graphs: that same API is wide open to your own scripts. If you can write ten lines of Python, you can scrape every temperature, position, and progress figure the printer knows about.
+**Gist.** Klipper performs the real-time work — stepping motors, running the proportional-integral-derivative (PID) heater loops — and communicates over a Unix domain socket rather than over the network. Moonraker is the API server that fronts that socket and exposes printer state through a representational state transfer (REST) interface and a JSON-RPC 2.0 interface over WebSocket, the latter offering a push subscription. The cost of the push path is that **updates are deltas**: the client, not the server, is responsible for holding last-known state and merging each notification into it, and a client that treats a notification as a full snapshot will lose every field that did not change.
 
-Moonraker gives you two ways in: a **REST API** for one-shot requests, and a **JSON-RPC 2.0 API over WebSocket** for the same calls plus a live push feed. For monitoring you want both — REST to check state, the WebSocket to stream it.
+## Printer objects and the one-shot query
 
-## The one-shot query over REST
+Klipper models the machine as a set of named **printer objects** — `heater_bed`, `extruder`, `toolhead`, `print_stats`, `display_status` — each carrying its own field set. Every read path in the API, one-shot or streaming, addresses state through this same namespace.
 
-Start with the cheapest possible call. `GET /printer/info` tells you whether Klipper is even alive:
+The cheapest call reports whether Klipper is running at all:
 
 ```bash
 curl http://mainsailos.local/printer/info
@@ -35,7 +35,7 @@ curl http://mainsailos.local/printer/info
   "hostname": "mainsailos", "software_version": "v0.12.0-85-gd785b396" }
 ```
 
-The workhorse is `/printer/objects/query`. Klipper models the machine as a set of named **printer objects** — `heater_bed`, `extruder`, `toolhead`, `print_stats`, `display_status` — each with its own fields. You ask for the objects you care about by adding them to the query string. A bare object name returns all its fields; `object=field1,field2` narrows it down:
+`/printer/objects/query` is the general read. Objects are named in the query string; a bare object name returns all of its fields, and `object=field1,field2` narrows the response to the named fields:
 
 ```bash
 curl "http://mainsailos.local/printer/objects/query?extruder&heater_bed&print_stats&display_status"
@@ -54,18 +54,19 @@ curl "http://mainsailos.local/printer/objects/query?extruder&heater_bed&print_st
 }
 ```
 
-That single response has everything a status widget needs. The fields worth knowing:
+The fields that carry the monitoring signal:
 
-- **`extruder` / `heater_bed`**: `temperature` (current °C), `target` (setpoint °C), `power` (PWM, 0.0–1.0).
-- **`print_stats`**: `state` (`standby`, `printing`, `paused`, `complete`, `cancelled`, `error`), `filename`, `print_duration` (seconds actually printing, excluding pauses), `total_duration` (wall-clock including pauses).
-- **`display_status.progress`**: fraction complete, 0.0–1.0. (`virtual_sdcard.progress` gives file-position progress if you prefer bytes-read over the slicer's `M73` estimate.)
-- **`toolhead`**: `position` (`[x, y, z, e]`) and `homed_axes` (e.g. `"xyz"`, or `""` before homing).
+- **`extruder` / `heater_bed`**: `temperature` (current, °C), `target` (setpoint, °C), `power` (pulse-width modulation duty cycle, 0.0–1.0).
+- **`print_stats.state`**: one of `standby`, `printing`, `paused`, `complete`, `cancelled`, `error`. This is the print state machine as Klipper reports it; a monitor that derives "is printing" from a non-zero progress value will misclassify a paused job.
+- **`print_stats.print_duration` versus `total_duration`**: the first counts seconds spent printing and **excludes pauses**, the second is wall-clock and includes them. Remaining-time estimates built on the wrong one drift by exactly the accumulated pause time.
+- **`display_status.progress`**: fraction complete, 0.0–1.0. A slicer that emits `M73` sets this value directly. `virtual_sdcard.progress` reports file-position progress instead, which tracks how far through the file the reader has advanced rather than an estimate of remaining work.
+- **`toolhead`**: `position` as `[x, y, z, e]`, and `homed_axes` — `"xyz"` when all three are homed, `""` before homing. Position values are meaningless as absolute machine coordinates while `homed_axes` is empty.
 
-The REST call is a `POST` under the hood but Moonraker accepts the query string on a `GET` too, which is why the `curl` above just works. Poll it on a timer and you have a scraper — but polling is wasteful and always a little stale. The WebSocket does better.
+Arguments travel in the query string rather than in a request body, which is why the `curl` above is a bare `GET`. Polling this endpoint on a timer yields a scraper whose staleness is bounded by the poll interval, and whose request volume is independent of the rate at which state changes.
 
-## Subscribing to the live feed
+## The subscription and its delta invariant
 
-Over the WebSocket at `/websocket`, every REST endpoint has a JSON-RPC method: `/printer/info` becomes `printer.info`, `/printer/objects/query` becomes `printer.objects.query`, and `/printer/gcode/script` becomes `printer.gcode.script`. A request is standard JSON-RPC 2.0:
+At `/websocket`, each REST endpoint has a JSON-RPC method counterpart: `/printer/info` becomes `printer.info`, `/printer/objects/query` becomes `printer.objects.query`, `/printer/gcode/script` becomes `printer.gcode.script`. Requests are ordinary JSON-RPC 2.0:
 
 ```json
 { "jsonrpc": "2.0", "method": "printer.objects.query",
@@ -73,14 +74,18 @@ Over the WebSocket at `/websocket`, every REST endpoint has a JSON-RPC method: `
   "id": 4654 }
 ```
 
-`null` means "all fields"; a list narrows it. The unique-to-WebSocket call is **`printer.objects.subscribe`**, which takes the same `objects` map but then keeps pushing. After the initial reply, whenever a subscribed field changes Moonraker sends a **`notify_status_update`** notification — no `id`, params as a two-element array `[changed_objects, eventtime]`:
+`null` requests all fields of an object; a list restricts it.
+
+**`printer.objects.subscribe`** takes the same `objects` map and changes the interaction shape. Its immediate reply is a **full snapshot** of every subscribed field, identified by the request `id`. Thereafter Moonraker pushes **`notify_status_update`** notifications — no `id`, and `params` is a two-element array of `[changed_objects, eventtime]`:
 
 ```json
 { "jsonrpc": "2.0", "method": "notify_status_update",
   "params": [ { "extruder": { "temperature": 210.4 } }, 578245.12 ] }
 ```
 
-Crucially, updates are **deltas** — only the fields that changed appear. Your handler has to keep the last-known state and merge each update into it, not replace it. Here is the core of a logger (or the collector half of a Prometheus exporter) using the `websockets` library:
+The invariant the client must maintain: **the snapshot establishes the initial state, and every subsequent notification is a partial update applied over it**. Only changed fields appear. A handler that assigns `state = params[0]` instead of merging will report `heater_bed.temperature` as absent for as long as the bed sits at setpoint, because a field at steady state generates no update at all. The distinction between the two message shapes is structural, not semantic: the snapshot arrives under `result.status` with the matching `id`, the delta under `params[0]` with `method` set.
+
+The example below implements the merge. It is the collector half of an exporter, using the `websockets` library:
 
 ```python
 import asyncio, json, websockets
@@ -92,7 +97,7 @@ SUBS = {"extruder": ["temperature", "target"],
         "display_status": ["progress"]}
 
 async def monitor():
-    state = {}  # last-known values, merged from deltas
+    state = {}  # last-known values; deltas are merged in, never assigned over
     async with websockets.connect(URL) as ws:
         await ws.send(json.dumps({
             "jsonrpc": "2.0", "method": "printer.objects.subscribe",
@@ -103,7 +108,7 @@ async def monitor():
             if msg.get("id") == 1:                 # initial full snapshot
                 objs = msg["result"]["status"]
             elif msg.get("method") == "notify_status_update":
-                objs = msg["params"][0]            # delta only
+                objs = msg["params"][0]            # changed fields only
             else:
                 continue
             for obj, fields in objs.items():
@@ -117,19 +122,24 @@ async def monitor():
 asyncio.run(monitor())
 ```
 
-Point that at a Prometheus `Gauge` per field instead of `print()` and you've built an exporter — which is exactly what community projects like [`prometheus-klipper-exporter`](https://github.com/scross01/prometheus-klipper-exporter) do, calling `printer/objects/query` and reshaping the JSON into `/metrics`. Graph `extruder_temperature` next to `heater_bed_power` in Grafana and thermal runaway or a loose heater cartridge shows up as a shape, not a surprise.
+Substituting a Prometheus `Gauge` per field for the `print()` produces an exporter. [`prometheus-klipper-exporter`](https://github.com/scross01/prometheus-klipper-exporter) takes the polling variant of the same approach, calling `printer/objects/query` and reshaping the JSON into a `/metrics` response. Plotting `temperature` against `power` for one heater makes a divergence between duty cycle and achieved temperature — the signature of a failing heater cartridge or a detached thermistor — visible as a trend rather than as a single alarm event.
 
-## Sending G-code, and getting in the door
+## Writing G-code, and the authorization paths
 
-Reading is half of it. To *act* — pause on an anomaly, fire an `M117` note, kick off a print — POST to `/printer/gcode/script` (or call `printer.gcode.script`):
+The write endpoint is `/printer/gcode/script`, or `printer.gcode.script` over the socket:
 
 ```bash
 curl -X POST http://mainsailos.local/printer/gcode/script \
      -H 'Content-Type: application/json' -d '{"script": "M117 dashboard connected"}'
 ```
 
-Whether any of this needs a credential depends on where your script runs. Moonraker's `[authorization]` block defines **`trusted_clients`** — IP addresses and subnets that skip authentication entirely. A script on the printer's own LAN subnet listed there needs nothing. From outside that range, send your **API key** in the `X-Api-Key` header on each request; you can read the current key with `GET /access/api_key`. Browser code that can't set headers uses a **oneshot token** from `/access/oneshot_token` appended as `?token=...`, but for a server-side monitor the API key is simpler. Read-only status queries are typically exempt from auth anyway — it's the G-code and file endpoints that Moonraker guards.
+Whether a credential is required depends on the caller's address. Moonraker's `[authorization]` block defines **`trusted_clients`**, a set of addresses and subnets exempt from authentication; a script running from a listed address sends no credential. Outside that range, requests carry an **API key** in the `X-Api-Key` header, and `GET /access/api_key` returns the current key. Browser contexts that cannot set headers use a **oneshot token** obtained from `/access/oneshot_token` and appended as `?token=...`. Moonraker's authorization documentation exempts a set of endpoints from authentication; the G-code and file endpoints are among those it guards.
 
-That's the whole loop: `printer.info` to confirm Klipper is up, `objects.subscribe` for a live delta feed, `gcode.script` to intervene. Everything Mainsail does, your dashboard can do too.
+## Pitfalls
 
-**Try next:** subscribe to `print_stats` and `display_status`, feed `progress` and the two temperatures into Prometheus gauges, and build a Grafana panel that overlays hotend temperature against `extruder.power` so a failing heater is visible before Klipper's own runaway protection trips.
+- **Assigning a `notify_status_update` payload over the state dictionary instead of merging it.** Symptom: fields disappear from the dashboard while the machine is at steady state. Cause: a field that has not changed since the last notification is omitted from the delta, so the assignment erases it.
+- **Deriving print activity from `display_status.progress`.** Symptom: a paused job is reported as printing. Cause: `progress` retains its last value across a pause; only `print_stats.state` distinguishes `printing` from `paused`.
+- **Computing time-remaining from `total_duration`.** Symptom: the estimate is inflated by exactly the time spent paused. Cause: `total_duration` is wall-clock, whereas `print_duration` excludes pause intervals.
+- **Reading `toolhead.position` before homing.** Symptom: coordinates that do not correspond to any physical location. Cause: `homed_axes` is `""` until each axis is homed, and position is not referenced to the machine origin until then.
+- **Testing a script from the printer's own subnet and deploying it elsewhere.** Symptom: requests that worked in development return an authorization error in production. Cause: `trusted_clients` exempted the development address, so the missing `X-Api-Key` header went unnoticed.
+- **Subscribing to a narrowed field list and later reading a field outside it.** Symptom: the field is permanently absent from merged state. Cause: `printer.objects.subscribe` pushes only the fields named in the `objects` map; a field not subscribed is never sent, snapshot or delta.

@@ -2,8 +2,8 @@
 title: "Panelizing KiCad Boards with KiKit: A 2x2 Panel from One Command"
 date: 2026-08-15
 track: cad-3dprint
-summary: "Small boards below fab minimums, per-board assembly cost, and pick-and-place rails all point the same way: panelize. KiKit turns one .kicad_pcb into a framed multi-board panel — mousebites or v-cuts, tooling holes, fiducials — from a single CLI command or a reusable JSON preset."
-reading_time: 5
+summary: "Small boards fall below assembly-line handling minimums and lack rails, tooling holes and fiducials. KiKit transforms one .kicad_pcb into a framed multi-board panel — mousebites or v-cuts — from a single CLI invocation or a reusable JSON preset, at the cost of fab-specific geometry rules that must be encoded correctly."
+reading_time: 6
 tags: [kicad, kikit, panelization, mousebites, v-cuts, pcb, fabrication]
 sources:
   - title: "KiKit — Automation tools for KiCAD (GitHub)"
@@ -18,21 +18,25 @@ sources:
     url: "https://www.pcbway.com/helpcenter/design_instruction/PCB_Panelization__Breakaway_Rails__Fiducial_Marks__Tooling_Holes.html"
 ---
 
-A 20 × 15 mm sensor breakout is a perfectly good board and a terrible fabrication order. JLCPCB's minimum FR4 board size is 3 × 3 mm, but assembly lines want something they can actually grip: rails for the conveyor, tooling holes for registration, fiducials for the pick-and-place camera. And whether you order five boards or a 2×2 panel of them, you often pay per *delivered unit* — so panelizing turns one prototype run into four boards for nearly the same money. **KiKit** automates all of it from the command line against your existing `.kicad_pcb`, no manual copy-paste-and-pray in the PCB editor. Current release is **v1.8.0** (April 2026), which supports KiCad 9 and the new KiCad 10 and drops everything older than 9; KiCad 9 support originally landed in v1.7.0. Install with `pip install kikit` (the docs cover getting it into KiCad's bundled Python on each platform).
+**Gist.** A 20 × 15 mm breakout is well within what a fabricator will etch, but it offers an assembly line nothing to grip, register against, or align a placement camera to. Panelization solves this by replicating the board into a grid, bridging the copies with breakable connections, and surrounding the array with rails that carry tooling holes and fiducials; KiKit performs that transformation on an existing `.kicad_pcb` from one command line. The cost is that panel geometry is governed by fab-specific rules — minimum panel size, cut-to-copper clearance, router-bit radius — which must be encoded in the invocation, because the tool applies the geometry requested rather than the geometry a given fabricator accepts.
 
-## Mousebites or v-cuts?
+## What a panel adds to a board
 
-The two separation methods have different fab-imposed rules, so pick before you panelize.
+Three features exist for the machines, not the circuit. **Breakaway rails** give the conveyor and the board-handling clamps a region that is not part of any delivered board. **Tooling holes**, non-plated and drilled in the rails, register the panel mechanically in fixtures. **Fiducials**, a disc of bare copper inside a solder-mask opening, give the pick-and-place camera optical reference points; the usual arrangement places three of them on the rails in an asymmetric pattern rather than a symmetric one, so that a panel loaded the wrong way round does not present the same fiducial geometry. Rails are commonly 5 mm wide.
 
-**V-cuts** are straight scored grooves cut across the *entire* panel — no partial cuts, no curves. JLCPCB requires v-cut panels to be at least **70 × 70 mm**, board thickness ≥ 0.6 mm, and leaves about **1/3 of the thickness** as the connecting web. Keep copper ≥ 0.4 mm from the cut centerline and components 1–2 mm away. In exchange you get near-zero wasted material and clean straight edges. Use them for rectangular boards big enough to meet the minimum.
+KiKit tracks KiCad's own release line, and a given KiKit release states which KiCad major versions it supports; the pairing must be checked against the release notes rather than assumed. Installation is `pip install kikit`, with the documentation covering placement into KiCad's bundled Python interpreter per platform.
 
-**Mousebites** (stamp holes) are routed tabs perforated with small drills — they work for any outline, curved edges included, and JLCPCB imposes *no minimum panel size* for them. The cost is a rougher edge you may need to file, and material lost to the routed gap. For odd-shaped hobby boards and anything tiny, mousebites are the default.
+## The separation mechanism: two incompatible geometries
 
-Either way the panel needs **rails**: PCBWay wants breakaway rails at least 3 mm wide (5 mm is the comfortable default), fiducials of ~1 mm bare copper placed ≥ 5 mm from the panel edge in an asymmetric L-pattern, and ~2 mm non-plated tooling holes.
+The choice of how copies detach determines what outlines and panel sizes are legal, so it precedes panelization rather than following it.
+
+**V-cuts** are scored grooves cut straight across the *entire* panel. The constraint is structural: the blade traverses the full width, so a cut cannot stop mid-panel and cannot follow a curve. JLCPCB's documented requirements are a panel of at least **70 × 70 mm**, board thickness **≥ 0.6 mm**, and a remaining web of about **1/3 of the board thickness** left uncut. Copper must stay **≥ 0.4 mm** from the cut centerline with components kept back further still, because the groove and the subsequent snap both disturb material adjacent to the line. The compensating property is that adjacent boards share an edge, so material loss between copies approaches zero and the resulting edge is straight.
+
+**Mousebites** are routed slots interrupted by tabs, each tab perforated by a row of small drills. Because the separation is produced by routing rather than by a full-width blade pass, the outline may be arbitrary, curves included, and the minimum panel size that applies to v-scoring does not apply. The costs are the material removed by the router slot and a fractured edge at each perforation, which typically requires filing. For irregular outlines and boards below the v-cut size floor, mousebites are the only admissible option.
 
 ## One command, one panel
 
-Here is a complete 2×2 mousebite panel with top/bottom rails, tooling holes, and fiducials — straight from KiKit's documented example set:
+The following produces a 2×2 mousebite panel with top and bottom rails, tooling holes and fiducials, drawn from KiKit's documented example set:
 
 ```bash
 kikit panelize \
@@ -46,13 +50,15 @@ kikit panelize \
     breakout.kicad_pcb panel.kicad_pcb
 ```
 
-Reading it section by section: **layout** places copies in a grid with 2 mm routed gaps; **tabs** puts two 3 mm-wide bridges on each vertical edge; **cuts** perforates those tabs with 0.5 mm drills at 1 mm pitch, pulled 0.2 mm *inside* the board outline so the broken stubs don't protrude past the edge; **framing** adds 5 mm rails top and bottom, 3 mm from the boards; **tooling** and **fiducials** decorate the rails; and **post** `millradius: 1mm` rounds every internal corner to what a real routing bit can actually cut, so your preview matches what ships. All lengths must carry units (`mm`, `mil`, `inch`). Open `panel.kicad_pcb` in KiCad, run DRC, and generate fabrication outputs from it exactly as you would for a single board — the Gerber and IPC-2581 flow from the earlier fabrication-outputs article applies unchanged.
+Each section transforms the intermediate panel in turn. **`layout`** replicates the source board into a grid with 2 mm of routed gap between copies. **`tabs`** reintroduces substrate across that gap: two bridges, each 3 mm wide, on every vertical edge. **`cuts`** perforates those bridges with 0.5 mm drills at 1 mm pitch; **`offset: 0.2mm` pulls the perforation line 0.2 mm inside the board outline**, so the stubs left after snapping terminate inside the nominal edge instead of protruding past it. **`framing: railstb`** adds 5 mm rails above and below the array, separated from the boards by 3 mm. **`tooling`** and **`fiducials`** place their features on those rails. **`post` `millradius: 1mm`** replaces every internal corner with an arc of 1 mm radius, matching what a rotating router bit can physically produce — a square internal corner is not a shape a cylindrical cutter can cut, so without this step the panel drawing and the manufactured panel differ. **All lengths must carry an explicit unit** (`mm`, `mil`, `inch`).
 
-For a v-cut version, swap two sections: `--cuts 'vcuts'` and `--tabs 'full'` (v-cuts must span the panel, so the boards connect across their full edge), and use `--framing 'frame; width: 5mm; space: 3mm; cuts: both'` so the frame separates from the boards too.
+The output `panel.kicad_pcb` is an ordinary KiCad board file: it opens in the editor, runs through design rule check (DRC), and produces Gerber and IPC-2581 fabrication outputs by the same procedure as a single board.
 
-## Presets: stop retyping fab rules
+Converting the same panel to v-cuts requires two changes that follow from the full-width constraint: `--cuts 'vcuts'` and `--tabs 'full'`, the latter because boards must remain connected across their entire shared edge for a straight cut to be meaningful. The frame section becomes `--framing 'frame; width: 5mm; space: 3mm; cuts: both'` so the frame itself separates from the array.
 
-Every CLI section can live in a JSON preset. KiKit merges its built-in defaults, then each `-p` file in order, then CLI flags — so you keep one file per fab and per separation style:
+## Presets as encoded fab rules
+
+Every CLI section has a JSON equivalent. KiKit resolves configuration by merging **built-in defaults first, then each `-p` file in the order given, then command-line flags**, so a per-fabricator file and a per-separation-style file compose without either being rewritten.
 
 ```json
 {
@@ -64,16 +70,16 @@ Every CLI section can live in a JSON preset. KiKit merges its built-in defaults,
 }
 ```
 
-Then `kikit panelize -p jlc-mousebites.json breakout.kicad_pcb panel.kicad_pcb`. KiKit also ships built-in presets referenced with a colon prefix — `kikit panelize -p :jlcTooling ...` applies JLCPCB's assembly tooling-hole convention without you looking up the numbers.
+The file is applied with `kikit panelize -p jlc-mousebites.json breakout.kicad_pcb panel.kicad_pcb`. KiKit also ships built-in presets, referenced with a colon prefix: `-p :jlcTooling` applies JLCPCB's assembly tooling-hole convention without the numbers being restated locally.
 
-## Common failures
+## Pitfalls
 
-**Tabs through pads.** KiKit places tabs by geometry, not by what's on the board — a tab landing under an edge connector or castellated pad means the router chews your copper. Fix it by moving tabs explicitly: place `kikit:Tab` annotation footprints on the source board where tabs are safe, then use `--tabs annotation`. Note KiKit builds *half-bridges* from each annotation, so the opposite side needs matching substrate — a facing tab, a backbone, or a tightframe.
+**Tabs landing on pads.** Tab placement in `fixed` mode is derived from edge geometry alone, with no knowledge of copper, so a tab can fall across an edge connector or castellated pad and the router removes that copper. The remedy is explicit placement: `kikit:Tab` annotation footprints on the source board plus `--tabs annotation`. Each annotation generates a **half-bridge**, so the facing side needs matching substrate — an opposing tab, a backbone, or a tightframe — or the bridge terminates in empty space.
 
-**Mousebite breakout roughness.** Drill too large or spacing too wide and separation tears fiberglass past the outline. Stay near the 0.5 mm drill / 1 mm spacing defaults and keep the 0.2 mm inward offset; the stubs then break *inside* the theoretical edge and a quick file pass finishes the job.
+**Under-perforated mousebites.** Widening `spacing` without widening `drill` leaves more unperforated fiberglass between holes, and separation then tears material outside the intended outline instead of fracturing along the hole line.
 
-**Illegal v-cuts.** A v-cut that stops mid-panel, runs at an angle, or sits on a 0.4 mm-thick board will bounce at review. KiKit's v-cut validation (added in 1.7.0) catches most of these before the fab does.
+**Zero or omitted cut offset.** Without the 0.2 mm inward offset the fracture occurs on the nominal outline, and the residual stubs protrude beyond the designed edge, which can defeat an enclosure fit that assumed the outline dimension.
 
-**Sharp internal corners.** Without `millradius`, KiKit draws internal corners a 2 mm router bit cannot produce. Always set it; 1 mm matches common fab tooling.
+**Illegal v-cuts.** A v-cut that stops mid-panel, runs at an angle, or is specified on a board below the 0.6 mm thickness minimum violates the fab rule and is rejected at review, after the design has already been submitted.
 
-**Try next:** panelize your smallest real board into a 2×2 with the command above, diff the panel's DRC report against the single board's, and order it — then check whether the mousebite stubs land inside or outside the edge you designed.
+**Omitted `millradius`.** Internal corners are drawn sharp, the fab's router cannot reproduce them, and the delivered outline diverges from the panel drawing at every internal corner.

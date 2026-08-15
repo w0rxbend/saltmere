@@ -2,8 +2,8 @@
 title: "Eddy-Current Bed Probing in Klipper: Beacon, Cartographer, and BTT Eddy"
 date: 2026-08-03
 track: cad-3dprint
-summary: "How inductive eddy-current probes read nozzle-to-bed distance for fast full-bed scanning, and how to wire up mainline Klipper's [probe_eddy_current] with drive-current and temperature calibration."
-reading_time: 6
+summary: "How inductive eddy-current probes read nozzle-to-bed distance for fast full-bed scanning, and how mainline Klipper's [probe_eddy_current] is wired up with drive-current and temperature calibration."
+reading_time: 7
 tags: [klipper, 3d-printing, eddy-current, beacon, cartographer, btt-eddy, bed-mesh, probing]
 sources:
   - title: "Eddy Current Inductive probe — Klipper documentation"
@@ -18,31 +18,54 @@ sources:
     url: "https://docs.cartographer3d.com/cartographer-probe/classic-vs-survey-touch"
 ---
 
-An inductive proximity sensor and an eddy-current surface scanner are the same physics component pushed to different ends of its resolution curve. Both drive an AC current through a coil, which sets up an oscillating magnetic field. Bring that coil near a conductive bed — aluminum, spring steel, most PEI-on-steel plates — and the field induces circulating *eddy currents* in the metal. Those currents oppose the coil's field, which changes the coil's effective inductance. A cheap inductive probe just watches for the inductance to cross a threshold and trips a digital pin. An eddy-current probe instead measures the coil's resonant frequency continuously with a dedicated LDC (inductance-to-digital converter) chip like the TI LDC1612, so it reports an *analog* distance the whole time it's moving. That single difference — a number instead of a click — is what unlocks everything interesting here.
+**Gist.** Point-by-point bed probing is slow because the toolhead must stop, descend and retract at every sample. An eddy-current probe replaces the trigger event with a **continuous inductance measurement**, so distance is known at every instant and a mesh can be collected during horizontal travel. The cost is that a frequency reading has **no inherent zero and drifts with temperature**, so the probe requires drive-current calibration, a frequency-to-height model, and either a contact reference or software thermal compensation.
 
-## Why a continuous reading changes the game
+## The measurement
 
-Because the sensor knows its height at every instant, the toolhead never has to stop, descend, and retract at each probe point. It can fly across the bed at travel speed while the LDC streams frequency data, and Klipper converts that stream into a full mesh. A 100-point mesh that takes a BLTouch several minutes drops to seconds. Klipper exposes this as distinct probing behaviors: the default descend-and-trigger mode (used for QGL and Z-tilt), a `scan` mode that samples at the current Z without moving down, and a `rapid_scan` mode that reads *during* horizontal motion for mesh generation. The tradeoff is honest — `rapid_scan` is faster but noisier than a settling scan, so people usually reserve careful scans for calibration and rapid scans for per-print adaptive meshing.
+An inductive proximity sensor and an eddy-current surface scanner are the same physics component read at different resolutions. Both drive an alternating current through a coil, which establishes an oscillating magnetic field. Near a conductive bed — aluminium, spring steel, most polyetherimide (PEI) plates on steel — that field induces circulating *eddy currents* in the metal. Those currents oppose the coil's field and change the coil's effective inductance.
 
-The catch with any frequency-based reading is that it has no inherent zero. The coil doesn't know where the nozzle tip is; it only knows its own distance to metal. So these probes need a physical reference. That's where **contact / tap mode** comes in: the nozzle is driven gently into the bed until motion stalls, then lifted, and the sensor watches the frequency's *rate of change* to pin the exact contact point. Tap makes the measurement independent of absolute coil offset and largely temperature-independent, which is why Beacon markets its "contact" hardware and Cartographer its "Survey Touch" mode as the accuracy story, while plain scanning is the speed story.
+The two device classes differ in what they do with that change. An inductive probe compares the inductance against a threshold and toggles a digital pin: the output is one bit, asserted once per approach. An eddy-current probe measures the coil's resonant frequency continuously with an inductance-to-digital converter (LDC) such as the Texas Instruments LDC1612, and reports a number throughout the motion. **Every capability below follows from that single difference: a stream of values rather than a single edge.**
 
-## The thermal-drift problem
+## What a continuous reading permits
 
-Eddy-current sensing is exquisitely sensitive to temperature. The coil's inductance, the LDC oscillator, the PCB, and even the expansion of nearby metal all shift with heat. Klipper's docs are blunt about it: calibration and the probing that uses it "should be done at the same temperature." A probe calibrated on a cold bed will read a different absolute distance once the bed hits 100 C. Two mitigations exist. First, use tap/contact mode, which measures a slope inflection rather than an absolute value and mostly sidesteps drift. Second, use software compensation: mainline Klipper pairs a `[temperature_probe]` section with the probe, records how readings drift versus an onboard thermistor, and corrects in real time. BTT Eddy ships a temperature sensor on-board specifically for this.
+Because height is known at every instant, the toolhead need not stop at each probe point. It can traverse the bed while the LDC streams frequency data, and Klipper converts that stream into a mesh. Klipper exposes three distinct probing behaviours:
 
-## Mainline Klipper vs vendor forks
+- the **default descend-and-trigger mode**, used for quad gantry levelling (QGL) and Z-tilt, which reproduces the classic probe contract;
+- **`scan` mode**, which samples at the current Z without descending;
+- **`rapid_scan` mode**, which reads *during* horizontal motion and is the mode intended for mesh generation.
 
-As of 2026 the landscape splits three ways, and it matters for setup:
+The ordering of the trade-off is documented: `rapid_scan` is faster and noisier than a settling scan. The common division of labour is therefore a settling scan for calibration and `rapid_scan` for per-print adaptive meshing.
 
-- **Mainline Klipper** ships built-in `[probe_eddy_current]` + `[ldc1612]` support. **BTT Eddy** is the reference hardware for this path — it's an LDC1612 board that talks I2C to an onboard RP2040 running the Klipper MCU firmware, so no external plugin is required. A community plugin, **eddy-ng** (vvuk), adds a more polished tap workflow on top for those who want it.
-- **Beacon** ships its own `beacon_klipper` module rather than using the mainline section; its Rev H hardware combines eddy scanning with a contact probe, and configuration uses `beacon`-prefixed commands.
-- **Cartographer** historically ran its own Klipper fork/module with "Classic" scan and "Survey Touch" modes (`CARTOGRAPHER_CALIBRATE`, `CARTOGRAPHER_TOUCH_HOME`); newer hardware also works against the mainline eddy path. Reconcile before copying configs: a Cartographer guide's `CARTOGRAPHER_*` macros will not exist on a mainline BTT Eddy install, and vice versa.
+## The missing zero
 
-If you buy BTT Eddy, prefer the mainline path — it's maintained in the Klipper tree and doesn't depend on an out-of-tree plugin surviving the next Klipper release.
+A frequency reading is a distance from the *coil* to metal. **The coil has no knowledge of where the nozzle tip is**, so the sensor cannot supply an absolute Z origin on its own; the frequency-to-height model must be anchored by an external reference.
 
-## A mainline config + calibration walk-through
+**Contact (tap) mode** supplies that anchor. The nozzle is driven gently into the bed until motion stalls, then lifted, and the sensor examines the frequency's *rate of change* to locate the contact point. Because the quantity of interest is a slope inflection rather than an absolute frequency, the result is largely independent of the coil's absolute offset and of temperature. Beacon sells this as its "contact" hardware and Cartographer as "Survey Touch"; scanning remains the speed mechanism, contact the accuracy mechanism.
 
-A minimal BTT Eddy setup on mainline Klipper looks like this. The probe and temperature sections must share a name so Klipper links them:
+## Thermal drift
+
+Eddy-current sensing is strongly temperature-dependent. The coil's inductance, the LDC oscillator, the printed circuit board and the expansion of nearby metal all shift with heat. The Klipper documentation states the constraint directly: calibration and the probing that uses it "should be done at the same temperature." A probe calibrated on a cold bed reads a different absolute distance once the bed is hot.
+
+Two mitigations exist, and they are independent:
+
+1. **Contact mode**, which measures a slope inflection rather than an absolute value and therefore largely sidesteps drift.
+2. **Software compensation.** Mainline Klipper pairs a `[temperature_probe]` section with the probe, records how readings drift against an onboard thermistor, and applies the correction in real time. BTT Eddy carries an onboard temperature sensor for this purpose.
+
+**The two sections must share a name** — `[probe_eddy_current btt_eddy]` and `[temperature_probe btt_eddy]` — for Klipper to associate them.
+
+## Mainline Klipper and vendor forks
+
+Three code paths coexist, and configuration snippets are not portable between them:
+
+- **Mainline Klipper** ships `[probe_eddy_current]` and `[ldc1612]` in-tree. **BTT Eddy** is the reference hardware for this path: an LDC1612 board communicating over I2C with an onboard RP2040 running the Klipper microcontroller firmware, requiring no external plugin. The community plugin **eddy-ng** (vvuk) layers an additional tap workflow on top.
+- **Beacon** ships its own `beacon_klipper` module instead of the mainline section; its Rev H hardware combines eddy scanning with a contact probe, and its commands carry a `beacon` prefix.
+- **Cartographer** historically ran its own fork or module exposing "Classic" scan and "Survey Touch" modes (`CARTOGRAPHER_CALIBRATE`, `CARTOGRAPHER_TOUCH_HOME`); newer hardware also works against the mainline eddy path.
+
+The failure mode when mixing guides is immediate and legible: **`CARTOGRAPHER_*` macros do not exist on a mainline BTT Eddy install**, and the mainline `PROBE_EDDY_CURRENT_*` commands do not exist on a Cartographer fork. For BTT Eddy the mainline path is maintained in the Klipper tree and does not depend on an out-of-tree plugin surviving the next Klipper release.
+
+## Mainline configuration and calibration order
+
+A minimal BTT Eddy setup on mainline Klipper:
 
 ```ini
 [mcu eddy]
@@ -55,30 +78,38 @@ i2c_bus: i2c0f
 z_offset: 0.5
 x_offset: 0
 y_offset: 20
-# descend_z: 0.5   # how close to approach before switching to fine scan
 
 [temperature_probe btt_eddy]
 sensor_type: Generic 3950
 sensor_pin: eddy:gpio26
 ```
 
-Then calibrate, in order. First find the LDC drive current with the coil parked ~20 mm above bed center, then map frequency to Z height:
+Calibration is ordered, and the order is load-bearing. **Drive current is established first**, with the coil parked roughly 20 mm above bed centre; only then is frequency mapped to height:
 
 ```
 LDC_CALIBRATE_DRIVE_CURRENT CHIP=btt_eddy
 PROBE_EDDY_CURRENT_CALIBRATE CHIP=btt_eddy
 ```
 
-`PROBE_EDDY_CURRENT_CALIBRATE` walks the nozzle down in steps and asks you to set each height with the paper test (via `TESTZ`/`ACCEPT`), building the distance model. If you want contact tap probing, add:
+`PROBE_EDDY_CURRENT_CALIBRATE` steps the nozzle downwards and requires each height to be set by the paper test through `TESTZ` and `ACCEPT`, which is what builds the distance model. Contact (tap) probing is not part of the mainline `[probe_eddy_current]` surface; it comes from vendor modules or from the eddy-ng plugin, each with its own calibration commands. Thermal-drift correction is characterised with `TEMPERATURE_PROBE_CALIBRATE PROBE=btt_eddy TARGET=<temp>` while the bed heats. `SAVE_CONFIG` persists the results.
 
-```
-PROBE_EDDY_CURRENT_TAP_CALIBRATE CHIP=btt_eddy TAP=guess
-```
+**The drive current is specific to the coil's mounting geometry**, so `LDC_CALIBRATE_DRIVE_CURRENT` has to be re-run — and the frequency-to-height calibration redone after it — whenever the probe is remounted or its height above the bed changes.
 
-then re-run with `TAP=refine` and `TAP=verify`. To enable thermal-drift correction, characterize the drift with `TEMPERATURE_PROBE_CALIBRATE PROBE=btt_eddy TARGET=<temp>` while the bed heats. Save everything with `SAVE_CONFIG`. Drive current is the parameter most people forget — the wrong value clips the LDC's range and produces a distance model that goes nonlinear near the bed, so always run `LDC_CALIBRATE_DRIVE_CURRENT` first after any mounting-height change.
+## Comparison with other probe classes
 
-## How it stacks up against other probes
+Against a **standard inductive probe**: identical physics, but the eddy scanner yields continuous distance and full-bed scanning where the inductive probe only crosses a threshold, and the inductive trigger point is itself sensitive to temperature and to bed metal.
 
-Against a standard inductive probe: same physics, but eddy scanners give continuous distance and full-bed scanning, where an inductive probe only trips a threshold and is notoriously temperature- and metal-sensitive at the trigger point. Against BLTouch: eddy probes are non-contact for meshing (faster, no deploy servo to fail) but need real calibration and thermal management; BLTouch is dumber but forgiving and works on any bed. Against a load-cell / strain-gauge tool (like a Voron Tap or a load-cell toolhead): load cells measure true nozzle contact directly and don't care about bed material or temperature, which is the gold standard for Z accuracy — but they can't scan a mesh without touching every point. Eddy probes with tap try to get the best of both: fast non-contact meshing *plus* a contact reference for the absolute Z, at the cost of the most involved calibration of the bunch.
+Against a **BLTouch**: eddy probes are non-contact for meshing, so there is no deploy servo to fail, but they require calibration and thermal management; the BLTouch carries no model and works on any bed.
 
-**Try next:** Wire up a BTT Eddy on mainline Klipper, run `LDC_CALIBRATE_DRIVE_CURRENT` then `PROBE_EDDY_CURRENT_CALIBRATE`, and compare a `rapid_scan` adaptive mesh time against your current BLTouch or inductive probe.
+Against a **load-cell or strain-gauge tool** (a Voron Tap-style mount or a load-cell toolhead): the load cell measures true nozzle contact and is indifferent to bed material and temperature, but it cannot produce a mesh without physically touching every point.
+
+An eddy probe with contact mode occupies the middle: **non-contact scanning for the mesh, a contact reference for absolute Z**, at the cost of the most involved calibration of the group.
+
+## Pitfalls
+
+- **`LDC_CALIBRATE_DRIVE_CURRENT` skipped or stale after remounting.** Symptom: probing results disagree with the stored distance model after the probe is moved. Cause: the drive current is calibrated for one mounting geometry, and the frequency-to-height model is built on top of it.
+- **Calibration performed cold, probing performed hot.** Symptom: first-layer Z is consistently wrong once the bed reaches temperature. Cause: coil inductance, oscillator and surrounding metal all drift with heat; the Klipper documentation requires calibration and probing at the same temperature.
+- **`[temperature_probe]` named differently from `[probe_eddy_current]`.** Symptom: drift compensation never applies. Cause: Klipper associates the two sections by shared name.
+- **Copying a Cartographer guide onto a mainline BTT Eddy install.** Symptom: `CARTOGRAPHER_CALIBRATE` or `CARTOGRAPHER_TOUCH_HOME` reports an unknown command. Cause: those macros belong to the Cartographer module, not to mainline `[probe_eddy_current]`.
+- **Using `rapid_scan` for calibration measurements.** Symptom: mesh values that differ between runs of the same bed. Cause: `rapid_scan` samples during motion and is noisier than a settling scan.
+- **Expecting the sensor to supply an absolute Z origin.** Symptom: mesh shape is correct but the whole surface sits at the wrong offset. Cause: the coil measures its own distance to metal, not the nozzle tip position; the origin comes from `z_offset` or from a contact probe.

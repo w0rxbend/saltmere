@@ -59,6 +59,12 @@ jobs:
       - name: Check articles for duplicate topics
         run: python3 tools/check_duplicates.py
 
+      # Enforceable now that the whole corpus follows STYLE.md. Catches the
+      # exact rules — second person, filler, hype, a missing Gist opener or
+      # Pitfalls section — so reviewers can spend attention on correctness.
+      - name: Check articles against the house style
+        run: python3 tools/check_style.py
+
       - name: Build with Jekyll
         # Outputs to the './_site' directory by default
         run: bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}"

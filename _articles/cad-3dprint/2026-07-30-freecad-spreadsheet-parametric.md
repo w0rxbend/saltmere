@@ -2,8 +2,8 @@
 title: "One spreadsheet, many parts: driving FreeCAD dimensions from a table"
 date: 2026-07-30
 track: cad-3dprint
-summary: "Hard-coding dimensions into sketches means editing geometry every time a design changes. FreeCAD's Spreadsheet workbench lets you put your key dimensions in named cells and reference them from every constraint via expressions — so an enclosure resizes to a new board by editing two cells. Here's the alias-and-expression workflow."
-reading_time: 5
+summary: "Hard-coding dimensions into sketches means editing geometry whenever a design changes. FreeCAD's Spreadsheet workbench holds the driving dimensions in named cells that every constraint references through expressions, so an enclosure resizes to a new board by editing two cells. The alias-and-expression workflow, and the failure modes it does not remove."
+reading_time: 6
 tags: [freecad, parametric, spreadsheet, expressions, cad, enclosure]
 sources:
   - title: "Spreadsheet Workbench — FreeCAD Documentation"
@@ -16,11 +16,17 @@ sources:
     url: "https://www.silica.io/a-pragmatic-introduction-to-freecad-part-9-expressions-and-configurations/"
 ---
 
-Every parametric CAD project eventually hits the same wall: your key dimensions are scattered across a dozen sketch constraints, and changing the board you're enclosing means hunting down each one. FreeCAD 1.0's Spreadsheet workbench solves this cleanly — put your dimensions in one table, give the cells names, and reference those names from every constraint. Change the table, the whole model regenerates. It's the same "single source of truth" idea as build123d or OpenSCAD (covered earlier here), but for people who'd rather stay in the GUI and keep the parameters in front of them.
+**Gist.** In a hand-built computer-aided design (CAD) model the driving dimensions are duplicated across a dozen independent sketch constraints, so a change of input requires locating and editing each copy, and any copy missed silently produces a part that no longer fits. FreeCAD's Spreadsheet workbench removes the duplication by holding each dimension once in a named cell and letting every constraint reference that name through an expression, making the dependency explicit to the recompute engine. The cost is that an expression-driven constraint is no longer a number a human can drag: its value belongs to the table, edits must go through the table, and a single literal left behind in a sketch becomes an invisible exception to the rule.
 
-## Step 1: build the parameter table
+## The invariant the workflow establishes
 
-Switch to the **Spreadsheet** workbench and create a spreadsheet. Put your driving dimensions in cells — say a PCB you want to enclose:
+The property being enforced is single definition: **each independent dimension is written exactly once in the document, and every other occurrence is a derivation of it**. A model satisfying that property has the useful consequence that the set of things a human may edit is exactly the set of aliased cells, and everything else is a computed function of them.
+
+The property is not enforced by FreeCAD. Nothing prevents a literal `2.0` typed directly into a constraint. The workflow is a discipline; the spreadsheet supplies the mechanism that makes the discipline cheap enough to keep.
+
+## Step 1: the parameter table
+
+The Spreadsheet workbench creates a spreadsheet object inside the document. Driving dimensions go in cells — for an enclosure around a printed circuit board (PCB):
 
 | Cell | Value | Meaning |
 |---|---|---|
@@ -30,14 +36,16 @@ Switch to the **Spreadsheet** workbench and create a spreadsheet. Put your drivi
 | B4 | 2.0 | wall thickness (mm) |
 | B5 | 3.0 | standoff height (mm) |
 
-The trick that makes cells usable in expressions is the **alias**. Right-click a cell → *Alias*, and give `B1` the alias `board_len`, `B2` → `board_width`, `B4` → `wall`, and so on. Now the cell has a *name* you can reference from anywhere in the document, instead of a fragile "cell B1" address. You can even attach units — type `55 mm` and FreeCAD treats it as a length quantity, so your expressions stay dimensionally correct.
+What makes a cell usable from the rest of the document is the **alias**, a name bound to a cell through the cell's properties dialog: `B1` to `board_len`, `B2` to `board_width`, `B3` to `board_thickness`, `B4` to `wall`, `B5` to `standoff`. **The alias is the referencing key: an expression names `board_len` rather than the address `B1`, and the FreeCAD documentation recommends the alias form for references from outside the sheet.**
 
-## Step 2: reference the aliases from constraints
+A cell may also carry a unit. Entering `55 mm` stores a length quantity rather than a dimensionless number, and the expression engine then propagates the dimension through arithmetic. **Adding a quantity to a plain number is a unit mismatch the engine rejects, so the error surfaces at edit time rather than as a silently wrong dimension.** Multiplication is unaffected: a plain number scales a quantity and the unit carries through.
 
-Anywhere FreeCAD accepts a number, you can instead click the small blue **f(x)** expression icon and type a formula referencing the spreadsheet. To make the enclosure's inner cavity match the board plus clearance:
+## Step 2: referencing aliases from constraints
+
+Wherever FreeCAD accepts a numeric input, the **f(x)** icon opens the expression editor and replaces the number with an expression. For the enclosure's inner cavity:
 
 ```
-# In a sketch constraint for the cavity length:
+# Sketch constraint, cavity length:
 Spreadsheet.board_len + 1 mm
 
 # Cavity width:
@@ -50,20 +58,30 @@ Spreadsheet.board_len + 1 mm + 2 * Spreadsheet.wall
 Spreadsheet.standoff + Spreadsheet.board_thickness + 5 mm
 ```
 
-`Spreadsheet` is the object's name; `.board_len` is the alias. The expression engine understands units and arithmetic, so `2 * Spreadsheet.wall` resolves to `4 mm` and the constraint updates live. A constraint driven by an expression shows a small f(x) marker and can't be dragged by hand — which is exactly what you want, because its value now *belongs* to the table.
+`Spreadsheet` is the object's name in the document tree; the suffix after the dot is the alias. `2 * Spreadsheet.wall` resolves to `4 mm`, carrying the unit through the multiplication.
 
-## Step 3: change two cells, regenerate everything
+A constraint bound to an expression is marked with the f(x) indicator and **cannot be dragged in the sketcher**. That restriction is the visible half of the invariant: the constraint's value is no longer stored in the sketch, so there is nothing local to drag. The value is recomputed from the spreadsheet whenever the document recomputes.
 
-This is the payoff. A new revision of the board arrives at 60 × 30 mm. You edit `B1` and `B2`, hit recompute, and every cavity dimension, every wall, and the extrude depth all update together — because they're all derived from those two cells. No sketch archaeology, no forgetting one constraint and shipping a lid that doesn't close. The spreadsheet becomes the design's control panel.
+## Step 3: the recompute
 
-A few habits that keep this maintainable:
+Changing `B1` and `B2` to a 60 × 30 mm board and recomputing propagates through every constraint that references those aliases: cavity length and width, outer shell length, and any extrude depth derived from them. **The set of updated features is precisely the set that declared a dependency by naming an alias — nothing more and nothing less.** A wall thickness typed as a literal is outside that set and does not move, which is the failure this workflow exists to make impossible, and the failure that returns the moment one literal creeps back in.
 
-- **Alias everything you'll reference; label the row next to it.** Put a human-readable description in the adjacent column (A) so future-you knows `B4` is wall thickness without opening a sketch.
-- **Derive, don't duplicate.** If two dimensions must stay related (outer = inner + 2×wall), express one *in terms of* the other in the sheet or the constraint — never type the derived number twice, or they'll drift.
-- **Read values back for a BOM.** Spreadsheet cells can also *compute* — a cell can hold `=board_len * board_width` to show the footprint area, or reference model measurements, so the same sheet doubles as a lightweight parts/dimensions summary.
+Practices that keep the property intact:
 
-## Where the spreadsheet ends and code begins
+- **Alias every cell that is referenced, and label it in the adjacent column.** Column A holding "wall thickness (mm)" next to `B4` keeps the sheet readable without opening a sketch to infer what the number drives.
+- **Derive rather than duplicate.** Where two dimensions must stay related — outer equals inner plus twice the wall — one is expressed in terms of the other, in the sheet or in the constraint. A derived number typed twice has two independent definitions and drifts on the first edit that touches only one.
+- **Compute inside the sheet where useful.** Cells can hold formulas as well as constants, so a cell holding a product of two aliased dimensions reports a footprint area, and the same sheet doubles as a dimensional summary of the part.
 
-The Spreadsheet workbench is the sweet spot for a *fixed* set of named parameters you tune by hand — enclosures, brackets, plates that come in a few sizes. When you need *generated* geometry (a bolt pattern with N holes computed from a diameter, or a family of parts stamped out programmatically), that's where you graduate to FreeCAD's Python console or a code-CAD tool like build123d. Many projects run both: a spreadsheet for the headline dimensions a human sets, and a macro for the repetitive geometry those dimensions imply.
+## Where the spreadsheet stops
 
-**Try next:** Model a simple two-part snap enclosure with every dimension driven from a five-cell spreadsheet, then change only `board_len` and `board_width` to a completely different board's size and confirm the lid, walls, and standoffs all regenerate to fit — then deliberately hard-code one wall thickness as a literal in a sketch and watch it become the one dimension that *doesn't* follow, which is the bug this whole workflow exists to prevent.
+The Spreadsheet workbench addresses a **fixed** set of named parameters adjusted by hand: enclosures, brackets, plates offered in a few sizes. The table has one row per parameter and the model has one expression per constrained dimension, so the structure of the model is static and only the numbers move.
+
+Geometry whose *structure* depends on a parameter — a bolt circle whose hole count is computed from a diameter, or a family of parts generated in bulk — is not expressible this way, because the number of features is itself a variable. That work belongs to FreeCAD's Python console or to a code-CAD system such as build123d. The two combine: the spreadsheet holds the headline dimensions a human sets, and a macro generates the repetitive geometry those dimensions imply.
+
+## Pitfalls
+
+- **A dimension typed as a literal in one sketch stays fixed through every recompute.** Its symptom is a part that resizes almost correctly — a lid that no longer meets the walls — and the cause is that the constraint declared no dependency on any alias, so the recompute engine had no reason to visit it.
+- **A cell referenced by address carries no indication of what it holds.** The symptom is a reference that still resolves after the sheet is rearranged but no longer names the intended parameter; the cause is that the address encodes a position rather than an identity, which is why the documentation recommends aliases.
+- **Adding a unitless cell to a quantity is rejected by the expression engine.** The symptom is an expression that refuses to commit; the cause is that `55` and `55 mm` are different types to the engine, and a sheet built inconsistently produces this only for the expressions that combine the two.
+- **Deleting an alias orphans every expression that used it.** The dependency is by name, so each broken reference must be repaired individually.
+- **An expression-bound constraint cannot be dragged in the sketcher.** Attempting to adjust geometry by hand appears as an unresponsive sketch; the cause is that the value is held in the spreadsheet, and the edit must be made there.

@@ -2,7 +2,7 @@
 title: "From KiCad 9 Board to Fab Package: Gerber X2, Excellon, and IPC-2581"
 date: 2026-08-11
 track: cad-3dprint
-summary: "A finished PCB is only half the job — the fab needs a package it can actually build. Here's what goes in it, why Gerber X2 and IPC-2581 beat bare RS-274X, and how KiCad 9's Output Jobsets plus kicad-cli make the whole thing reproducible."
+summary: "A finished PCB layout is not a manufacturable package. What the fabrication package contains, what structured attributes in Gerber X2 and IPC-2581 carry that bare RS-274X cannot, and how KiCad 9 Output Jobsets with kicad-cli make the export reproducible."
 reading_time: 6
 tags: [kicad, pcb, gerber, ipc-2581, fabrication, kicad-cli]
 sources:
@@ -18,48 +18,48 @@ sources:
     url: "https://www.microtype.io/blog/kicad-9-jobsets"
 ---
 
-Routing the last trace is a milestone, not the finish line. What a board house actually builds from is a *package* of machine-readable files, and the gap between "my layout looks done" and "the fab accepted it" is where most first-time projects lose a day. This is the export step: turning a `.kicad_pcb` and its schematic into something a manufacturer can quote, fabricate, and assemble without emailing you back.
+**Gist.** A routed `.kicad_pcb` is a design database; a board house builds from a package of machine-readable image, drill and assembly files, and the translation between the two is where a revision silently loses information. Structured formats — **Gerber X2**, which embeds per-aperture attributes, and **IPC-2581**, which carries the whole package in one Extensible Markup Language (XML) document — preserve net, pad and stackup semantics that flat RS-274X discards, so the fab's computer-aided manufacturing (CAM) tooling can verify rather than infer. The cost is that the package is now a derived artifact of many coupled export settings, which is why KiCad 9 pushes the definition into a checked-in jobset file rather than a sequence of dialogs.
 
-## What the fab actually needs
+## What the package must answer
 
-Strip away the acronyms and a fabrication package answers a few blunt questions: where is the copper, where is the mask opening, where do holes go, and how big is the board? Concretely, for a standard two-layer board that means:
+A fabrication package answers a small set of blunt questions: where the copper is, where the mask opens, where holes go, and what shape the board is cut to. For a two-layer board that resolves to:
 
-- **Copper layers** — one image per layer (`F.Cu`, `B.Cu`, and any inner layers). This is the etch pattern.
-- **Solder mask** (`F.Mask`, `B.Mask`) — the green (or whatever) coating, with openings where pads sit.
-- **Silkscreen** (`F.Silkscreen`, `B.Silkscreen`) — the white reference designators and outlines.
-- **Solder paste** (`F.Paste`, `B.Paste`) — stencil apertures, only needed if you're getting a stencil or assembly.
-- **Board outline** (`Edge.Cuts`) — the mechanical shape the router follows. Miss this and the fab can't tell your board from a rectangle.
-- **Drill files** — hole positions and diameters, plated and non-plated, usually as Excellon.
+- **Copper layers** — one image per layer (`F.Cu`, `B.Cu`, plus any inner layers). The etch pattern.
+- **Solder mask** (`F.Mask`, `B.Mask`) — the coating, with openings where pads sit.
+- **Silkscreen** (`F.Silkscreen`, `B.Silkscreen`) — reference designators and outlines.
+- **Solder paste** (`F.Paste`, `B.Paste`) — stencil apertures, required only when a stencil or assembly is ordered.
+- **Board outline** (`Edge.Cuts`) — the mechanical profile the router follows. **Omitting this layer leaves the fab with no defined board shape**, and the order cannot proceed without a clarification round.
+- **Drill files** — hole positions and diameters, plated and non-plated, conventionally Excellon.
 
-Historically each of those went out as an **RS-274X** Gerber: a flat, dumb image format with no idea what a "net" or a "component" is. It works, but it throws away everything KiCad knows. If the fab needs to know which apertures are pads versus traces, or wants to verify your netlist against the copper, RS-274X can't tell them.
+Historically each image went out as **RS-274X**: a flat vector image description with no concept of a net or a component. It is sufficient to etch from, but it discards everything the design database knew. A fab that needs to distinguish pad flashes from trace segments, or that wants to compare the copper against the intended netlist, cannot recover that from RS-274X — the information is not encoded.
 
-## Why Gerber X2 and IPC-2581 are better
+## What X2 and IPC-2581 add
 
-**Gerber X2** is the same file format with structured attributes embedded in it. Each aperture carries metadata — this flash is a *component pad* on this *net*, this drill is *plated*, this layer is *top copper* in a defined stack. A fab's CAM tooling reads those attributes to auto-assign layers and run netlist comparison instead of guessing. KiCad emits X2 by default; you have to opt *out* with `--no-x2`. There's rarely a reason to.
+**Gerber X2** is the same underlying file format carrying structured attributes. An aperture can be marked as a component pad, associated with a net, and a drill marked plated or non-plated; layers carry their function and position in a defined stack. CAM tooling reads those attributes to assign layers automatically and to run a netlist comparison against the copper instead of inferring intent from geometry. **KiCad emits X2 by default; disabling it requires the explicit `--no-x2` flag.**
 
-**IPC-2581** goes further: it's a single XML file that bundles the entire package — copper, mask, silk, drill, stackup, netlist, *and* assembly data (component placement, BOM references) — in one open, vendor-neutral document. No zip of a dozen Gerbers plus a separate drill file plus a CSV that might drift out of sync. One file, one revision, fab and assembly data traveling together. KiCad 9 exports IPC-2581 revision B or C directly, and turnkey houses increasingly prefer it because there's nothing to reconcile.
+**IPC-2581** is a single open, vendor-neutral XML document that bundles copper, mask, silkscreen, drill, stackup, netlist *and* assembly data — component placement and bill-of-materials (BOM) references — together. The practical difference is one of coupling: a zip of a dozen Gerbers plus a separate drill file plus a placement comma-separated values (CSV) file plus a BOM is four independently revisable artifacts, and **any one of them can be regenerated while the others go stale**. IPC-2581 collapses them into one file with one revision. **KiCad 9 exports IPC-2581 revision B or C directly.**
 
-The practical takeaway: send X2 Gerbers when your fab expects Gerbers, send IPC-2581 when they accept it, and stop hand-assembling zips.
+Neither format is universally accepted, so the operative rule is: X2 Gerbers where the fab expects Gerbers, IPC-2581 where the fab accepts it.
 
 ## The kicad-cli commands
 
-Every fabrication output KiCad can produce has a `kicad-cli` subcommand, which is what makes this scriptable in CI. The core four:
+Each fabrication output has a `kicad-cli` subcommand, which is what makes the package reproducible in continuous integration.
 
 ```bash
-# 1. Gerber X2 copper/mask/silk/paste/outline (X2 + netlist on by default)
+# 1. Gerber X2 copper/mask/silk/paste/outline (X2 + netlist attributes on by default)
 kicad-cli pcb export gerbers \
   --output fab/gerbers/ \
   --layers F.Cu,B.Cu,F.Mask,B.Mask,F.Silkscreen,B.Silkscreen,F.Paste,B.Paste,Edge.Cuts \
   board.kicad_pcb
 
-# 2. Excellon drill files + a human-readable drill map
+# 2. Excellon drill files plus a human-readable drill map
 kicad-cli pcb export drill \
   --output fab/gerbers/ \
   --format excellon --excellon-units mm \
   --generate-map --map-format pdf \
   board.kicad_pcb
 
-# 3. IPC-2581 — the whole package in one compressed XML
+# 3. IPC-2581 — the whole package in one compressed XML document
 kicad-cli pcb export ipc2581 \
   --output fab/board.xml --version C --units mm --compress \
   board.kicad_pcb
@@ -71,7 +71,7 @@ kicad-cli pcb export pos \
   board.kicad_pcb
 ```
 
-And the BOM, which comes from the *schematic*, not the board:
+The BOM derives from the **schematic**, not the board, and therefore takes a `.kicad_sch` input:
 
 ```bash
 kicad-cli sch export bom \
@@ -83,23 +83,32 @@ kicad-cli sch export bom \
   board.kicad_sch
 ```
 
-Those `--fields` and `--labels` names are exactly the columns JLCPCB's assembly form expects — the `Designator`/`Comment`/`Footprint` header trio and an LCSC part column. Drop the `LCSC` field and this is a generic BOM for any house. Both JLCPCB and PCBWay ship recommended plot presets in the GUI's Plot dialog; the CLI honors the same board settings, so configure once in the project and the command line stays terse.
+The `--labels` values are the column headers JLCPCB's assembly form expects: the `Designator`/`Comment`/`Footprint` trio plus an LCSC part column. Removing the `LCSC` field yields a generic BOM. `--group-by "Value,Footprint"` collapses parts that share both attributes into one line with a quantity; **two components with the same value but different footprints remain separate rows**, because the grouping key includes the footprint. `--exclude-dnp` drops do-not-populate parts, so the BOM and the placement file must be generated under consistent assumptions or **the assembler receives coordinates for parts that were never ordered**.
 
-## Output Jobsets: define once, re-run forever
+Board houses publish recommended plot settings for the graphical Plot dialog; PCBWay's KiCad 9 guide is one such walkthrough. The command-line exporter honours the same board settings stored in the project, so the presets are configured once and the invocation stays short.
 
-Typing five commands per revision is exactly the kind of thing you get subtly wrong at 1am. KiCad 9 introduced **Output Jobsets** to fix it. A jobset is a `.kicad_jobset` file — created via **File → New Jobset File** in the project manager — that captures a list of *jobs* (export gerbers, export drill, export IPC-2581, export BOM, run DRC, render a STEP model) grouped into *destinations* (an output folder, or a zip archive). You configure the layers, formats, and presets once in the GUI, and the whole set becomes a reproducible artifact checked into the repo alongside the board.
+## Output Jobsets
 
-Because the jobset lives in the project, it's the single source of truth for "what a release looks like." Run it from the GUI, or run the identical set headless in CI:
+Five separate commands per revision is a state that drifts: one is edited, another is not, and the package that ships is a mixture of two board revisions. KiCad 9 introduced **Output Jobsets** to make the package a single declared object. A jobset is a `.kicad_jobset` file, created through **File → New Jobset File** in the project manager, holding a list of *jobs* — export gerbers, export drill, export IPC-2581, export BOM, run design rule check (DRC), render a STEP model — grouped into *destinations*, each destination being an output folder or a zip archive. Layers, formats and presets are configured once; the file is checked into the repository beside the board.
+
+Because the jobset lives in the project, it is the single definition of what a release contains, and it can be executed from the graphical interface or headless:
 
 ```bash
 # Generate every destination in the jobset
 kicad-cli jobset run --file fab.kicad_jobset board.kicad_pro
 
-# Or just the "JLCPCB" destination, and fail the build on any job error
+# Or a single destination, failing the build on any job error
 kicad-cli jobset run --file fab.kicad_jobset \
   --output JLCPCB --stop-on-error board.kicad_pro
 ```
 
-Drop that line in a GitHub Action and every tagged revision produces a fresh, identical fab package with zero manual clicks. Pair it with a scripted DRC gate ([KiCad Custom DRC Rules](/articles/cad-3dprint/2026-07-31-kicad-9-custom-drc-rules)) so a rule violation blocks the release, and you have a fabrication pipeline that's as version-controlled as your firmware. For anything the jobset and CLI can't express — reading net data back, mutating footprints programmatically — reach for the [IPC Python API (kipy)](/articles/cad-3dprint/2026-08-10-kicad-9-ipc-api-kipy); for the broader automation story see [Automating KiCad 9](/articles/cad-3dprint/2026-07-25-kicad-9-scripting).
+**`--stop-on-error` is what converts the jobset from a convenience into a gate**: without it a failed job leaves a partial destination that still looks like a complete package. Pairing the run with a scripted DRC job ([KiCad Custom DRC Rules](/articles/cad-3dprint/2026-07-31-kicad-9-custom-drc-rules)) makes a rule violation block the release. Operations the jobset and CLI do not express — reading net data back, mutating footprints programmatically — belong to the [IPC Python API (kipy)](/articles/cad-3dprint/2026-08-10-kicad-9-ipc-api-kipy); the wider automation surface is covered in [Automating KiCad 9](/articles/cad-3dprint/2026-07-25-kicad-9-scripting).
 
-**Try next:** Create a `.kicad_jobset` with three destinations — a JLCPCB zip, a PCBWay zip, and an IPC-2581 file — then wire `kicad-cli jobset run --stop-on-error` into CI behind a passing DRC.
+## Pitfalls
+
+- **`Edge.Cuts` omitted from the `--layers` list.** The package plots and zips without error; the fab has no board profile and has to query the order.
+- **`--no-x2` set, or an X2-unaware CAM flow.** Layer assignment and netlist comparison fall back to geometric inference, so a swapped or duplicated layer image is no longer caught automatically.
+- **BOM and placement generated with different `--exclude-dnp` settings.** The placement file contains coordinates for parts absent from the BOM, and assembly stalls on unmatched designators.
+- **BOM regenerated from the schematic while Gerbers come from an older board export.** Nothing in a Gerber-plus-CSV package cross-checks revisions; IPC-2581 avoids the class of failure by carrying both in one document.
+- **`jobset run` without `--stop-on-error`.** A failing job leaves the destination folder or archive partially populated, and the artifact is shipped as if complete.
+- **Drill map treated as a machine input.** The `--generate-map` output is a human-readable drawing; the Excellon files are what the drilling machine consumes.

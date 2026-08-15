@@ -2,8 +2,8 @@
 title: "build123d: Parametric Code-CAD in Python for the ESP32 Bench"
 date: 2026-07-27
 track: cad-3dprint
-summary: "build123d is a Pythonic BREP CAD library on the OpenCascade kernel. I compare its Builder and Algebra APIs, contrast it with OpenSCAD's CSG DSL, and model a parametric ESP32 enclosure lid that exports straight to STEP and STL."
-reading_time: 5
+summary: "build123d is a Pythonic boundary-representation CAD library on the OpenCascade kernel. A comparison of its Builder and Algebra APIs, a contrast with OpenSCAD's CSG DSL, and a parametric ESP32 enclosure lid exported to STEP and STL."
+reading_time: 6
 tags: [build123d, code-cad, parametric, python, 3d-printing, cadquery]
 sources:
   - title: "build123d documentation (readthedocs)"
@@ -18,25 +18,29 @@ sources:
     url: "https://cadquery.readthedocs.io/en/latest/"
 ---
 
-I keep a small pile of ESP32 sensor boards on the bench, and every one of them eventually needs a printed lid. Sketching lids in a mouse-driven CAD program is fine once; doing it eleven times, each with a slightly different vent pattern and screw spacing, is exactly the kind of work a parametric model should absorb. This journal already has notes on FreeCAD's Python console and on OpenSCAD, so this entry is about the tool I have actually settled on: **build123d**.
+**Gist.** A family of near-identical parts — ESP32 sensor lids differing only in vent pattern and screw spacing — is expensive to maintain as one mouse-drawn CAD document per variant, because a change to a shared dimension has to be replayed by hand in each. build123d expresses the part as a **Python function of named parameters** driving the OpenCascade boundary-representation (BREP) kernel, so a revision is a text diff and a re-run. The cost is that geometry is no longer selected by clicking it: **faces and edges must be identified by queries** (position, area, axis order) that can silently bind to a different face when a parameter changes shape topology.
 
 ## What build123d is, and what it is not
 
-build123d is a Python CAD library built on the OpenCascade geometric kernel (via the OCP bindings). That single sentence carries most of the important distinctions. OpenSCAD is a constructive solid geometry (CSG) system with its own domain-specific language: you union and difference primitives, and the result is meshed. build123d instead drives a boundary-representation (BREP) kernel, so a "part" is a real solid with faces, edges, and vertices you can query, fillet, and export as STEP for downstream CAD or CNC work — not just a triangle soup. And because it is ordinary Python, the whole standard library, `numpy`, unit tests, and your editor's tooling are all just there.
+build123d is a Python CAD library built on the OpenCascade geometric kernel through the OCP bindings. That one sentence carries the distinctions that matter.
 
-If you know CadQuery, build123d will feel familiar: same kernel, overlapping community, even a shared Discord. build123d started as a sibling/successor effort by Roger Maitland (gumyr) and leans harder into two things — location math and a choice of two APIs. The latest release is **0.11.1** (July 2026), it supports Python 3.10 through 3.14, and the repository is actively maintained at `gumyr/build123d`.
+OpenSCAD is a constructive solid geometry (CSG) system with its own domain-specific language: primitives are unioned and differenced, and the result is meshed. build123d instead drives a **BREP kernel**, where a part is a solid carrying explicit faces, edges and vertices. Those entities are addressable: they can be queried, filleted, and written out as **STEP**, a format that preserves exact curve and surface definitions rather than a triangulated approximation. The practical consequence is that a build123d part survives a round trip into downstream CAD or computer numerical control (CNC) toolpathing, whereas a mesh does not.
 
-## Builder API vs Algebra API
+Because the modelling language is ordinary Python, the standard library, `numpy`, unit-test frameworks and editor tooling apply without adaptation. The model is a program; the usual program-handling machinery works on it.
 
-build123d ships two ways to describe the same geometry.
+CadQuery shares the same kernel and an overlapping community. build123d began as a sibling effort by Roger Maitland (gumyr) and emphasises two things: location arithmetic, and a choice between two APIs. It is maintained at `gumyr/build123d` and distributed on the Python Package Index (PyPI) as `build123d`; the current release number and the range of supported Python versions are recorded in that package's metadata rather than fixed here, since both move.
 
-The **Builder API** uses context managers that hold an implicit running total. You open `with BuildPart() as part:`, add objects, and each one is fused (or subtracted) into the builder's state. It reads top-to-bottom like a recipe and is the mode I reach for first.
+## Builder API versus Algebra API
 
-The **Algebra API** drops the contexts and composes shapes with operators instead. `Plane.XZ * Pos(X=5) * Rectangle(1, 1)` reads as "take a rectangle, move it, place it on the XZ plane" — locations multiply, solids add and subtract with `+` and `-`. It carries almost no hidden state, which makes it pleasant for functions that return parts. Both target the identical kernel, so it is purely an ergonomics choice.
+build123d offers two syntaxes over the identical kernel; the choice is ergonomic, not semantic.
+
+The **Builder API** uses context managers holding an implicit running total. `with BuildPart() as part:` opens a scope, and each object created inside is fused into — or subtracted from — the builder's accumulated state according to its `mode`. The invariant is that **the builder owns exactly one current shape**, and every statement in the block is a transition on it. This reads top to bottom like a procedure, at the cost of state that is not named anywhere in the source.
+
+The **Algebra API** removes the contexts and composes with operators. `Plane.XZ * Pos(X=5) * Rectangle(1, 1)` places a rectangle: **locations multiply, solids combine with `+` and `-`**. Multiplication is location composition and associates left to right, so the plane and the offset combine into one location that then places the rectangle, and the result is a value rather than a mutation. Carrying almost no hidden state makes this form suitable for functions that return parts and for reuse of subassemblies.
 
 ## A parametric ESP32 lid
 
-Here is a real Builder-API part: a snap-in enclosure lid with a plug lip, four M3 counterbored corner holes, and a set of cooling vents over the microcontroller. Every dimension is a named parameter at the top.
+The part below is a snap-in enclosure lid: a top plate, a plug lip that drops into the box, four M3 counterbored corner holes, and cooling slots over the microcontroller. Every dimension is a named parameter.
 
 ```python
 from build123d import *
@@ -85,12 +89,27 @@ export_step(lid.part, "esp32_lid.step")
 export_stl(lid.part, "esp32_lid.stl")
 ```
 
-A few things worth noticing. `Locations` and `GridLocations` are location contexts — they position the *next* objects rather than transforming after the fact, which is why the four holes come from one `CounterBoreHole` call. `sort_by(Axis.Z)[-1]` is a live query against the solid's faces, selecting the top plate to sketch the vents onto. And `Mode.SUBTRACT` turns any object into a cut, so the lip's inner rectangle and the vent slots both remove material.
+Three mechanisms carry the model.
+
+**Location contexts position the next object rather than transforming a finished one.** `Locations` and `GridLocations` establish a set of placements in scope; each object constructed inside the block is instantiated once per placement. This is why a single `CounterBoreHole` call yields four holes: the grid supplies four locations, and the object statement runs against all of them.
+
+**Face selection is a query against the current solid.** `lid.faces().sort_by(Axis.Z)[-1]` collects the faces, orders them along the Z axis, and takes the last — the highest. The result is an ordinary object bound to `top` and reused as both a location source and a sketch plane. The binding is positional, not nominal: it names whichever face happens to sort highest at that point in the build, which is where parameter changes can retarget it.
+
+**`Mode.SUBTRACT` turns any object into a cut.** The same construction statement adds or removes material depending on its mode, so the lip's inner rectangle and the vent slots both remove, using the same syntax as the additive statements around them.
 
 ## Exporting for the printer
 
-The two export calls do the whole job. `export_step(shape, path)` writes a precise BREP STEP file (default `Unit.MM`) that you can reopen in FreeCAD or KiCad's 3D viewer with curves intact. `export_stl(shape, path, tolerance=0.001, angular_tolerance=0.1)` meshes the solid for the slicer — tighten the tolerances if you see facets on rounded corners. Both return a boolean success flag.
+`export_step(shape, path)` writes the BREP STEP file, default unit `Unit.MM`, reopenable in FreeCAD or KiCad's 3D viewer with curves intact. `export_stl(shape, path, tolerance=0.001, angular_tolerance=0.1)` triangulates the solid for the slicer; the two tolerances bound linear deviation and angular deviation of the mesh from the exact surface, so visible faceting on rounded corners is addressed by lowering them. Both functions report success by returning a boolean rather than by raising on failure, so the return value has to be inspected.
 
-Change `lid_l`, `lid_w`, or the vent count and re-run: a new STL drops out in a second, no clicking. That is the entire reason to model in code — the part is a function of its parameters, and diffing two revisions is diffing two text files.
+The parametric payoff is contained in the re-run: changing `lid_l`, `lid_w` or the vent count and executing the script produces a new STL without interactive work, and comparing two revisions is comparing two text files.
 
-**Try next:** Rewrite the vent block in the Algebra API (`lid -= Pos(...) * extrude(SlotOverall(...), -wall)`) and confirm the exported STL is byte-for-byte equivalent — a fast way to feel where the two APIs converge.
+**Try next:** rewrite the vent block in the Algebra API (`lid -= Pos(...) * extrude(SlotOverall(...), -wall)`) and compare the exported STL against the Builder-API output — a direct way to observe where the two APIs converge.
+
+## Pitfalls
+
+- **A face query silently retargets when a parameter changes topology.** `sort_by(Axis.Z)[-1]` selects whichever face is highest at that moment; if a later dimension change makes the lip or a boss taller than the top plate, the vents are cut into the wrong face and the script still succeeds.
+- **`Mode.SUBTRACT` on an object that does not intersect the current shape removes nothing and reports nothing.** A vent grid placed outside the plate footprint yields a solid lid with no error.
+- **Export failure is a return value, not an exception.** A script that ignores the boolean from `export_step` or `export_stl` proceeds to the next step while no usable file was written.
+- **STL tolerances are geometric, not visual.** `tolerance` and `angular_tolerance` are separate arguments bounding different quantities, so tightening the linear one alone can leave faceting on a small fillet unchanged.
+- **Builder state is implicit.** Inside a `BuildPart` block there is no named variable holding the intermediate solid, so an object created in the wrong nesting level fuses into a different builder than intended.
+- **STEP and STL are not interchangeable outputs of one model.** STEP preserves exact surfaces; STL is a triangulation produced under the tolerances given, so a slicer's view of the part is never the kernel's view of it.

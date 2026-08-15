@@ -3,7 +3,7 @@ title: "Scripting Klipper: Custom G-code Macros"
 date: 2026-07-30
 track: cad-3dprint
 summary: "How the [gcode_macro] section, Jinja2 templating, parameters, and printer-state access combine to build a real PRINT_START and override built-ins such as M600 in Klipper."
-reading_time: 6
+reading_time: 8
 tags: [klipper, 3d-printing, gcode, macros, jinja2, firmware]
 sources:
   - title: "Klipper — Command Templates"
@@ -69,7 +69,7 @@ gcode:
 
 ## Reading printer state
 
-The `printer` object exposes the same status dictionary that the Moonraker API publishes. Frequently used paths:
+The `printer` object exposes Klipper's object status dictionary. Frequently used paths:
 
 | Expression | Value |
 |---|---|
@@ -102,11 +102,11 @@ gcode:
 ```
 {% endraw %}
 
-`M140` and `M104` are set-and-continue; `M190` and `M109` are set-and-wait. The ordering exploits that distinction: homing (typically 15–30 s on a bed-slinger) overlaps the bed soak rather than following it, so the wall-clock start cost falls to `max(t_bed, t_home) + t_nozzle` instead of `t_bed + t_home + t_nozzle`. Deferring nozzle heat until after homing also avoids holding molten filament at temperature over the probe sequence, which is the usual source of the ooze blob dragged into the first layer.
+`M140` and `M104` are set-and-continue; `M190` and `M109` are set-and-wait. The ordering exploits that distinction: homing overlaps the bed soak rather than following it, so the wall-clock start cost falls to `max(t_bed, t_home) + t_nozzle` instead of `t_bed + t_home + t_nozzle`. Deferring nozzle heat until after homing also shortens the interval during which filament sits molten in a stationary nozzle, which is when oozing accumulates.
 
 ## Variables that persist across a print
 
-A macro may declare `variable_`-prefixed state, published on the `printer` object and mutable at run time through `SET_GCODE_VARIABLE`. This is the only supported channel for passing a value from one macro invocation to another.
+A macro may declare `variable_`-prefixed state, published on the `printer` object and mutable at run time through `SET_GCODE_VARIABLE`. It is the ordinary channel for passing a value from one macro invocation to another.
 
 {% raw %}
 ```
@@ -149,13 +149,13 @@ gcode:
 ```
 {% endraw %}
 
-`SAVE_GCODE_STATE` and `RESTORE_GCODE_STATE` snapshot and restore the interpreter state — absolute versus relative positioning (`G90`/`G91`), extruder mode (`M82`/`M83`), origin offsets, and speed factor — so `RESUME` resumes against the same coordinate frame the sliced file assumed. Without the pair, the trailing `G91` above would leak, and the first move after resume would be interpreted as a relative displacement of the sliced absolute coordinate.
+`SAVE_GCODE_STATE` and `RESTORE_GCODE_STATE` snapshot and restore the interpreter state — absolute versus relative positioning (`G90`/`G91`), extruder mode (`M82`/`M83`), origin offsets, and speed factor — so `RESUME` resumes against the same coordinate frame the sliced file assumed. Without the pair, the trailing `G91` above would leak, and the first move after resume would be interpreted as a relative displacement of the sliced absolute coordinate. **`RESTORE_GCODE_STATE` restores the interpreter state without moving the toolhead unless `MOVE=1` is supplied**; with the parameter omitted, the saved coordinates are reinstated as bookkeeping only and the carriage stays where the macro parked it.
 
-Wrapping a genuine built-in follows the same shape: `[gcode_macro PAUSE]` with `rename_existing: BASE_PAUSE`, calling `BASE_PAUSE` from inside the new body. The **invariant is that the renamed original must be invoked exactly once on every path through the override**; skipping it on a conditional branch leaves `[pause_resume]` believing the printer is running while the toolhead sits parked. The Klipper documentation warns explicitly that overriding commands can produce complex and unexpected results.
+Wrapping a genuine built-in follows the same shape: `[gcode_macro PAUSE]` with `rename_existing: BASE_PAUSE`, calling `BASE_PAUSE` from inside the new body. The **invariant is that the renamed original must be invoked exactly once on every path through the override**; skipping it on a conditional branch leaves `[pause_resume]` believing the printer is running while the toolhead sits parked. The Klipper documentation cautions that overriding a built-in command is an advanced use of the mechanism.
 
 ## delayed_gcode
 
-`[delayed_gcode]` schedules a block to run after a delay measured in seconds. `initial_duration:` fires it once after configuration load, which is the standard hook for initialisation that must not run during the config parse. `UPDATE_DELAYED_GCODE ID=name DURATION=10` (re)arms it from a macro, and `DURATION=0` cancels a pending timer. A block that re-arms itself constitutes a polling loop suitable for idle-timeout lighting or a temperature watchdog; the effective period is the requested duration plus the render and execution time of the block, so it drifts rather than holding a fixed phase.
+`[delayed_gcode]` schedules a block to run after a delay measured in seconds. `initial_duration:` gives a number of seconds after configuration load at which the block fires once; a value of 0 leaves it unarmed. `UPDATE_DELAYED_GCODE ID=name DURATION=10` (re)arms it from a macro, and `DURATION=0` cancels a pending timer. A block that re-arms itself constitutes a polling loop suitable for idle-timeout lighting or a temperature watchdog; the effective period is the requested duration plus the render and execution time of the block, so it drifts rather than holding a fixed phase.
 
 ## Pitfalls
 
@@ -165,5 +165,6 @@ Wrapping a genuine built-in follows the same shape: `[gcode_macro PAUSE]` with `
 - **A parking move without `SAVE_GCODE_STATE` leaks positioning mode.** A `G91` left set at the end of a filament-change macro turns the first absolute move after `RESUME` into a relative one, driving the toolhead off the bed or into the part.
 - **`rename_existing` skipped on a conditional branch desynchronises `[pause_resume]`.** The module's paused flag never sets, `RESUME` reports no paused print, and the queued file continues from the parked position.
 - **Upper-case characters in a `variable_` name are rejected at config load,** so the printer refuses to start rather than failing at the point of use.
-- **An unbounded `{% raw %}{% for %}{% endraw %}` loop materialises every generated line in host memory before execution begins,** producing a multi-second stall and, at large counts, an out-of-memory abort on a single-board host.
+- **An unbounded `{% raw %}{% for %}{% endraw %}` loop materialises every generated line in host memory before execution begins,** so render time and host memory both grow with the generated line count rather than with the loop body.
+- **`RESTORE_GCODE_STATE` without `MOVE=1` does not return the toolhead.** Positioning mode and offsets are reinstated, but the carriage remains at the parking position, so printing resumes from the wrong place.
 - **A self-rearming `[delayed_gcode]` drifts.** Its period is the requested duration plus render and execution time, so it must not be used as a time base for anything requiring fixed phase.

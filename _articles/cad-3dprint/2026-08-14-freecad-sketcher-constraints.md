@@ -2,8 +2,8 @@
 title: "FreeCAD Sketcher: Fully Constraining a Sketch and Reading the Degrees of Freedom"
 date: 2026-08-14
 track: cad-3dprint
-summary: "A sketch that isn't fully constrained is a set of suggestions, not a definition — here's how to read the degrees-of-freedom counter, pick geometric vs dimensional constraints, and drive a bracket profile to green (DoF = 0) without over-constraining it."
-reading_time: 5
+summary: "An under-constrained sketch is a set of suggestions rather than a definition: how the degrees-of-freedom counter is computed, how geometric and dimensional constraints differ, and how a bracket profile reaches DoF = 0 without redundancy or conflict."
+reading_time: 6
 tags: [freecad, sketcher, constraints, degrees-of-freedom, parametric, cad]
 sources:
   - title: "FreeCAD Wiki: Sketcher Workbench"
@@ -16,35 +16,60 @@ sources:
     url: "https://blog.freecad.org/2026/03/25/freecad-version-1-1-released/"
 ---
 
-Every solid model in FreeCAD's Part Design workflow starts as a 2D sketch, and every sketch starts unconstrained — a bag of lines that will slide, stretch, and rotate the moment you touch them. The Sketcher's job is to pin that geometry down until exactly one shape satisfies your rules. FreeCAD tracks how much freedom remains with a **degrees of freedom** counter, and the discipline of driving it to zero is what separates a model you can edit six months later from one that explodes when you change a single number. This is current in FreeCAD 1.1 (released March 25, 2026), but the concepts are unchanged since 1.0.
+**Gist.** Every solid in FreeCAD's Part Design workflow begins as a 2D sketch, and freshly drawn sketch geometry admits infinitely many positions and sizes that satisfy the drawing as entered. The Sketcher's constraint solver removes that freedom one **degree of freedom (DoF)** at a time until exactly one configuration remains, and reports the remaining count in the Solver messages panel. The cost is that the constraint set must be *exactly* determining: too few constraints leave geometry free to drift when an upstream parameter changes, and one too many produces a redundant or conflicting sketch that the solver reports as an error rather than silently ignoring. The behaviour described here is current in FreeCAD 1.1, released 25 March 2026.
 
-## What degrees of freedom actually count
+## What the degrees-of-freedom counter measures
 
-A single line segment, freshly drawn, has **four** degrees of freedom: it can move horizontally, move vertically, stretch in length, and rotate. Each constraint you add removes one or more of those DoF. When the count reaches zero, the geometry is *fully constrained* — there is exactly one valid position and size for every element. FreeCAD shows the running total in the **Solver messages** panel of the Sketcher task dialog: unconstrained geometry appears white, and the panel reads `Under-constrained: N degrees of freedom`. When you close the last gap, the message flips to `Fully constrained` and every edge turns **green**.
+A DoF is one independent parameter of the sketch's geometry that no constraint has yet fixed. A single line segment drawn on an empty sketch carries **four** DoF: its two endpoints each have an x and a y coordinate, which is equivalent to saying the segment can translate along two axes, rotate, and change length. **The counter is a property of the whole sketch, not of any one edge** — it is the number of free parameters across all geometry minus the number of independent equations the constraints impose.
 
-Green is the goal. Not because FreeCAD refuses to extrude a loose sketch — it will happily pad a white one — but because an under-constrained sketch has undefined behavior under edits. Change a pad length or a spreadsheet parameter upstream, and any element that wasn't locked down is free to drift to a new solution the solver finds equally valid.
+Each constraint removes one or more DoF, provided it is independent of the constraints already present. A **coincident** constraint between two endpoints identifies two coordinate pairs and removes two. A **horizontal** constraint on a line forces the two endpoint y-coordinates equal and removes one. A **distance** constraint removes one. Dependence, not the constraint's type, decides whether the count falls: a constraint whose equation is already implied by the existing set removes nothing, and FreeCAD classifies it as redundant.
 
-## Two families of constraints
+The Sketcher reports state in three visible channels:
 
-Constraints come in two kinds, and a robust sketch uses both.
+- The **Solver messages** panel in the task dialog reports the sketch as under-constrained together with the number of remaining degrees of freedom while that number is greater than zero, and as **fully constrained** when it reaches zero.
+- Geometry that still has freedom is drawn **white**; a fully constrained sketch turns **green** throughout.
+- Errors — redundant, conflicting, or over-constrained — are reported in the same panel with links that select the offending constraints.
 
-**Geometric constraints** define *relationships* without numbers: **coincident** (join two endpoints, or make a point concentric), **horizontal/vertical** (force a line or point-pair onto an axis), **parallel**, **perpendicular**, **tangent**, **equal** (two edges share length or radius), **symmetric** (two points mirror across a line or axis), and **point-on-object**. These are cheap DoF removers and they encode design intent — "these two holes are always the same size" survives every later edit.
+**Reaching zero is a correctness property, not a formality.** FreeCAD does not refuse to pad an under-constrained sketch; it will extrude a white profile without complaint. The consequence appears later. The solver only guarantees that the final geometry satisfies the stated constraints, so any parameter left free may settle on a different value the next time the sketch is solved — after a spreadsheet cell changes, after an upstream feature moves the attachment, or after a vertex is dragged. **An under-constrained sketch therefore has no stable definition of shape across edits, only a shape that happened to be reached on the last solve.**
 
-**Dimensional constraints** supply the *numbers*: **distance** (length of a line or gap between points), **horizontal/vertical distance**, **angle**, and **radius/diameter**. Reach for geometric constraints first to express intent, then add the minimum dimensions needed to fix scale.
+## The two constraint families
 
-## Step-by-step: constraining a bracket profile to 0 DoF
+Constraints divide into those that state a relationship and those that state a number, and a durable sketch uses both.
 
-Take a simple L-shaped bracket outline — six line segments forming a closed loop, drawn roughly with the polyline tool.
+**Geometric constraints** encode relationships without any dimension: **coincident** (joins two points, including making a point concentric with a circle's centre), **horizontal** and **vertical** (aligns a line or a point pair with a sketch axis), **parallel**, **perpendicular**, **tangent**, **equal** (two edges share length or radius), **symmetric** (two points mirror about a line or axis), and **point-on-object** (a point lies on an edge or its extension). These carry design intent through later edits: an **equal** constraint between two holes keeps them equal whatever their radius becomes, whereas two independent radius dimensions do not.
 
-1. **Close and coincide.** Make sure every corner is a single coincident point (endpoints snapped together). The solver won't fully constrain a loop with a hairline gap. Draw with snapping on, or add **coincident** constraints at each vertex. Six clean corners drop you from ~24 DoF to around 8.
-2. **Anchor to the origin.** Select the bottom-left corner point and the sketch origin, apply **coincident**. This kills the two translation DoF for the whole profile — nothing floats anymore.
-3. **Square it up.** Select the bottom edge, apply **horizontal**; select the left edge, apply **vertical**. Add **vertical**/**horizontal** to the remaining edges (or **perpendicular** between adjacent ones). This removes rotation and forces the right-angle geometry. The counter should now read a small single-digit number.
-4. **Dimension the outer box.** Add a **horizontal distance** for overall width (say 60 mm) and a **vertical distance** for overall height (40 mm).
-5. **Dimension the notch.** Add the two distances that define the inner corner of the L — the leg thickness one way (12 mm) and the other (15 mm).
-6. **Read the panel.** It should now say `Fully constrained` and the whole outline turns green. If it still shows `1 degree of freedom`, one dimension or a horizontal/vertical is missing — grab a green-less edge and drag it to see what still moves.
+**Dimensional constraints** supply the numbers: **distance** (length of an edge or separation of two points), **horizontal distance** and **vertical distance** (the axis-aligned components), **angle**, and **radius** or **diameter**. Each fixes one scalar and removes one DoF when independent.
 
-## Avoiding over-constraint and redundancy
+The ordering that minimises redundancy is to state geometric relationships first and then add only the dimensions still needed to fix scale and position — every relationship expressed geometrically is one fewer number that a later edit can contradict.
 
-Adding more constraints past zero isn't safer — it's an error. If you dimension a length that a symmetric-plus-equal pair already implied, the solver flags a **redundant constraint** (the relationship is true but stated twice; use *Select redundant constraints* to find it and delete it). If two constraints demand incompatible things — a line both horizontal and at 30° — you get an **over-constrained**, *conflicting* sketch, and FreeCAD warns you to undo. The habit that avoids both: constrain incrementally, watch the DoF counter drop by exactly what you expect after each click, and stop the instant it hits zero.
+## Driving a bracket profile to zero
 
-**Try next:** open any past sketch that shows white edges, drag a vertex to see what floats, then add constraints one at a time — watching the Solver messages count fall — until it reads `Fully constrained`.
+Consider an L-shaped bracket outline: six line segments forming a closed loop, drawn roughly with the polyline tool.
+
+1. **Close the loop.** Every corner must be a single coincident point. **A corner with a hairline gap leaves both endpoints free rather than joined**, so the sketch does not reach zero DoF and Part Design rejects the profile as an open wire. Drawing with snapping enabled produces the coincident constraints automatically; otherwise each vertex needs an explicit **coincident**. Six segments start at 24 DoF (four per segment) and six coincidences remove two each, leaving twelve.
+2. **Anchor to the origin.** A **coincident** constraint between one corner point and the sketch origin removes the profile's two translational DoF. Nothing in the sketch can float thereafter.
+3. **Fix the orientation.** **Horizontal** on the bottom edge and **vertical** on the left edge remove rotation and align the profile to the axes; the remaining edges take **horizontal**, **vertical**, or **perpendicular** against their neighbours. Each independent one of these removes a further DoF.
+4. **Dimension the bounding box.** A **horizontal distance** for overall width and a **vertical distance** for overall height fix the outer extent.
+5. **Dimension the notch.** Two further distances fix the inner corner of the L — one leg thickness in each direction.
+6. **Read the panel.** The message should now read `Fully constrained` and the outline should be green throughout. If it still reports one or more degrees of freedom, a dimension or an alignment is missing; **dragging a vertex reveals which parameter is still free, because only unconstrained parameters move under the drag.**
+
+The useful discipline is to watch the counter after every constraint and check that it fell by the expected amount. A click that leaves the count unchanged has added a dependent constraint, and that is the moment to undo it — not after twenty more clicks, when the redundancy is buried.
+
+## Redundancy, conflict and over-constraint
+
+Adding constraints past zero is an error state rather than extra safety, and FreeCAD distinguishes the cases.
+
+A **redundant constraint** is one whose equation is already implied by the others: a length dimension on an edge that an **equal** plus **symmetric** pair has already determined, for example. The stated relationship is true, so the geometry is not wrong, but the solver reports the redundancy and the sketch now has two places where one number lives. The Sketcher provides a *Select redundant constraints* action that highlights them for deletion.
+
+A **conflicting** sketch results when two constraints demand incompatible values of the same parameter — a line constrained both **horizontal** and to an angle of 30°. There is no solution, the solver reports the conflict, and the correct response is to undo the last constraint rather than to fight the solver by deleting geometry.
+
+The distinction matters because the two have different fixes: redundancy is resolved by deleting the *later, weaker* statement of an already-known fact, whereas conflict means one of the two constraints expresses the wrong intent and must be replaced, not merely removed.
+
+## Pitfalls
+
+- **A padded white sketch produces geometry that changes shape on the next solve.** FreeCAD extrudes an under-constrained profile without warning, so the defect surfaces only when an upstream parameter changes and the free parameters resolve differently.
+- **A hairline gap at a corner leaves the loop open.** The profile appears closed on screen at normal zoom, but the sketch never reaches zero DoF and Part Design rejects it as an open wire.
+- **A constraint that leaves the DoF counter unchanged has been absorbed as redundant.** The sketch still looks correct; the duplicate statement of the same fact only becomes visible as a solver message later, after many more constraints hide its origin.
+- **Dimensioning a length that `equal` plus `symmetric` already implied triggers a redundancy report**, because the symmetry and equality together have already determined that scalar.
+- **Constraining a line both horizontal and to a non-zero angle yields a conflicting sketch with no solution**; deleting geometry does not fix it, since the incompatible pair of constraints is the cause.
+- **Fixing scale before fixing relationships multiplies the dimensions needed.** Every relationship left unexpressed geometrically becomes an independent number that a later parameter change can contradict.

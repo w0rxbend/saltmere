@@ -2,7 +2,7 @@
 title: "Sensorless homing on Klipper: TMC2209 StallGuard, tuned"
 date: 2026-07-31
 track: cad-3dprint
-summary: "Skip the endstop switches: a TMC2209 can detect the motor stalling into the axis limit and report it on its DIAG pin as a virtual endstop. This covers the wiring, the printer.cfg for diag_pin and driver_SGTHRS, why homing_retract_dist must be 0, the SGTHRS tuning direction everyone gets backwards, and the dwell that keeps homing repeatable."
+summary: "A TMC2209 detects the motor stalling into the axis limit and reports it on its DIAG pin as a virtual endstop, removing the mechanical switch. This covers the wiring, the printer.cfg entries for diag_pin and driver_SGTHRS, why homing_retract_dist must be 0, the direction of the SGTHRS sensitivity scale, and the dwell that keeps homing repeatable."
 reading_time: 6
 tags: [klipper, tmc2209, sensorless-homing, stallguard, 3d-printing, printer-cfg]
 sources:
@@ -16,13 +16,13 @@ sources:
     url: "https://www.klipper3d.org/Config_Reference.html#tmc2209"
 ---
 
-A limit switch is a small failure surface with a real cost: two more wires per axis, a bracket to print, a screw to strip, and a connector that eventually goes intermittent. On a CoreXY or a delta the switch placement is fiddly and the repeatability is only as good as the lever. The TMC2209 offers a different deal — it already measures the back-EMF load on the motor, so when the carriage drives into the frame and the motor stalls, the driver *knows*. **StallGuard4** turns that stall into a digital pulse on the **DIAG** pin, and Klipper treats that pin as a **virtual endstop**. No switch, no bracket, and the "endstop" is the physical axis limit itself.
-
-The catch is that sensorless homing is a tuning exercise, not a plug-in feature. The stall threshold depends on your motor, current, voltage, and homing speed, and a bad value either crashes silently past the limit or triggers on the acceleration transient a millimetre after it starts moving. Get the workflow right and it's rock solid.
+**Gist.** A mechanical limit switch adds wiring, a bracket and a connector per axis, and its repeatability is bounded by the lever geometry. The TMC2209 already derives a load measure from the motor's back-electromotive force (back-EMF), so **StallGuard4** can report the carriage driving into the frame as a digital edge on the **DIAG** pin, which Klipper consumes as a **virtual endstop**. The cost is that the trigger point is no longer a fixed mechanical feature: it is a threshold that depends on motor, run current, supply voltage and homing speed, and must be tuned per axis and re-verified from cold.
 
 ## Wiring and the DIAG pin
 
-Wire the driver's **DIAG** (sometimes silkscreened DIAG/INDEX) output to the MCU pin that would otherwise be your X (or Y) endstop input. On many boards there's a dedicated jumper that bridges the driver's DIAG to the endstop header — set it, and leave the physical endstop connector empty. One important electrical note: the DIAG line is push-pull/open-ended depending on the board, so if you see phantom triggers, drop the pull-up and invert, or vice versa — the pin definition in Klipper carries the `^` (pull-up) and `!` (invert) prefixes for exactly this.
+The driver's **DIAG** output (silkscreened DIAG on most boards) is connected to the microcontroller (MCU) pin that would otherwise carry the X or Y endstop input. Many boards provide a jumper that bridges DIAG to the endstop header directly; with that jumper set, the physical endstop connector is left empty.
+
+The electrical behaviour of the DIAG line differs between boards, so the same threshold can produce phantom triggers on one board and none on another. Klipper's pin syntax carries the two modifiers that resolve this: **`^` enables the MCU pull-up** and **`!` inverts the logical sense** of the pin. Phantom triggers that appear before any motion are a pin-configuration symptom rather than a threshold symptom, and are addressed by changing those prefixes.
 
 ## The printer.cfg
 
@@ -33,7 +33,7 @@ Two sections cooperate. The `[tmc2209 stepper_x]` section declares the DIAG pin 
 uart_pin: PC11
 run_current: 0.700
 diag_pin: ^PA1              # MCU pin wired to the driver DIAG line
-driver_SGTHRS: 80          # StallGuard threshold; TUNE THIS (0-255)
+driver_SGTHRS: 80          # StallGuard threshold; tune per axis (0-255)
 
 [stepper_x]
 step_pin: PB13
@@ -46,37 +46,57 @@ position_endstop: 0
 position_min: 0
 position_max: 235
 homing_speed: 40           # fast enough for reliable stall detection
-homing_retract_dist: 0     # MUST be 0 — no second homing move
+homing_retract_dist: 0     # must be 0 — no second homing move
 ```
 
-Three lines carry the whole trick. `endstop_pin: tmc2209_stepper_x:virtual_endstop` tells Klipper the endstop is the driver's StallGuard output, not a physical pin. `homing_retract_dist: 0` **disables the second homing pass** — the usual back-off-and-re-home dance doesn't work sensorlessly, because after the first stall the motor is loaded against the frame and a short re-approach can't build a clean stall again. And `driver_SGTHRS` is the number you'll spend your tuning session on.
+Three lines carry the mechanism.
 
-## Tuning SGTHRS (the direction everyone reverses)
+`endstop_pin: tmc2209_stepper_x:virtual_endstop` binds the axis endstop to the driver's StallGuard output rather than to a board pin. The name is derived from the driver section, so a `[tmc2209 stepper_y]` section supplies `tmc2209_stepper_y:virtual_endstop`.
 
-On the TMC2209, StallGuard4 compares an internal load measurement against `SGTHRS`, and — counterintuitively — **a higher `driver_SGTHRS` is *more* sensitive** (0 = least sensitive, 255 = most). This is the opposite of the older TMC2130 StallGuard2 `driver_SGT`, where lower is more sensitive, and mixing them up is the single most common tuning mistake. If homing triggers instantly the moment the motor moves, your threshold is too high; if the carriage slams the frame and grinds without stopping, it's too low.
+`homing_retract_dist: 0` **disables the second homing pass**. The default homing sequence approaches the endstop, retracts by this distance, and re-approaches slowly to refine the trigger position. That refinement is invalid here for two reasons: after the first stall the carriage is loaded against the frame, and the second approach is deliberately slow — and StallGuard's load measure is only meaningful while the motor is turning at speed. A non-zero retract distance therefore produces a second pass whose trigger point is not comparable to the first.
 
-The workflow, without reflashing between attempts:
+`driver_SGTHRS` is the trigger threshold and the only value that requires a tuning session.
 
-1. Set `homing_speed` first and leave it (stall detection is speed-dependent — the Klipper docs note the driver can't reliably detect a stall at very slow speeds; aim for roughly a full motor revolution every two seconds or faster).
-2. Start `driver_SGTHRS` low, then home `G28 X` and step it up.
-3. Adjust live with `SET_TMC_FIELD STEPPER=stepper_x FIELD=SGTHRS VALUE=90` and re-home, no restart needed. Binary-search toward the highest value that never false-triggers on the acceleration transient but still stops firmly at the limit.
-4. **Wait a couple of seconds between homing attempts.** StallGuard needs the motor to be moving at speed to be meaningful, and the driver's internal indicator must clear between runs — hammering `G28` back-to-back gives inconsistent results.
-5. Once you've found the sweet spot, write it into `driver_SGTHRS` and confirm it survives a cold start (StallGuard behaves differently as the motor warms; verify from cold, which is the worst case).
+## Tuning SGTHRS
 
-## The dwell that makes it repeatable
+StallGuard4 compares an internal load measurement against `SGTHRS`. On the TMC2209 the scale runs **0 (least sensitive) to 255 (most sensitive), so a higher `driver_SGTHRS` triggers on a smaller load**. This is inverted relative to StallGuard2 on the TMC2130, whose `driver_SGT` is more sensitive at lower values; carrying the TMC2130 intuition across is a frequent cause of tuning that moves in the wrong direction.
 
-There's a subtle timing issue on multi-axis or homing-override setups: right after a stall-home, the motor coils are still energized and holding position against the frame. If your homing macro immediately moves that axis (or homes the next one on a shared load), the residual load can corrupt the next StallGuard read or cause a missed step. The fix is a short **`G4` dwell** in your homing override to let the axis settle and de-energize before the next move — a couple hundred milliseconds is usually enough:
+The two failure modes are distinguishable by symptom. **A trigger within the first few millimetres of motion means the threshold is too high**: the acceleration transient at the start of the move presents a load comparable to a stall. **A carriage that reaches the frame and grinds without the move ending means the threshold is too low**: the stall load never crosses it.
+
+The tuning loop does not require restarting Klipper between attempts:
+
+1. Fix `homing_speed` first and leave it fixed. Stall detection is speed-dependent, and the Klipper documentation notes the driver cannot reliably detect a stall at very slow speeds, so the homing speed has to be kept well above a crawl. Changing the speed later invalidates the threshold found at the old speed.
+2. Start `driver_SGTHRS` low, run `G28 X`, and raise it.
+3. Adjust the live value with `SET_TMC_FIELD STEPPER=stepper_x FIELD=SGTHRS VALUE=90` and re-home. This writes the driver register directly, so no restart is needed and the config file is untouched.
+4. Search for **the highest value that never triggers on the acceleration transient** while still ending the move firmly at the limit, then back off by a few counts for margin.
+5. **Leave a pause of a second or more between homing attempts.** Back-to-back `G28` invocations give inconsistent results, because the driver's stall indicator must clear and the axis must be at speed for the measurement to be meaningful.
+6. Write the chosen value into `driver_SGTHRS` and confirm it still homes from a cold machine. StallGuard's readings shift as the motor warms, so the cold case is the one that must be verified rather than assumed.
+
+## The dwell between axes
+
+Immediately after a stall-home, the coils remain energised and hold the carriage against the frame. A homing macro that moves that axis, or homes another axis sharing the same load path, while that condition persists can corrupt the next StallGuard reading or lose steps. A short **`G4` dwell** between homing moves lets the axis settle first:
 
 ```ini
 [homing_override]
 gcode:
     G28 X
-    G4 P250          # let X settle / de-energize before Y
+    G4 P250          # let X settle before Y
     G28 Y
     G4 P250
     G28 Z
 ```
 
-This is the sensorless equivalent of the mechanical second-home: instead of re-touching a switch, you give the driver a moment of quiet so the next axis's stall detection starts from a clean state.
+The dwell occupies the role the mechanical second homing pass plays with a switch: instead of re-touching a contact to refine the position, it gives the driver an interval of quiet so the next axis begins its stall detection from an unloaded state.
 
-**Try next:** Bind `SET_TMC_FIELD ... FIELD=SGTHRS` to two macros (`SG_UP`/`SG_DOWN` that bump the value by 5) and home X repeatedly while walking the threshold from too-low to too-high — note the exact value where false triggers start, then set `driver_SGTHRS` a few counts below it for margin.
+**Extension.** Binding `SET_TMC_FIELD ... FIELD=SGTHRS` to a pair of macros that step the value up and down by five counts allows the threshold to be walked from too-low to too-high across repeated `G28 X` runs, recording the exact value at which false triggers begin, and placing `driver_SGTHRS` a few counts below it.
+
+## Pitfalls
+
+- **Homing ends a millimetre into the move.** The threshold is high enough that the acceleration transient reads as a stall; lower `driver_SGTHRS`, or reduce acceleration on the homing move.
+- **The carriage grinds at the frame and the move never completes.** The threshold is below the stall load; raise `driver_SGTHRS`.
+- **`driver_SGTHRS` is adjusted in the TMC2130 direction.** On the TMC2209, higher is more sensitive, so a value lowered to "increase sensitivity" moves the axis further into the grinding failure.
+- **`homing_retract_dist` left at its default.** The second, slow approach runs against an already-loaded axis at a speed at which StallGuard is unreliable, producing a trigger position that varies run to run.
+- **`homing_speed` changed after tuning.** The load measure is speed-dependent, so a threshold tuned at one homing speed does not transfer to another.
+- **Threshold verified only on a warm machine.** Readings shift with motor temperature, so a value that homes reliably after a print can fail on the first home from cold.
+- **Repeated `G28` with no pause.** The stall indicator has not cleared between runs, so consecutive homing attempts report different trigger points and appear to indicate an unstable threshold.
+- **Phantom triggers before any motion.** This is the DIAG pin's electrical configuration, not the threshold; the `^` pull-up and `!` invert prefixes on `diag_pin` are what change it.

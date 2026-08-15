@@ -1,9 +1,9 @@
 ---
-title: "Measuring your printer's resonances with an ADXL345 and letting Klipper tune input shaping"
+title: "Measuring printer resonances with an ADXL345 and calibrating Klipper input shaping"
 date: 2026-07-31
 track: cad-3dprint
-summary: "Ghosting and ringing are your printer's frame ringing like a bell at its resonant frequency. Instead of guessing input-shaper values, bolt a $5 ADXL345 accelerometer to the toolhead, let Klipper excite each axis and record the response, and have it compute the shaper type and frequency that cancel the ringing. Here's the wiring, config, and command flow."
-reading_time: 5
+summary: "Ringing on printed walls is the frame oscillating at its natural frequency after each direction change. Klipper's input shaper cancels that oscillation by splitting each acceleration command into timed impulses, but only at a frequency it has been told. An ADXL345 accelerometer mounted on the toolhead supplies that frequency by measurement, at the cost of the smoothing the shaper imposes on fine detail."
+reading_time: 6
 tags: [klipper, adxl345, input-shaper, resonance, 3d-printing, calibration]
 sources:
   - title: "Klipper — Measuring Resonances (official docs)"
@@ -18,16 +18,22 @@ sources:
     url: "https://www.klipper3d.org/G-Codes.html#resonance_tester"
 ---
 
-Print a cube fast and look at the wall just after each corner: faint repeating echoes of the corner, fading out. That's **ringing** (a.k.a. ghosting), and it isn't a slicer problem — it's physics. When the toolhead changes direction sharply it hammers the frame, and the frame rings at its natural resonant frequency like a struck bell, dragging the nozzle a few microns back and forth. Klipper's **input shaper** cancels this by shaping the acceleration commands so they don't excite that frequency. But it can only cancel a frequency it *knows*, and every printer's is different. An ADXL345 accelerometer lets you measure it instead of guessing.
+**Gist.** A sharp direction change delivers an impulse to the printer frame, which then oscillates at its own natural frequency and drags the nozzle back and forth, leaving the repeating echoes known as ringing or ghosting. Klipper's **input shaper** suppresses the oscillation by replacing each commanded acceleration with a short sequence of impulses whose individual responses cancel at one target frequency — a frequency that differs per machine and per axis, and that an ADXL345 accelerometer on the toolhead measures directly. The cost is **smoothing**: the impulse sequence spreads motion over a finite window, blunting fine geometry and capping the acceleration at which the shaper remains valid.
+
+## The mechanism being cancelled
+
+The moving mass and the compliance of belts, gantry and frame form an under-damped second-order system. An abrupt change in commanded acceleration excites it, and the response decays over several periods. At a print speed *v* and resonant frequency *f*, successive echoes appear on the wall spaced *v / f* apart — which is why ringing is measured on a test tower rather than argued about in the slicer.
+
+Input shaping is a feed-forward convolution applied to the toolhead trajectory. The simplest shaper, **zero vibration (ZV)**, issues two impulses separated by half the oscillation period; the vibration started by the first is met in antiphase by the second, and the residual amplitude at exactly *f* is nulled. **Modified zero vibration (MZV)** and **extra-insensitive (EI)** shapers use more impulses, widening the band over which residual vibration stays small at the price of a longer impulse window. Klipper also provides multi-hump EI variants for still wider coverage. The invariant across all of them: **cancellation is exact only at the configured frequency**, and degrades as the true resonance drifts away from it.
 
 ## Wiring the sensor
 
-The **ADXL345** is a 3-axis digital accelerometer that speaks SPI (preferred for Klipper's high sample rate) and costs a few dollars on a breakout. You mount it rigidly to the toolhead — a printed bracket that clamps to the hotend or carriage — because it must feel exactly what the nozzle feels. Wire its SPI pins to your MCU (often a spare header on the main board, or a Raspberry Pi's SPI). Then declare it and a `resonance_tester` that knows where to run the test:
+The **ADXL345** is a three-axis digital accelerometer with selectable ranges up to ±16 g and an output data rate reaching 3200 Hz, exposed over Serial Peripheral Interface (SPI) or I²C. Klipper's `[adxl345]` section configures the sensor over SPI. The sensor must be **rigidly coupled to the toolhead** — a bracket clamped to the hotend or carriage — since a compliant mount adds its own resonance to the measurement and reports it as the machine's.
 
 ```ini
 [adxl345]
 cs_pin: rpi:None            # SPI chip-select (example: Pi host SPI)
-# spi_bus / pins depend on where you wired it
+# spi_bus / pins depend on where the sensor is wired
 
 [resonance_tester]
 accel_chip: adxl345
@@ -35,47 +41,47 @@ probe_points:
     117, 117, 20           # X, Y, Z near the center of the bed
 ```
 
-`probe_points` is where the toolhead sits while Klipper shakes it — pick a spot near the middle of the build area at a modest Z.
+`probe_points` fixes the position the toolhead occupies while being shaken. A point near the middle of the build area at modest Z is representative; the gantry's compliance is not uniform across the volume, so the measured frequency is a property of the machine *at that point*.
 
-## Verify the sensor before trusting it
+## Verifying the sensor before trusting it
 
-Two commands sanity-check the wiring first. Skipping these is how people spend an evening tuning against garbage data:
+Two commands establish that the data are physical rather than noise.
 
 ```
 ACCELEROMETER_QUERY        # reads current acceleration on all 3 axes
 ```
 
-At rest this should report roughly `9800 mm/s^2` (≈1 g) on the vertical axis and near zero on the others — that's gravity, and seeing it proves the sensor is alive and oriented sanely. Then measure the noise floor:
+At rest one axis should read approximately `9800 mm/s^2` (one standard gravity) and the others near zero. That signature confirms the device responds and that its orientation is understood. Then:
 
 ```
 MEASURE_AXES_NOISE         # baseline sensor noise per axis
 ```
 
-Low, stable numbers here mean a clean signal; wildly high noise usually means a loose sensor or bad wiring, and you fix that *now*, not after a confusing calibration.
+A high or unstable noise figure indicates a loose mount, marginal wiring or interference. **A calibration run on a noisy sensor still produces a confident-looking recommendation**, because the analysis has no way to distinguish a mounting resonance or an electrical artefact from a frame mode.
 
-## Excite each axis and let Klipper do the math
+## Excitation and analysis
 
-The measurement itself: Klipper vibrates the toolhead through a sweep of frequencies along one axis and records how hard the frame responds at each — a frequency-response curve whose peak is your resonance.
+`TEST_RESONANCES` drives the toolhead through a sweep of vibration frequencies along one axis while logging accelerometer samples, producing a frequency-response curve whose peaks are the machine's modes.
 
 ```
 TEST_RESONANCES AXIS=X     # sweeps X, writes /tmp/resonances_x_*.csv
 TEST_RESONANCES AXIS=Y     # sweeps Y
 ```
 
-You can plot those CSVs with Klipper's bundled `scripts/calibrate_shaper.py` to *see* the peaks, but the one-shot path is:
+The CSV files can be plotted with Klipper's bundled `scripts/calibrate_shaper.py` to inspect the peaks directly, which shows whether the response has one dominant mode or several. The single-command path performs sweep and analysis together:
 
 ```
 SHAPER_CALIBRATE           # runs both axes and picks shaper + frequency
 ```
 
-`SHAPER_CALIBRATE` sweeps X and Y, evaluates every shaper type against your measured curve, and prints a recommendation — something like:
+`SHAPER_CALIBRATE` evaluates each available shaper type against the measured curve and reports a choice per axis:
 
 ```
 Recommended shaper_type_x = mzv,   shaper_freq_x = 47.8 Hz
 Recommended shaper_type_y = ei,    shaper_freq_y = 41.2 Hz
 ```
 
-It also tells you the **max acceleration** at which each shaper still works, which is the number that actually lets you print faster without the ringing coming back. Run `SAVE_CONFIG` to write the result into `printer.cfg`:
+It also reports the **maximum acceleration** at which the selected shaper's smoothing remains acceptable. That figure, not the frequency, is the operational output: it bounds how aggressively the printer can be driven before the shaper's own smoothing becomes the limiting defect. `SAVE_CONFIG` writes the result into `printer.cfg`:
 
 ```ini
 [input_shaper]
@@ -85,8 +91,19 @@ shaper_type_y: ei
 shaper_freq_y: 41.2
 ```
 
-## Why the *type* matters, not just the frequency
+## Why the type matters as much as the frequency
 
-The shaper types trade off differently. `zv` is the mildest (fast, least smoothing, but less robust if your resonance drifts); `mzv` and `ei` are more robust to frequency error at the cost of a little extra smoothing on fine detail. `SHAPER_CALIBRATE` picks based on how much vibration each leaves versus how much it smooths features, but if you later see corners looking soft you can nudge toward a lower-smoothing type, and if ghosting creeps back after a belt change, just re-run the test — resonance shifts with belt tension, toolhead mass, and frame changes, so it's a re-measure, not a one-time set.
+The shaper types occupy different points on one trade-off. **ZV has the shortest impulse window and therefore the least smoothing, but the narrowest band of effective cancellation.** MZV and EI tolerate a larger error between the configured and actual frequency, and pay for it with a longer window — more smoothing of fine features and a lower permissible acceleration. `SHAPER_CALIBRATE` selects by weighing residual vibration against smoothing, so soft-looking corners after calibration point toward a lower-smoothing type, and returning ghosting points toward a stale frequency.
 
-**Try next:** print a "ringing tower" test model at your normal speed *before* calibrating and keep it. Then run `SHAPER_CALIBRATE`, `SAVE_CONFIG`, and print the identical tower again. Set the two side by side under a raking light — the echoes past each layer's protrusions should be visibly gone. That before/after is the most convincing five minutes in printer tuning, and it's driven entirely by a $5 sensor and a frequency you measured instead of guessed.
+The measured frequency is **not a permanent property of the machine**. Belt tension, toolhead mass and any change to frame stiffness move it, so a belt change or a hotend swap invalidates the calibration and calls for a repeated sweep.
+
+A controlled comparison isolates the effect: print a ringing-tower test model at the normal print speed before calibrating and retain it, then run `SHAPER_CALIBRATE`, `SAVE_CONFIG`, and print the identical tower again. Under raking light the echoes trailing each protrusion should be absent in the second specimen.
+
+## Pitfalls
+
+- **A compliant sensor mount reports its own resonance.** The calibration then configures the shaper to cancel a frequency the nozzle never experiences, and ringing survives untouched.
+- **Skipping `MEASURE_AXES_NOISE` yields a plausible but meaningless recommendation.** The analysis fits a shaper to whatever spectrum it receives, including electrical noise, and emits no warning that the input was garbage.
+- **Applying the recommended frequency without applying the recommended maximum acceleration** leaves the printer driven past the point where the shaper's smoothing window is valid, reintroducing artefacts at speed.
+- **A single dominant peak is an assumption, not a guarantee.** Where the response shows two comparable modes on one axis, a single-frequency shaper cancels one and leaves the other; the plotted CSV reveals this where the printed part does not.
+- **Calibrating at one `probe_points` location and printing across the whole bed** exposes the position dependence of gantry compliance, so the residual ringing can vary across the build area.
+- **Belt retensioning silently invalidates the stored `shaper_freq`.** The symptom is ghosting returning after routine maintenance, with no configuration change to blame.

@@ -1,8 +1,8 @@
 ---
-title: "Cancel one bad part, not the whole plate: Klipper's [exclude_object]"
+title: "Cancelling one part of a plate: Klipper's [exclude_object]"
 date: 2026-07-31
 track: cad-3dprint
-summary: "How Klipper's [exclude_object] lets you drop a single failed part from a multi-object plate mid-print — the G-code markers, the printer.cfg one-liner, the Moonraker angle, and the cancel command."
+summary: "How Klipper's [exclude_object] drops a single failed part from a multi-object plate mid-print — the G-code markers, the printer.cfg section, the Moonraker preprocessing path, and the cancel command."
 reading_time: 5
 tags: [klipper, 3d-printing, moonraker, mainsail, gcode, slicing]
 sources:
@@ -18,45 +18,56 @@ sources:
     url: "https://github.com/Klipper3d/klipper/blob/master/docs/Exclude_Object.md"
 ---
 
-You slice 20 phone-stand feet onto one plate for an overnight run. At 3 a.m. one of them pops off the bed, gets dragged around, and becomes a wandering blob. On a naive setup that blob is now colliding with the nozzle on every layer, threatening the other 19 good parts — and your only lever is to cancel the entire print. Klipper's `[exclude_object]` gives you a scalpel instead: drop that one part and let the rest finish.
+**Gist.** A plate of twenty parts is a single continuous G-code stream, so a firmware that only tracks moves has exactly one remedy when one part detaches and becomes a nozzle-dragged blob: cancel the file. Klipper's `[exclude_object]` module removes that all-or-nothing choice by consuming marker commands that name which moves belong to which object, and suppressing the moves of objects that have been excluded. The cost is that the markers must exist in the file — either the slicer emits them, or something parses and rewrites the file before printing.
 
-## The problem it solves
+## What the firmware lacks without the markers
 
-A multi-object plate is really one continuous G-code stream. The printer has no concept of "part 7" — it just executes moves and extrusions in order. So when one part fails, there's traditionally nothing to cancel *except* the whole file. `[exclude_object]` fixes this by teaching Klipper which moves belong to which named object, so it can skip the ones you've written off while continuing everything else.
+G-code carries geometry, not identity. A move to `X104.3 Y88.1 E0.0142` says nothing about which of the arranged objects it belongs to; the association exists only in the slicer, which discards it when it serialises the toolpath. Any mid-print "skip this one" therefore requires the slicer's knowledge to survive into the file. `[exclude_object]` defines the vocabulary that carries it.
 
-## How it works
+## The marker vocabulary
 
-The slicer wraps each object's toolpath in marker comments/commands, and Klipper acts on them:
+Two families of commands appear in a labelled file.
 
-- `EXCLUDE_OBJECT_DEFINE` — declared once near the top of the file, one per object. It carries a `NAME`, a `CENTER`, and a bounding `POLYGON`. The Klipper docs' own example:
+- `EXCLUDE_OBJECT_DEFINE` — emitted once per object, near the top of the file. It carries `NAME`, and optionally a `CENTER` and a bounding `POLYGON`. A definition line has the form:
+
   ```
   EXCLUDE_OBJECT_DEFINE NAME=calibration_pyramid CENTER=50,50 POLYGON=[[40,40],[50,60],[60,40]]
   ```
-- `EXCLUDE_OBJECT_START NAME=<name>` / `EXCLUDE_OBJECT_END` — wrap the block of moves for that object on each layer.
 
-When you exclude an object, Klipper watches for its `EXCLUDE_OBJECT_START` and suppresses the extrusion and printing moves until the matching `EXCLUDE_OBJECT_END`. Non-excluded objects keep printing normally. Because the exclusion is by name, it applies on every subsequent layer automatically — you cancel once, not per layer.
+  The definitions are what a front end lists and draws; `CENTER` and `POLYGON` give the interface a shape to render and click on.
 
-## Enabling it in printer.cfg
+- `EXCLUDE_OBJECT_START NAME=<name>` and `EXCLUDE_OBJECT_END` — a matched pair wrapping the block of moves belonging to that object, **repeated on every layer** the object occupies.
 
-The config section is literally just the header — no required parameters:
+**The name is the identity.** Exclusion is recorded against the name, not against a file offset or a layer index, which is why a single `EXCLUDE_OBJECT` call holds for the remainder of the print: every later `EXCLUDE_OBJECT_START` bearing that name enters the suppressed state again. The name given to `EXCLUDE_OBJECT` has to be the one carried by the `EXCLUDE_OBJECT_DEFINE` lines.
+
+## The suppression state machine
+
+Klipper's behaviour reduces to a small state machine over the stream. The module maintains a **set of excluded names**. On `EXCLUDE_OBJECT_START NAME=n`, if `n` is in that set, the module enters a suppressing state; extrusion and printing moves are not executed until the matching `EXCLUDE_OBJECT_END`. If `n` is not in the set, the block executes normally. Moves outside any `START`/`END` pair — the start G-code, layer changes, the end G-code — are never suppressed, because they are not attributed to any object.
+
+The consequence worth stating plainly: **exclusion takes effect from the next `EXCLUDE_OBJECT_START` for that name onward.** Material already deposited on the current layer stays where it is, and a part excluded halfway through its own block finishes that block. The blob is not removed; only further growth of it stops.
+
+## Enabling the module
+
+The configuration section takes no required parameters:
 
 ```ini
 # printer.cfg
 [exclude_object]
 ```
 
-Restart Klipper (`RESTART` / `FIRMWARE_RESTART`) and the `EXCLUDE_OBJECT*` commands become available. That's the entire firmware side.
+After a `RESTART` or `FIRMWARE_RESTART`, the `EXCLUDE_OBJECT*` commands are registered. That is the whole firmware-side change; nothing about kinematics, extrusion or the object list is configured here.
 
-## Getting the markers into your G-code
+## Getting markers into the file
 
-Klipper only reacts to markers that are actually in the file, so something has to put them there. Two paths:
+Klipper reacts only to markers present in the stream, so one of two producers has to supply them.
 
-**1. Native slicer support (preferred).** Turn on "Label objects" so the slicer emits the markers directly:
-- **PrusaSlicer** (2.7.0+): Print Settings → Output options → enable **Label objects**.
-- **OrcaSlicer / Bambu Studio**: in the process/print settings, enable **Label objects** (Others section). OrcaSlicer emits Klipper-style markers when the printer is flagged as Klipper.
-- **Cura**: labeling is available via the object-processing behavior and works out of the box for this feature.
+**Slicer labelling.** Enabling the slicer's object-labelling option makes it emit the markers directly:
 
-**2. Moonraker preprocessing.** If your slicer (IdeaMaker, older SuperSlicer, etc.) doesn't label natively, let Moonraker inject the markers on upload:
+- **PrusaSlicer**: Print Settings → Output options → **Label objects**.
+- **OrcaSlicer / Bambu Studio**: **Label objects** in the process/print settings. OrcaSlicer emits Klipper-style markers when the printer profile is set to the Klipper G-code flavour.
+- **Cura**: no equivalent native option is documented by the sources cited here; files sliced with Cura generally reach Klipper through one of the rewriting paths below.
+
+**Moonraker preprocessing.** For slicers that do not emit the markers natively, Moonraker can inject them when the file is uploaded:
 
 ```ini
 # moonraker.conf
@@ -64,33 +75,39 @@ Klipper only reacts to markers that are actually in the file, so something has t
 enable_object_processing: True
 ```
 
-This is optional and only needed when the slicer can't do it. Note it parses each file on upload, which can be slow on low-power boards.
+This path **parses every uploaded file**, so upload latency scales with file size and with the host's CPU. On low-power single-board hosts that cost is noticeable, and it is paid again on every re-upload of the same file.
 
-**The preprocess_cancellation angle.** On something like a Pi Zero, on-the-fly parsing hurts. `preprocess_cancellation` (kageurufu) is a standalone tool that rewrites the G-code *once* — at slice time via a post-processing script, or ahead of upload — so no runtime parsing is needed. Same result, work done up front. It's the reference implementation the feature grew out of.
+**Ahead-of-time rewriting.** `preprocess_cancellation` (kageurufu) is a standalone tool that performs the same rewrite once — as a slicer post-processing script, or before upload — so no parsing happens on the printer host. It emits the same marker vocabulary; Moonraker's own object-processing path is built on it.
 
-## Cancelling a part mid-print
+## Excluding a part mid-print
 
-Two equivalent ways:
+**From a front end.** Mainsail and Fluidd render the object map for the running print from the `EXCLUDE_OBJECT_DEFINE` polygons. Each object is selectable, and the exclude control marks it. This is a wrapper over the same command.
 
-**From the UI.** In Mainsail or Fluidd, open the G-code viewer / object map for the running print. Each labeled object is selectable; click the exclude (X / cross) icon next to the failed part. The printer skips it from the next layer onward.
-
-**From the console / a macro.** The command is:
+**From the console or a macro.**
 
 ```
 EXCLUDE_OBJECT NAME=phone_foot_7
 ```
 
-Use the exact name from the `EXCLUDE_OBJECT_DEFINE` lines (check the file header or the UI object list — names are case-sensitive). Related forms from the G-code reference let you list current exclusions, exclude the object currently printing with `CURRENT=1`, or clear the excluded set with `RESET=1`. The plain `NAME=` form is all you need for the knocked-loose-part case.
+The G-code reference documents further forms: listing the current exclusions, excluding the object currently printing with `CURRENT=1`, and clearing the excluded set with `RESET=1`. The plain `NAME=` form covers the detached-part case.
 
-## Quick sanity check
+## Verification procedure
 
-Before trusting it on a big overnight plate:
+Confirming the chain before an unattended multi-part run costs one short print:
 
-1. `[exclude_object]` in printer.cfg, restart.
-2. Slice a 2-part test plate with Label objects on.
-3. Upload, confirm the two parts appear in Mainsail's object map, start the print.
-4. Exclude one part a few layers in — the nozzle should stop laying plastic there while the other part completes.
+1. Add `[exclude_object]` to printer.cfg and restart.
+2. Slice a two-part plate with object labelling enabled.
+3. Upload, and confirm both objects appear in the front end's object map.
+4. Start the print, exclude one object a few layers in, and observe that extrusion continues on the other alone.
 
-If the object list is empty, the markers aren't in the file: your slicer isn't labeling and Moonraker's `enable_object_processing` isn't on.
+An empty object map is the diagnostic signal: the file carries no `EXCLUDE_OBJECT_DEFINE` lines, meaning the slicer did not label and `enable_object_processing` is not enabled.
 
-**Try next:** Slice two small cubes side by side with Label objects enabled, start the print, and run `EXCLUDE_OBJECT NAME=<one-cube-name>` from the Mainsail console after layer 5 — watch one cube stop growing while the other finishes.
+## Pitfalls
+
+- **The object map is empty and `EXCLUDE_OBJECT` reports an unknown name.** The uploaded file has no markers: object labelling is off in the slicer and Moonraker preprocessing is disabled. The firmware side is fine and restarting Klipper changes nothing.
+- **`EXCLUDE_OBJECT NAME=...` is rejected for an object visible in the UI.** The name has to match the one in the `EXCLUDE_OBJECT_DEFINE` line; a front end may render a shortened or prettified label, so a name transcribed by eye from the object map is a common mismatch.
+- **The excluded part keeps growing for the rest of the current layer.** Suppression begins at the next `EXCLUDE_OBJECT_START` for that name, so a block already in progress runs to its `EXCLUDE_OBJECT_END`.
+- **Excluding a part does not remove the debris.** The detached part and any blob remain on the bed and can still be struck by the nozzle or by moves belonging to other objects.
+- **Uploads become slow after enabling `enable_object_processing`.** Every file is parsed on upload; on a low-power host, moving the rewrite to `preprocess_cancellation` at slice time removes that per-upload cost.
+- **A file sliced before labelling was enabled stays unlabelled.** Re-slicing is required; toggling the setting does not retroactively affect G-code already produced or already uploaded.
+- **`RESET=1` clears the whole excluded set.** Objects excluded earlier in the print resume printing on their next block, which is rarely the intent when only one entry needed correcting.

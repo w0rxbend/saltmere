@@ -74,10 +74,9 @@ code — `git rebase --just-in-case` is a command, not filler — and it also
 inspects the front matter's `title` and `summary`, which are rendered on cards
 and article headers.
 
-It is deliberately **not** wired into CI yet: the corpus is being converted
-track by track, and the checker would currently fail the build on every article
-that has not been converted. Wire it in once `tools/style_progress.py` reports
-100%.
+It runs in CI on every push. That became possible once the whole corpus was
+converted — `tools/style_progress.py` now reports 100%, so a new article that
+drifts from the house style fails the build instead of landing quietly.
 
 ## Local preview
 
