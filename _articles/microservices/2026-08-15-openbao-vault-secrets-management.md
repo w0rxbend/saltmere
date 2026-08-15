@@ -54,7 +54,7 @@ bao read database/creds/orders-svc
 
 Two invariants are worth naming. First, `bao write -f database/rotate-root/appdb` rotates the privileged account's password after configuration, so **the value written in the command above stops being valid and is known to no human**. Second, containment of a leaked dynamic credential has two independent paths: the credential expires on its own at `default_ttl`, bounded above by `max_ttl`; and `bao lease revoke -prefix database/creds/orders-svc` terminates every outstanding lease under that prefix immediately.
 
-The {%- raw -%} `VALID UNTIL '{{expiration}}'` {%- endraw -%} clause matters because it makes the database itself enforce the deadline. Without it, expiry depends entirely on OpenBao successfully running the revocation statement; with it, **the database refuses the login after the timestamp even if revocation never runs**.
+The {% raw %} `VALID UNTIL '{{expiration}}'` {% endraw %} clause matters because it makes the database itself enforce the deadline. Without it, expiry depends entirely on OpenBao successfully running the revocation statement; with it, **the database refuses the login after the timestamp even if revocation never runs**.
 
 ## Key-value v2 and transit
 
@@ -125,7 +125,7 @@ The load-bearing property is that **renewal failure is not an error path but the
 ## Pitfalls
 
 - **Leaving the configured root database password in place.** Without `database/rotate-root`, the privileged account's password remains in shell history, configuration management, and the operator's memory, and it can create arbitrary roles.
-- **Omitting {%- raw -%} `VALID UNTIL '{{expiration}}'` {%- endraw -%} in `creation_statements`.** If OpenBao cannot reach the database at revocation time, the role persists with a password that has already left the lease's protection window.
+- **Omitting {% raw %} `VALID UNTIL '{{expiration}}'` {% endraw %} in `creation_statements`.** If OpenBao cannot reach the database at revocation time, the role persists with a password that has already left the lease's protection window.
 - **`max_ttl` reached while the pod is still running.** Renewal stops succeeding and the application must re-read `database/creds/...`; code that only renews and never re-issues loses its database at a predictable, and therefore synchronised, moment across replicas.
 - **Connection pools pinned to an expired credential.** The pool holds open sockets authenticated with a dropped role; existing connections keep working until one is recycled, at which point reconnection fails with an authentication error rather than a lease error, which misdirects diagnosis.
 - **Role churn in the database's catalogue.** Every issuance creates a role; short TTLs with many replicas produce a large number of short-lived roles, and failed revocations accumulate rather than disappear.

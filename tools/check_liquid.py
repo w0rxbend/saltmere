@@ -55,15 +55,34 @@ def line_of(text, pos):
     return text.count("\n", 0, pos) + 1
 
 
+HYPHEN_RAW = re.compile(r"\{%-\s*(?:end)?raw\s*-%\}")
+RAW_OPEN = re.compile(r"\{%\s*raw\s*%\}")
+RAW_CLOSE = re.compile(r"\{%\s*endraw\s*%\}")
+
+
 def check(path):
     text = open(path, encoding="utf-8").read()
     body = FRONT_MATTER.sub("", text)
 
+    problems = []
+
+    # Liquid 4.0.4 (what GitHub Pages runs) parses `raw` with a tokenizer that
+    # matches only `{% raw %}` / `{% endraw %}`. The whitespace-control form
+    # `{%- endraw -%}` is never recognised as closing the block, so the build
+    # dies with "'raw' tag was never closed" — and the tags still look balanced
+    # to a naive count, which is why this is checked explicitly.
+    for m in HYPHEN_RAW.finditer(body):
+        problems.append((line_of(body, m.start()),
+                         f"{m.group(0)} — use the plain form; Liquid 4.0.4 does not "
+                         "accept whitespace-control hyphens on raw/endraw"))
+
+    opens, closes = len(RAW_OPEN.findall(body)), len(RAW_CLOSE.findall(body))
+    if opens != closes:
+        problems.append((0, f"unbalanced raw tags: {opens} raw, {closes} endraw"))
+
     # Blank out {% raw %} regions but keep the byte offsets so reported line
     # numbers still match the real file.
     masked = RAW_BLOCK.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), body)
-
-    problems = []
 
     for m in OUTPUT_TAG.finditer(masked):
         inner = m.group(0)[2:-2].strip()

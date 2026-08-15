@@ -39,7 +39,7 @@ gcode:
 
 Klipper renders each `gcode:` block as a Jinja2 template *before* running any of it. Two constructs carry the work:
 
-- **`{ ... }`** — evaluate an expression and substitute its string form. Klipper uses **single braces, not Jinja2's usual double braces**; the documentation gives no rationale for the choice, and the single form is the only one the expression delimiter accepts. Writing {%- raw -%}`{{ x }}`{%- endraw -%} does not produce the expected substitution: the outer brace opens the expression and the remainder is parsed as the expression text, which normally fails as a template syntax error.
+- **`{ ... }`** — evaluate an expression and substitute its string form. Klipper uses **single braces, not Jinja2's usual double braces**; the documentation gives no rationale for the choice, and the single form is the only one the expression delimiter accepts. Writing {% raw %}`{{ x }}`{% endraw %} does not produce the expected substitution: the outer brace opens the expression and the remainder is parsed as the expression text, which normally fails as a template syntax error.
 - **{% raw %}`{% ... %}`{% endraw %}** — a statement: `set`, `if`, `for`.
 
 {% raw %}

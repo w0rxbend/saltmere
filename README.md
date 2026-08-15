@@ -132,6 +132,11 @@ code block:
     ```
     {% endraw %}
 
+Use the plain `{% raw %}` / `{% endraw %}` form. GitHub Pages runs Liquid
+4.0.4, whose `raw` parser does not accept whitespace-control hyphens, so
+`{%- endraw -%}` never closes the block and the build fails with "'raw' tag was
+never closed" — while still looking balanced to anyone counting tags.
+
 `python3 tools/check_liquid.py` flags any article that needs this; CI runs it
 before the Jekyll build so a mistake names the file and line rather than
 producing a Ruby stack trace. Deliberate Liquid in prose, such as a

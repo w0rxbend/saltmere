@@ -76,6 +76,23 @@ worth more than a longer confident one.
     A short list of the specific traps, each one sentence of symptom plus one of
     cause.
 
+## Escaping other tools' templates
+
+Jekyll renders every article through Liquid before Markdown, so any literal
+`{{ ... }}` or `{% ... %}` belonging to another tool — GitHub Actions,
+Prometheus, Vault, Helm, Jinja, Klipper — must be wrapped:
+
+    {% raw %}
+    ```yaml
+    token: ${{ secrets.EXAMPLE }}
+    ```
+    {% endraw %}
+
+**Use the plain form.** GitHub Pages runs Liquid 4.0.4, whose `raw` parser
+matches only `{% raw %}` and `{% endraw %}`. The whitespace-control variant
+`{%- endraw -%}` is never recognised as closing the block, and the build fails
+with "'raw' tag was never closed" even though the tags look balanced.
+
 ## Code
 
 Code exists to make a mechanism legible, not to be copied into production.
