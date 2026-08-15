@@ -1,8 +1,8 @@
 ---
-title: "Landlock: sandbox a process's filesystem access without root"
+title: "Landlock: sandboxing a process's filesystem access without root"
 date: 2026-07-30
 track: linux-tools
-summary: "Landlock lets an ordinary, unprivileged program lock itself down — 'I will only ever read /etc and write /tmp' — enforced by the kernel and inherited by every child. Here's the three-syscall model, the no_new_privs requirement, the ABI-versioning dance, and a C program that sandboxes itself before doing risky work."
+summary: "Landlock allows an ordinary, unprivileged program to restrict itself — read only /etc, write only /tmp — with the restriction enforced by the kernel and inherited by every child. This article covers the three-syscall model, the no_new_privs requirement, the ABI-versioning check, and a C program that sandboxes itself before performing risky work."
 reading_time: 6
 tags: [landlock, lsm, sandboxing, security, seccomp, syscalls]
 sources:
@@ -16,29 +16,31 @@ sources:
     url: "https://docs.kernel.org/security/landlock.html"
 ---
 
-Traditional Linux sandboxing assumes you have power to give away: root sets up a chroot, a namespace, or an AppArmor profile *for* a less-trusted process. **Landlock** inverts that. It's a Linux Security Module that lets an **unprivileged** process restrict *itself* — declare "from this point on I may only read these directories and write those" — and the kernel enforces it, irreversibly, for the process and everything it forks. No root, no config files, no daemon. It's the same "self-imposed jail" idea as seccomp (which filters *syscalls*), but for *filesystem and network access*. Landlock landed in kernel **5.13** and has grown an access right per release since.
+**Gist.** Conventional Linux sandboxing requires privilege to give away: a root-owned supervisor builds a chroot, a mount namespace, or an AppArmor profile *for* a less-trusted process. Landlock, a Linux Security Module (LSM) merged in kernel **5.13**, inverts the direction — an **unprivileged** process declares which filesystem (and, from a later ABI, network) accesses it will permit itself, and the kernel enforces that declaration on the calling thread and every descendant. The cost is irreversibility and a version-negotiation burden: a ruleset cannot be relaxed once applied, and the set of enforceable access rights depends on the running kernel's Landlock **application binary interface (ABI)** version, which the program must query rather than assume.
 
 ## The model: handle, allow, enforce
 
-A Landlock ruleset works by *subtraction from a set you name*. You don't list everything the process can do; you name the categories of access you want the kernel to **handle** (start restricting), then add back **rules** granting specific paths, and anything handled-but-not-granted is denied.
+A Landlock ruleset operates by *subtraction from a named set*. The program does not enumerate everything it may do. It names the categories of access the kernel should **handle** — begin mediating — then adds **rules** granting specific paths within those categories. **Any access that is handled but not granted is denied; any access category never handled is untouched by Landlock and remains governed by the ordinary permission checks, discretionary access control (DAC) among them.** This is the single most load-bearing property of the model: forgetting a right in `handled_access_fs` does not fail closed, it leaves that right entirely unrestricted.
 
 Three syscalls, in order:
 
-1. **`landlock_create_ruleset()`** — declare the `handled_access_fs` bitmask (e.g. "I want to control read, write, and execute on files"). Returns a ruleset file descriptor.
-2. **`landlock_add_rule()`** — for each path you *do* want to allow, add a rule: this directory FD, these permitted accesses. Call it once per allowed path.
-3. **`landlock_restrict_self()`** — enforce the ruleset on the calling thread. **Irreversible.** From here on, every handled access outside your granted paths gets `EACCES`, and every child inherits the restriction.
+1. **`landlock_create_ruleset()`** — declares the `handled_access_fs` bitmask (for example, read, write and execute on files). Returns a ruleset file descriptor.
+2. **`landlock_add_rule()`** — for each path to be allowed, supplies a rule of the form *this directory file descriptor, these permitted accesses*. Called once per allowed path. The path-beneath rule type grants the listed accesses to the directory and everything under it.
+3. **`landlock_restrict_self()`** — enforces the ruleset on the calling thread. **Irreversible.** From this point, every handled access outside the granted paths returns `EACCES`, and the restriction is inherited across `fork()` and `execve()`.
 
-Before step 3, an unprivileged process must set **`no_new_privs`** (`prctl(PR_SET_NO_NEW_PRIVS, 1, …)`). This is the same flag seccomp requires: it guarantees the process can't regain privileges via a setuid binary, which is what makes it *safe* for the kernel to let an unprivileged task sandbox itself. Without `CAP_SYS_ADMIN`, `restrict_self` fails unless `no_new_privs` is set.
+Before step 3, an unprivileged process must set **`no_new_privs`** via `prctl(PR_SET_NO_NEW_PRIVS, 1, …)`. This is the flag seccomp also requires; it guarantees the process cannot gain privileges through a set-user-ID binary. Without `CAP_SYS_ADMIN`, **`landlock_restrict_self()` fails unless `no_new_privs` is already set** — the ordering is part of the interface, not a convention.
 
-## ABI versioning: check, don't assume
+Rulesets compose by intersection rather than replacement. **Calling `landlock_restrict_self()` a second time layers a further ruleset on top of the existing one; the effective policy is the conjunction, so each layer can only narrow access.** A child process therefore cannot widen what its parent granted, which is what makes the restriction safe to inherit.
 
-Landlock's capabilities grow by an **ABI version** you must query at runtime, because your binary might run on an older kernel that lacks the access rights you named. Ask the kernel its supported ABI and mask off anything it doesn't know:
+## ABI versioning: query, do not assume
+
+Landlock's enforceable rights grow per kernel release, so a binary compiled against a recent `linux/landlock.h` may run on a kernel that does not recognise the rights it names. The supported ABI version is obtained from the same creation syscall with a dedicated flag:
 
 ```c
 int abi = landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
 ```
 
-The progression (right → first kernel that shipped it), so you can gate features on `abi`:
+The progression of rights against the first kernel that shipped each:
 
 | ABI | Kernel | Added |
 |-----|--------|-------|
@@ -49,11 +51,13 @@ The progression (right → first kernel that shipped it), so you can gate featur
 | 5 | 6.10 | `LANDLOCK_ACCESS_FS_IOCTL_DEV` (ioctls on device files) |
 | 6 | 6.12 | Scoping: abstract UNIX sockets and signals |
 
-If you *require* a right the running kernel is too old to enforce, you decide the policy: fail closed (refuse to run unsandboxed) or degrade (enforce what you can, log the gap). What you must never do is silently assume the sandbox is in force when the kernel quietly ignored a right it didn't recognize.
+The required discipline is to **mask `handled_access_fs` down to the rights the queried ABI supports**, and then to make an explicit policy decision about the gap: fail closed and refuse to run, or degrade and record which rights are unenforced. The failure to avoid is silent: a program that names a right the kernel does not know, does not check the ABI, and proceeds believing the sandbox covers accesses that are in fact unmediated.
+
+`LANDLOCK_ACCESS_FS_REFER` (ABI 2) deserves separate attention because it changes the default. Under ABI 1 there is no way to express a link or rename across directory boundaries, and such operations are refused whenever the ruleset is in force. Under ABI 2 and later, **`REFER` must be in the handled set and granted on both the source and destination hierarchies for a cross-directory rename or hard link to succeed** — granting it on one side only still yields `EXDEV`.
 
 ## A self-sandboxing program
 
-Here's a process that restricts itself to reading `/usr` and `/etc` and writing only `/tmp`, then proves it. The `handled_access_fs` here uses the ABI-1 core rights so it runs on any 5.13+ kernel:
+The following process restricts itself to reading `/usr` and `/etc` and writing under `/tmp`, then demonstrates the effect. The handled set uses ABI-1 core rights, so it is enforceable on any kernel from 5.13 onward.
 
 ```c
 #define _GNU_SOURCE
@@ -66,7 +70,7 @@ Here's a process that restricts itself to reading `/usr` and `/etc` and writing 
 
 static int add_dir(int rs, const char *path, __u64 allowed) {
     struct landlock_path_beneath_attr pb = { .allowed_access = allowed };
-    pb.parent_fd = open(path, O_PATH | O_CLOEXEC);
+    pb.parent_fd = open(path, O_PATH | O_CLOEXEC);   /* O_PATH: no read permission needed */
     if (pb.parent_fd < 0) return -1;
     int r = syscall(SYS_landlock_add_rule, rs,
                     LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
@@ -75,6 +79,10 @@ static int add_dir(int rs, const char *path, __u64 allowed) {
 }
 
 int main(void) {
+    int abi = syscall(SYS_landlock_create_ruleset, NULL, 0,
+                      LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi < 1) return 1;                            /* Landlock absent or disabled */
+
     struct landlock_ruleset_attr ra = {
         .handled_access_fs =
             LANDLOCK_ACCESS_FS_READ_FILE  | LANDLOCK_ACCESS_FS_READ_DIR |
@@ -83,28 +91,37 @@ int main(void) {
     };
     int rs = syscall(SYS_landlock_create_ruleset, &ra, sizeof(ra), 0);
 
-    // Grant: read /usr and /etc, read+write+create under /tmp.
+    /* Grant: read /usr and /etc, read+write+create under /tmp. */
     add_dir(rs, "/usr", LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
                         LANDLOCK_ACCESS_FS_EXECUTE);
     add_dir(rs, "/etc", LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR);
     add_dir(rs, "/tmp", LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
                         LANDLOCK_ACCESS_FS_READ_DIR  | LANDLOCK_ACCESS_FS_MAKE_REG);
 
-    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);          // required for unprivileged use
-    syscall(SYS_landlock_restrict_self, rs, 0);       // irreversible from here
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);           /* required for unprivileged use */
+    syscall(SYS_landlock_restrict_self, rs, 0);       /* irreversible from here */
     close(rs);
 
-    // Proof: writing to /tmp works; touching $HOME does not.
     printf("/tmp/ok     : %s\n", fopen("/tmp/landlock_ok", "w") ? "allowed" : "DENIED");
-    printf("$HOME/secret: %s\n", fopen("/root/secret", "w")     ? "allowed" : "DENIED");
+    printf("/root/secret: %s\n", fopen("/root/secret", "w")     ? "allowed" : "DENIED");
     return 0;
 }
 ```
 
-Compile with a recent `linux/landlock.h` (`gcc sandbox.c -o sandbox`) and run it as a normal user. The write under `/tmp` succeeds; the write to your home directory fails with `EACCES` — even though the process's UID has every right to that file. The kernel is enforcing a restriction the process *asked for on itself*.
+Built with a `linux/landlock.h` that defines the referenced constants (`gcc sandbox.c -o sandbox`) and run as an ordinary user, the write under `/tmp` succeeds and the write outside the granted hierarchies fails with `EACCES` — even where the process's user ID would otherwise permit it. Closing the ruleset descriptor after `landlock_restrict_self()` does not lift the restriction; **the descriptor is a handle used to build and apply the policy, not the policy's lifetime.**
 
 ## Where it fits
 
-Landlock is the right tool when an application wants to shrink its own blast radius before parsing untrusted input, running a plugin, or shelling out — a media transcoder that should only touch its input and output dirs, a build step that shouldn't reach the network, a language runtime sandboxing user scripts. Pair it with **seccomp** (restrict syscalls) and **namespaces** (restrict what's even visible) and you have defence in depth that needs no privileged setup. Its limits: it's path/access-oriented, not a full MAC policy language like SELinux, and older kernels enforce fewer rights — hence the ABI check. But for "this process should only ever touch these files," nothing else is this easy to adopt from inside your own code.
+Landlock applies when an application narrows its own reachable surface before parsing untrusted input, loading a plugin, or invoking a subprocess: a transcoder confined to its input and output directories, a build step barred from TCP `bind()` and `connect()` under ABI 4, a runtime executing user-supplied scripts. It composes with **seccomp**, which mediates syscalls rather than paths, and with **namespaces**, which change what is visible rather than what is permitted; none of the three requires privileged setup for the unprivileged case.
 
-**Try next:** Add `LANDLOCK_ACCESS_FS_TRUNCATE` to the handled set (gate it on `abi >= 3`), grant it on `/tmp` only, then try to `truncate()` a file under `/etc` and watch it fail while `/tmp` truncation succeeds — a concrete feel for how each ABI level widens what you can lock down, and why runtime version-checking isn't optional.
+Its limits follow from its shape. Landlock expresses path- and access-oriented rules, not the full mandatory access control (MAC) policy language of SELinux; and older kernels enforce a smaller right set, which is why the ABI query is a correctness requirement rather than a nicety.
+
+## Pitfalls
+
+- **A right omitted from `handled_access_fs` is not restricted at all.** Handling read and write but not `EXECUTE` leaves the sandboxed process free to execute binaries anywhere the DAC permits — the ruleset denies nothing it was never told to mediate.
+- **Naming a right the running kernel does not support without checking the ABI leaves that access unmediated.** The program believes it is sandboxed while the kernel is enforcing only the subset it recognises; the symptom is an access that succeeds in production on an older kernel and is denied on the developer's newer one.
+- **`landlock_restrict_self()` fails for an unprivileged caller when `no_new_privs` was not set first.** The syscall returns an error and, if the return value is ignored, the process continues completely unsandboxed.
+- **`landlock_restrict_self()` cannot be undone or loosened.** A later ruleset intersects with the current one, so a program that sandboxes itself too early cannot re-open a path it discovers it needs; the symptom is `EACCES` on a configuration file read after initialisation.
+- **Cross-directory rename and hard link require `LANDLOCK_ACCESS_FS_REFER` on both hierarchies.** Granting it on the source only produces `EXDEV` from `rename()`, which callers frequently misread as a filesystem-boundary error and respond to with a copy-and-delete fallback that then fails on the delete.
+- **Rules are added by directory file descriptor, so a path that cannot be opened yields no rule.** If `open(path, O_PATH)` fails because the directory does not exist yet, the grant is silently missing and every later access to that hierarchy is denied.
+- **The restriction is inherited across `execve()`.** A helper binary spawned after enforcement runs under the parent's ruleset, so a subprocess that needs paths the parent never granted fails with `EACCES` and no diagnostic pointing at Landlock.

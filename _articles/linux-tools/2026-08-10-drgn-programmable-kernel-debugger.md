@@ -1,8 +1,8 @@
 ---
-title: "drgn: The Programmable Kernel Debugger You Script in Python"
+title: "drgn: A Programmable Kernel Debugger Scripted in Python"
 date: 2026-08-10
 track: linux-tools
-summary: "drgn is a debugger-as-a-library from Meta that reads live kernel data structures through /proc/kcore and lets you walk them in plain Python. A hands-on tour: install it, attach to the running kernel, list processes off init_task, and use the drgn.helpers.linux helpers."
+summary: "drgn is a debugger-as-a-library from Meta that reads live kernel data structures through /proc/kcore and exposes them as ordinary Python objects. A tour of installation, attaching to the running kernel, listing processes from init_task, and the drgn.helpers.linux helper modules."
 reading_time: 6
 tags:
   - linux
@@ -23,61 +23,75 @@ sources:
     url: "https://lwn.net/Articles/952942/"
 ---
 
-The fastest way to understand a running system is to poke at its actual state, not to read about what its state is supposed to be. That is the pitch for **drgn** (pronounced "dragon"), a debugger written by Omar Sandoval and the Linux kernel team at Meta. It is unusual in a useful way: instead of giving you a command prompt with a fixed vocabulary, it gives you a Python library. Kernel types, variables, and structs show up as ordinary Python objects, and you debug by writing code against them.
+**Gist.** Inspecting the state of a running kernel normally means a debugger with a fixed command vocabulary, which stops at whatever queries its authors anticipated. **drgn** (pronounced "dragon"), created by Omar Sandoval at Meta, replaces the command vocabulary with a Python library: kernel types, variables and structures are wrapped as ordinary Python objects, and analysis is written as Python code against them. The cost is that drgn needs matching DWARF debugging information for the exact kernel under inspection, and that every field access is a memory read rather than a lookup in a cached snapshot.
 
-This article is a practical tour. We will install drgn, attach it to the live kernel, walk the task list off `init_task`, inspect struct fields, and use the batteries-included helpers in `drgn.helpers.linux`.
+## What drgn is
 
-## What drgn actually is
+drgn is simultaneously a Python library (`import drgn`) and a command-line program (`drgn`) that opens a read-eval-print loop with a debugger already attached. It reads target memory and DWARF debugging information. For a live kernel, memory is read through **`/proc/kcore`**; the same code attaches to a userspace process or opens a kernel or userspace core dump. Debug information must be supplied: a `vmlinux` carrying DWARF, a distribution `kernel-debuginfo` package, or `debuginfod`.
 
-drgn is two things at once: a Python library (`import drgn`) and a CLI (`drgn`) that drops you into a REPL with a debugger pre-attached. Under the hood it reads memory and DWARF debugging information. For a live kernel it reads memory through `/proc/kcore`; it can equally attach to a userspace process or open a kernel/userspace core dump. It needs debug info for the kernel you are inspecting — typically a `vmlinux` with DWARF, a distro `kernel-debuginfo` package, or `debuginfod`.
+Sandoval's description in the LWN write-up is "debugger as a library": the types, variables and similar entities are wrapped so that arbitrary operations can be performed on them. The interface is not a debugger macro language; it is Python that happens to reference kernel memory.
 
-The key design idea, in Sandoval's words from his LWN write-up, is a "debugger as a library": drgn "magically wraps the types, variables, and such so that you can do anything you want with them." You are not scripting a debugger's macro language. You are writing Python that happens to reference kernel memory.
+## Position relative to crash, gdb and eBPF
 
-## How it differs from crash and gdb
+- **crash** is purpose-built and fast for common tasks but exposes a fixed set of commands. A query its authors did not anticipate — cross-referencing two subsystems, computing an aggregate, filtering a list by a custom predicate — has no expression. In drgn the analysis is arbitrary Python, so such queries are the normal case rather than the exception.
+- **gdb** is organised around breakpoints and stepping, which does not apply to a production machine that cannot be stopped. Its Python scripting largely wraps existing gdb commands; drgn inverts the relationship, making scripting the primary interface.
+- **eBPF (extended Berkeley Packet Filter) and bpftrace** trace a live system but cannot analyse a historical crash dump. drgn presents the same application programming interface over a live kernel and over a dump.
 
-If you have used the **crash** utility or **gdb** on a kernel, drgn occupies a deliberately different niche:
+## References and values
 
-- **crash** is purpose-built and fast for common tasks, but it exposes a fixed set of commands. As soon as you want to do something its authors did not anticipate — cross-reference two subsystems, compute an aggregate, filter a list by a custom predicate — you hit a wall. drgn's answer is "it's just Python," so arbitrary analysis is the normal case.
-- **gdb** is oriented around breakpoints and stepping, which is a poor fit for a production box you cannot stop. Its Python scripting largely wraps existing gdb commands. drgn inverts that: scripting is the primary interface.
-- **eBPF/bpftrace** are excellent for live tracing but cannot analyze a historical crash dump. drgn works against both a live kernel and a dump with the same API.
+A drgn object is either a **reference** — its bytes are re-read from target memory on each access — or a **value**, a static snapshot taken once. **Nothing is copied until it is requested**, which is what makes it practical to hold a handle on a large interconnected structure and materialise only the fields touched. The distinction is observable on a quantity that changes:
 
-Another distinguishing property is **lazy reading**. A drgn object can be a *reference* (re-read from memory on each access) or a *value* (a static snapshot). Nothing is copied until you ask for it, which is what makes it practical to "hold" enormous interconnected structures and only materialize the fields you touch.
+```
+>>> jiffies = prog["jiffies"]
+>>> jiffies.value_()
+4391639989
+>>> import time; time.sleep(1)
+>>> jiffies.value_()          # re-read from memory: it moved
+4391640290
+>>> snap = jiffies.read_()    # freeze a value snapshot
+>>> snap.value_()
+4391640291
+>>> time.sleep(1); snap.value_()
+4391640291                    # unchanged: values are static
+```
 
-## Install
+The consequence for analysis is that **a loop over references observes a kernel that is mutating underneath it**. Two reads of the same field in the same iteration may disagree. `read_()` is the operation that pins a value against that drift.
 
-Via pip (the package ships prebuilt wheels for common platforms):
+## Installation
+
+The published package ships prebuilt wheels for common platforms:
 
 ```
 $ sudo pip3 install drgn
 ```
 
-Or use a distribution package — drgn is packaged for Fedora, RHEL/CentOS, Debian/Ubuntu, Arch, Gentoo, Oracle Linux, and openSUSE, e.g.:
+drgn is also packaged for Fedora, RHEL/CentOS, Debian/Ubuntu, Arch, Gentoo, Oracle Linux and openSUSE:
 
 ```
-$ sudo dnf install drgn      # Fedora / RHEL
-$ sudo apt install python3-drgn   # Debian / Ubuntu
+$ sudo dnf install drgn            # Fedora / RHEL
+$ sudo apt install python3-drgn    # Debian / Ubuntu
 ```
 
-## Attach to the live kernel
+## Attaching to a target
 
-Running the CLI with no arguments and root privileges attaches to the running kernel and hands you a `Program` object already bound to the name `prog`:
+Invoked with no arguments and root privileges, the command-line program attaches to the running kernel and binds a `Program` object to the name `prog`:
 
 ```
 $ sudo drgn
->>> prog
-Program(<host kernel>)
+>>> prog["init_task"].pid
+(pid_t)0
 ```
 
 The same binary attaches to other targets:
 
 ```
-$ drgn -p $PID        # attach to a running userspace process
-$ drgn -c vmcore      # open a kernel core dump / vmcore
+$ drgn -p $PID        # a running userspace process
+$ drgn -c vmcore      # a kernel core dump / vmcore
 ```
 
-## The `prog` object: types, variables, memory
+## The `prog` object
 
-`prog` is a `drgn.Program`, and it is the entry point for everything: look up types, access variables, and read raw memory.
+`prog` is a `drgn.Program` and is the entry point for type lookup, variable access and raw memory reads:
 
 ```
 >>> prog.type("struct list_head")
@@ -85,50 +99,34 @@ struct list_head {
         struct list_head *next;
         struct list_head *prev;
 }
->>> prog["jiffies"]              # same as prog.variable("jiffies")
+>>> prog["jiffies"]              # equivalent to prog.variable("jiffies")
 (volatile unsigned long)4391639989
 >>> prog.read(0xffffffffbe411e10, 16)
 b'...'
 ```
 
-Accessing a variable and a struct field reads exactly like C, minus the pointer punctuation:
+Field access reads as C does, minus the pointer punctuation:
 
 ```
 >>> prog["init_task"].comm
 (char [16])"swapper/0"
 ```
 
-`init_task` is the kernel's first task (PID 0, the idle/`swapper` thread), so its `comm` is `swapper/0` — a nice confirmation you are talking to real memory.
+`init_task` is the kernel's first task — PID 0, the idle or `swapper` thread — so a `comm` of `swapper/0` confirms that the read reached real memory.
 
-The syntax translation is worth memorizing:
+Three syntax translations carry the difference from C:
 
-- `ptr.member` auto-dereferences, like C's `ptr->member`
-- `ptr[0]` dereferences a pointer (there is no `*ptr`)
-- `var.address_of_()` takes an address, like C's `&var`
+- `ptr.member` auto-dereferences, corresponding to C's `ptr->member`
+- `ptr[0]` dereferences a pointer; there is no `*ptr` form
+- `var.address_of_()` takes an address, corresponding to C's `&var`
 
-References vs. values shows up clearly with something that changes:
+## Walking the task list
 
-```
->>> jiffies = prog["jiffies"]
->>> jiffies.value_()
-4391639989
->>> import time; time.sleep(1)
->>> jiffies.value_()          # re-read: it moved
-4391640290
->>> snap = jiffies.read_()    # freeze a value snapshot
->>> snap.value_()
-4391640291
->>> time.sleep(1); snap.value_()
-4391640291                    # unchanged — values are static
-```
-
-## Walk the task list off `init_task`
-
-Listing every process is the "hello world" of kernel introspection. Rather than hand-walking the linked list, use `for_each_task` from `drgn.helpers.linux.pid`, which yields `struct task_struct *`:
+Enumerating processes is the canonical first exercise. Instead of hand-walking the linked list, `for_each_task` from `drgn.helpers.linux.pid` yields `struct task_struct *`:
 
 ```
 >>> from drgn.helpers.linux.pid import for_each_task, find_task
->>> for task in for_each_task():
+>>> for task in for_each_task(prog):
 ...     print(task.pid.value_(), task.comm.string_().decode())
 ...
 0 swapper/0
@@ -137,19 +135,19 @@ Listing every process is the "hello world" of kernel introspection. Rather than 
 ...
 ```
 
-`.string_()` reads a NUL-terminated `char[]` out of memory as `bytes`. To jump straight to one task by PID:
+`.string_()` reads a NUL-terminated `char[]` out of target memory and returns `bytes`; the decode step is therefore mandatory before string comparison. A single task is reachable by PID:
 
 ```
->>> task = find_task(1)
+>>> task = find_task(prog, 1)
 >>> task.comm
 (char [16])"systemd"
->>> task.parent.comm            # ptr->parent->comm, no arrows needed
+>>> task.parent.comm            # ptr->parent->comm, no arrows required
 (char [16])"swapper/0"
 ```
 
-## The generic list walker
+## The generic intrusive-list walker
 
-Kernel data structures are stitched together with `struct list_head`. The helper `list_for_each_entry` turns any such intrusive list into a Python generator. Here it walks the loaded-modules list, filtering by reference count:
+Kernel data structures are stitched together with `struct list_head` embedded inside each element rather than in separate node objects. `list_for_each_entry` turns any such intrusive list into a Python generator. The example below walks the loaded-module list and filters by reference count:
 
 ```
 >>> from drgn.helpers.linux.list import list_for_each_entry
@@ -160,11 +158,11 @@ Kernel data structures are stitched together with `struct list_head`. The helper
 ...         print(mod.name.string_().decode())
 ```
 
-The three arguments are the element type, the address of the list head, and the name of the `list_head` member embedded in each entry — exactly the information `container_of()` needs in C, spelled out explicitly.
+The three arguments are **the element type, the address of the list head, and the name of the `list_head` member embedded in each entry** — precisely the information C's `container_of()` requires, written out explicitly instead of inferred by the compiler. A wrong member name yields entries offset by the difference between the two members, not an error.
 
-## Mounts and per-CPU data
+## Filesystem and per-CPU helpers
 
-drgn ships domain-specific helpers so you rarely re-derive plumbing. The mount table lives in `drgn.helpers.linux.fs`:
+Domain-specific helpers remove the need to re-derive plumbing. The mount table lives in `drgn.helpers.linux.fs`:
 
 ```
 >>> from drgn.helpers.linux.fs import for_each_mount, mount_dst, mount_fstype
@@ -176,7 +174,7 @@ proc /proc
 tmpfs /run
 ```
 
-There is also `print_mounts(prog)` if you just want the table dumped. And per-CPU variables — a recurring source of confusion in kernel code — are read with `per_cpu` from `drgn.helpers.linux.percpu`, which resolves the base for a given CPU:
+`print_mounts(prog)` dumps the same table directly. Per-CPU variables are read with `per_cpu` from `drgn.helpers.linux.percpu`, which resolves the per-CPU base address for a given processor:
 
 ```
 >>> from drgn.helpers.linux.percpu import per_cpu
@@ -185,8 +183,17 @@ There is also `print_mounts(prog)` if you just want the table dumped. And per-CP
 (unsigned int)1
 ```
 
-## Why this matters
+Reading the raw per-CPU symbol without `per_cpu` yields the object at the per-CPU offset base, not any processor's instance.
 
-The reason drgn feels different is that it collapses the gap between "reading the kernel source" and "querying the kernel." Once state is Python objects, the full language is available: list comprehensions to filter tasks, `collections.Counter` to tally states, a script committed to your repo that reproduces a diagnosis on the next incident. You are learning the system by inspecting the real thing, and the inspection is itself code you can keep.
+## Consequences
 
-**Try next:** boot a throwaway VM, `sudo drgn` into it, and write a five-line loop over `for_each_task()` that counts tasks by `task.__state` — then compare your count to `ps`. When it matches, you have verified you are reading the same reality the scheduler sees.
+drgn narrows the distance between reading kernel source and querying kernel state. Once state is Python objects, the whole language applies: comprehensions filter tasks, `collections.Counter` tallies states, and a script checked into a repository reproduces a prior diagnosis during the next incident. A verification exercise: in a throwaway virtual machine, loop over `for_each_task(prog)` counting tasks by `task.__state` and compare the totals against `ps`. Agreement establishes that the reads observe the same state the scheduler does.
+
+## Pitfalls
+
+- **Debug information that does not match the running kernel produces wrong field offsets, not an error.** DWARF supplies structure layout; a `vmlinux` from a different build reads correct addresses with incorrect member offsets, so fields appear populated with garbage.
+- **Iterating references while the kernel runs can observe a torn view.** Each attribute access is a fresh memory read, so a task freed mid-loop leaves subsequent reads pointing at reused memory. `read_()` snapshots a value at a single instant.
+- **`list_for_each_entry` given the wrong member name silently returns misaligned pointers.** The helper computes element addresses by subtracting the member offset; a wrong name subtracts a wrong constant and every field thereafter is misread.
+- **`comm` is a `char[16]`, not a Python string.** Comparing it directly against a `str` never matches; `.string_()` returns `bytes`, requiring an explicit decode.
+- **Attaching to the live kernel requires root and a readable `/proc/kcore`.** Kernels built without `CONFIG_PROC_KCORE`, or systems restricting it, leave core dumps as the only target.
+- **Breakpoints and single-stepping are absent.** drgn reads state; workflows built around stopping the target belong to gdb, and tracing execution over time belongs to eBPF or bpftrace.

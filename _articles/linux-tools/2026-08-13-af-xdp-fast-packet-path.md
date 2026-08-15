@@ -1,9 +1,9 @@
 ---
-title: "AF_XDP: a fast path from the NIC driver straight into your process"
+title: "AF_XDP: a fast path from the NIC driver into a userspace process"
 date: 2026-08-13
 track: linux-tools
-summary: "AF_XDP sockets let an XDP program redirect raw frames from the driver into userspace through shared-memory rings, skipping the kernel network stack entirely. Here's how UMEM, the four rings, and zero-copy mode fit together, plus a minimal libxdp receiver you can actually build."
-reading_time: 6
+summary: "AF_XDP sockets let an XDP program redirect raw frames from the driver into userspace through shared-memory rings, skipping the kernel network stack. How UMEM, the four rings, and zero-copy mode fit together, with a minimal libxdp receiver."
+reading_time: 7
 tags: [af-xdp, xdp, networking, libxdp, zero-copy]
 sources:
   - title: "AF_XDP — Linux kernel networking documentation"
@@ -16,11 +16,11 @@ sources:
     url: "https://lwn.net/Articles/750845/"
 ---
 
-The kernel network stack does a lot per packet: allocate an skb, run netfilter, route, demultiplex to a socket, copy to userspace. For a firewall or a browser that's the right trade. For a packet capture engine, a software load balancer, or a DDoS scrubber pushing millions of packets per second, it's overhead you'd rather not pay. **AF_XDP** is the socket family that opts out: an XDP program running in the NIC driver hands raw frames directly to your process through shared-memory rings, before the stack ever sees them.
+**Gist.** The kernel network stack performs a fixed amount of work per packet — socket buffer (skb) allocation, netfilter traversal, routing, demultiplexing to a socket, and a copy to userspace — which becomes the dominant cost for applications processing millions of packets per second. **AF_XDP** is a socket address family that bypasses that path: an eXpress Data Path (XDP) program running inside the network interface controller (NIC) driver redirects raw frames into a userspace-owned shared-memory region before the stack is entered. The cost is that the application takes over buffer management, descriptor bookkeeping and per-queue steering, and must handle the case where the driver does not support zero-copy.
 
 ## How a frame gets redirected
 
-XDP programs run at the earliest possible point — in the driver, on the raw DMA buffer. Normally they return verdicts like `XDP_PASS` or `XDP_DROP`. The third option is `XDP_REDIRECT`, and one redirect target is an **XSKMAP** (`BPF_MAP_TYPE_XSKMAP`): a map whose values are AF_XDP sockets, indexed by queue ID. The canonical program is three lines:
+XDP programs run at the earliest point at which the driver has a packet available — on the raw direct-memory-access (DMA) buffer, before an skb exists. The usual verdicts are `XDP_PASS` and `XDP_DROP`. The verdict that feeds AF_XDP is `XDP_REDIRECT`, whose target may be an **XSKMAP** (`BPF_MAP_TYPE_XSKMAP`): a map whose values are AF_XDP sockets, indexed by queue identifier. The canonical program is a single redirect:
 
 ```c
 SEC("xdp")
@@ -30,34 +30,38 @@ int xsk_redir(struct xdp_md *ctx)
 }
 ```
 
-Frames arriving on queue N go to the socket registered at slot N; anything unmatched falls through to the normal stack. That last part matters — unlike a DPDK port takeover, the interface keeps working. ARP, SSH, and your monitoring keep flowing through the kernel while your fast path grabs only the queue (or traffic) you steer to it. In practice you don't even write this program: **libxdp** loads an equivalent default program and manages the map for you when you create a socket.
+The invariant is per-queue: **a frame arriving on receive queue N is delivered to the socket registered at XSKMAP slot N**, and the third argument supplies the fallback verdict when no socket occupies that slot. Here the fallback is `XDP_PASS`, so unmatched traffic continues into the ordinary stack. That fallback is what separates AF_XDP from a Data Plane Development Kit (DPDK) port takeover: **the kernel retains ownership of the interface**, so Address Resolution Protocol (ARP), administrative SSH sessions and monitoring traffic continue to work while the fast path receives only the queues, or the flows, that are steered to it. **libxdp** loads an equivalent default program and maintains the map when a socket is created, so the program above need not be written by hand.
 
 ## UMEM and the four rings
 
-An AF_XDP socket owns no packet buffers. You allocate one contiguous region called the **UMEM**, divided into equal-sized frames (typically 4096 bytes), and register it with the kernel. All packet data lives there, in your address space; the rings only carry 64-bit descriptors pointing into it.
+An AF_XDP socket owns no packet buffers of its own. The application allocates one contiguous region, the **user memory area (UMEM)**, divides it into equal-sized frames (commonly 4096 bytes) and registers it with the kernel. **All packet data resides in that region, in the application's address space; the rings carry only descriptors — a 64-bit offset into the UMEM, and for the RX and TX rings a length alongside it — never payload.**
 
 | Ring | Producer | Consumer | Carries |
 |------|----------|----------|---------|
-| Fill | you | kernel | empty frames for RX |
-| RX | kernel | you | received frames (addr + len) |
-| TX | you | kernel | frames to transmit |
-| Completion | kernel | you | sent frames, ready to reuse |
+| Fill | application | kernel | empty frames for RX |
+| RX | kernel | application | received frames (addr + len) |
+| TX | application | kernel | frames to transmit |
+| Completion | kernel | application | sent frames, ready to reuse |
 
-The lifecycle is a loop: you push free frame addresses onto the **fill ring**; the driver writes packets into them and posts descriptors on the **RX ring**; you process and recycle the addresses back to the fill ring. Transmit mirrors it through the TX and **completion** rings. Everything is single-producer/single-consumer shared memory — after setup, a busy-polling receiver does zero syscalls per packet.
+The receive cycle is a closed loop over frame ownership. The application publishes free frame addresses on the **fill ring**; the driver writes packet data into those frames and posts descriptors on the **RX ring**; the application consumes the descriptors, processes the data in place, and returns the addresses to the fill ring. Transmit mirrors this through the TX and **completion** rings: a descriptor placed on the TX ring transfers the frame to the kernel, and its address reappears on the completion ring once the frame has been sent.
+
+Each ring is **single-producer/single-consumer shared memory**, which is what removes the syscall from the steady state: after setup, a receiver that busy-polls the RX ring performs zero syscalls per packet. It is also what makes the address-recycling discipline load-bearing. **A frame address is owned by exactly one side at a time.** Losing an address — consuming an RX descriptor without ever returning its address to the fill ring — permanently removes that frame from circulation; the leak is silent and ends in an empty fill ring, at which point the driver has nowhere to place arriving packets and drops them.
 
 ## Copy, zero-copy, and need_wakeup
 
-Bind flags select the data path. `XDP_COPY` works everywhere: the driver still copies each frame into your UMEM, which already skips skb allocation and the stack. `XDP_ZEROCOPY` is the real prize — the driver DMAs packets *directly into your UMEM frames*, so the NIC writes and your process reads the same bytes. Zero-copy needs driver support (i40e, ice, mlx5, and friends; virtio-net gained it more recently) and only works in native driver mode, not the generic `xdpgeneric` fallback. The usual approach: request `XDP_ZEROCOPY`, fall back to copy mode if `bind()` returns `EOPNOTSUPP`.
+Bind flags select the data path. `XDP_COPY` works in both native and generic mode: the driver copies each frame into the UMEM, which still eliminates skb allocation and the stack traversal but retains one copy. `XDP_ZEROCOPY` instructs the driver to DMA packets **directly into the UMEM frames**, so the NIC writes and the process reads the same bytes. Zero-copy requires explicit driver support (i40e, ice and mlx5 among them; virtio-net gained it more recently) and native driver mode — the generic `xdpgeneric` fallback, which runs XDP after the driver has already built an skb, cannot provide it.
 
-Add `XDP_USE_NEED_WAKEUP` and the kernel sets a flag on the ring when it actually needs a `poll()`/`sendto()` kick, letting you spare the syscall on the hot path but sleep when idle — the pragmatic middle ground between busy-polling a core at 100% and paying wakeup latency.
+The resulting failure mode is a bind-time one rather than a silent performance regression: **`bind()` with `XDP_ZEROCOPY` returns `EOPNOTSUPP` when the driver or mode cannot satisfy it.** The standard structure is therefore to request zero-copy first and retry with `XDP_COPY` on that error.
+
+`XDP_USE_NEED_WAKEUP` addresses the opposite problem. Without it, an application must choose between busy-polling a core continuously and paying an unconditional `poll()` or `sendto()` syscall per batch. With the flag set, **the kernel raises a flag on the ring when it requires a wakeup**, so the syscall is issued only when the ring's state demands it and the process can sleep when the link is idle.
 
 ## A minimal receiver with libxdp
 
-The `xsk_*` API used to live in libbpf and moved to libxdp, part of [xdp-tools](https://github.com/xdp-project/xdp-tools) (v1.6.3 as of mid-2026). On Debian/Ubuntu: `apt install libxdp-dev xdp-tools`. The essential shape, error handling elided:
+The `xsk_*` API originally lived in libbpf and now lives in libxdp, part of [xdp-tools](https://github.com/xdp-project/xdp-tools). On Debian and Ubuntu the packages are `libxdp-dev` and `xdp-tools`. The essential shape, with error handling elided:
 
 ```c
 #include <xdp/xsk.h>
-#define FRAMES 4096
+#define FRAMES XSK_RING_PROD__DEFAULT_NUM_DESCS  /* fill ring holds no more */
 #define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
 
 void *bufs; struct xsk_umem *umem;
@@ -80,7 +84,7 @@ for (int i = 0; i < FRAMES; i++)
     *xsk_ring_prod__fill_addr(&fq, idx++) = i * FRAME_SIZE;
 xsk_ring_prod__submit(&fq, FRAMES);
 
-for (;;) {                                /* the actual fast path */
+for (;;) {                                /* the fast path */
     uint32_t ridx, n = xsk_ring_cons__peek(&rx, 64, &ridx);
     for (uint32_t i = 0; i < n; i++) {
         const struct xdp_desc *d = xsk_ring_cons__rx_desc(&rx, ridx + i);
@@ -91,10 +95,19 @@ for (;;) {                                /* the actual fast path */
 }
 ```
 
-Build with `gcc rx.c -o rx $(pkg-config --cflags --libs libxdp)`, run as root, and confirm the program attached with `xdp-loader status eth0`. To see *all* traffic instead of one queue's, either steer flows to that queue with `ethtool -N` or open one socket per queue. `xdpdump` from the same package is a ready-made sanity check that the redirect path works on your NIC.
+Three details in that listing carry the mechanism. The initial loop seeds the fill ring with **every** frame address in the UMEM, because a driver with an empty fill ring has no buffer into which to receive; the UMEM is sized to the fill ring's capacity so that the single reservation fits. The `reserve`/`submit` and `peek`/`release` pairs are the ownership transfer: **the producer index advances only at `submit`, and the consumer index only at `release`**, so a descriptor written but not submitted is invisible to the other side. And `xsk_umem__get_data` performs address arithmetic against the UMEM base — the payload was never copied out of the region.
 
-## When it's the right tool
+Build with `gcc rx.c -o rx $(pkg-config --cflags --libs libxdp)`, run as root, and confirm attachment with `xdp-loader status eth0`. Because delivery is per queue, a socket bound to queue 0 observes only the traffic the NIC's receive-side steering places on queue 0; capturing all traffic requires steering flows to that queue with `ethtool -N` or opening one socket per queue. `xdpdump` from the same package verifies that the redirect path functions on a given NIC.
 
-Against **plain sockets** (even `AF_PACKET` with `PACKET_MMAP`), AF_XDP wins on per-packet cost: no skb, no stack traversal, optionally no copy and no syscalls. Against **DPDK**, it trades a little peak throughput for a lot of operability: the kernel still owns the device, standard tooling keeps working, no hugepage/VFIO setup, no vendor PMD matrix — just a driver with XDP support. DPDK still holds the crown when you need every last nanosecond and exotic NIC offloads; AF_XDP is the answer when you want 80–90% of that inside a normal Linux process. If your rates are tens of thousands of packets per second, not millions, stay with plain sockets — the complexity isn't free.
+## When it is the right tool
 
-**Try next:** run `xdpdump -i eth0 --rx-capture entry` while pinging the box, then modify the receiver above to swap Ethernet src/dst MACs and bounce frames back out through the TX ring — a userspace reflector is the "hello world" of packet processing.
+Against plain sockets, including `AF_PACKET` with `PACKET_MMAP`, AF_XDP removes the skb allocation and the stack traversal, and optionally the copy and the per-packet syscall. Against DPDK, it trades peak throughput for operability: the kernel continues to own the device, standard tooling continues to work, and there is no hugepage or Virtual Function I/O (VFIO) setup and no vendor poll-mode-driver matrix to satisfy — the requirement is a driver with XDP support. DPDK remains preferable where every nanosecond and exotic NIC offloads matter. Where traffic is measured in tens of thousands of packets per second rather than millions, plain sockets remain the appropriate choice, since the buffer-management complexity described above is paid regardless of rate.
+
+## Pitfalls
+
+- **The fill ring empties and receive stops.** An RX descriptor was consumed without its frame address being returned to the fill ring; the frame leaks out of circulation and the driver eventually has no buffer to write into, so packets are dropped in the driver.
+- **`bind()` fails with `EOPNOTSUPP`.** `XDP_ZEROCOPY` was requested on a driver without zero-copy support, or in generic mode, where XDP runs after skb allocation. The socket must be retried with `XDP_COPY`.
+- **Traffic is visible to `tcpdump` but never reaches the socket.** The frames arrive on a receive queue whose XSKMAP slot holds no socket, so the redirect falls through to the fallback verdict; only the bound queue is captured.
+- **Descriptors are written but never observed by the peer.** `xsk_ring_prod__submit` or `xsk_ring_cons__release` was omitted, leaving the shared producer or consumer index unchanged; the ring appears empty to the other side.
+- **Throughput is far below expectation with no errors reported.** The attachment silently landed in `xdpgeneric` mode, where XDP executes after the skb has been built, so the skb allocation the design avoids is still paid; `xdp-loader status` reports the active mode.
+- **A core is pinned at 100% while the link is idle.** The socket was bound without `XDP_USE_NEED_WAKEUP`, leaving busy-polling as the only way to avoid an unconditional syscall per batch.

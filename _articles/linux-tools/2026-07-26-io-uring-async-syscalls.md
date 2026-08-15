@@ -2,8 +2,8 @@
 title: "io_uring: two ring buffers and (almost) zero syscalls per I/O"
 date: 2026-07-26
 track: linux-tools
-summary: "read()/write() cost one syscall each; epoll still needs a syscall per readiness check. io_uring replaces both with two ring buffers shared between kernel and userspace, so you can submit a batch of operations and collect their results without crossing the kernel boundary each time — at a security cost distros are still arguing about."
-reading_time: 5
+summary: "read()/write() cost one syscall each; epoll still needs a syscall per readiness check. io_uring replaces both with two ring buffers shared between kernel and userspace, so a batch of operations can be submitted and their results collected without crossing the kernel boundary each time — at a security cost distributions are still arguing about."
+reading_time: 6
 tags: [io_uring, liburing, async-io, syscalls, kernel, security]
 sources:
   - title: "Efficient IO with io_uring (Jens Axboe)"
@@ -18,11 +18,11 @@ sources:
     url: "https://www.phoronix.com/news/Google-Restricting-IO_uring"
 ---
 
-Every classic Linux I/O call — `read()`, `write()`, even `epoll_wait()` — crosses the syscall boundary at least once per operation. That boundary isn't free: a mode switch, a TLB consideration, mitigations for speculative-execution bugs stacked on top. For a database doing hundreds of thousands of small reads a second, that overhead is the workload. io_uring, merged into the mainline kernel by Jens Axboe in **Linux 5.1** (March 2019), attacks this directly by replacing "one syscall per op" with "one shared memory region per *batch* of ops."
+**Gist.** Every classic Linux input/output (I/O) call — `read()`, `write()`, `epoll_wait()` — crosses the syscall boundary at least once per operation, and at high request rates that boundary crossing *is* the workload. io_uring, merged into the mainline kernel by Jens Axboe in **Linux 5.1** (2019), replaces "one syscall per operation" with two ring buffers mapped into both kernel and userspace address spaces, so an arbitrary number of operations can be queued and reaped per boundary crossing. The cost is a large, directly reachable kernel surface prominent enough that several vendors now disable or filter it by default.
 
 ## The two rings
 
-io_uring's whole design fits in one sentence: two ring buffers, mapped into both kernel and userspace, one for requests and one for results.
+The design reduces to one sentence: **two single-producer/single-consumer ring buffers, shared by `mmap()` between the kernel and the process, one carrying requests and one carrying results.**
 
 ```
  userspace                              kernel
@@ -32,18 +32,20 @@ io_uring's whole design fits in one sentence: two ring buffers, mapped into both
  read  CQE <--- [ Completion Queue ] <--- write CQE when done
 ```
 
-- **SQ (Submission Queue):** you write an `io_uring_sqe` describing an operation — read this fd at this offset into this buffer — into the next free ring slot. No syscall yet.
-- **CQ (Completion Queue):** when the kernel finishes an operation, it writes an `io_uring_cqe` (a result code plus the user-data you tagged the request with) into this ring. Again, no syscall to *produce* it.
+- **Submission queue (SQ).** The application fills an `io_uring_sqe` structure — opcode, file descriptor, offset, buffer pointer, length — into the next free ring slot. No syscall is involved in producing it.
+- **Completion queue (CQ).** When an operation finishes, the kernel writes an `io_uring_cqe` into this ring: a result code with the same sign convention as the corresponding syscall (negative errno on failure) plus the opaque `user_data` value the request was tagged with. No syscall is involved in producing it either.
 
-The only syscall left is `io_uring_enter()`, and its job changes completely: instead of "do this one operation," it means "look at everything I've queued since the last call, and optionally, wait until at least N results are ready." You can queue 50 reads and pay for a single `io_uring_enter()`. LWN's original coverage put it plainly: applications "fill in an `io_uring_sqe` structure" for each op and can "add multiple SQEs before making the system call as well" — batching is the entire point, not an optimization bolted on afterward.
+Each ring is described by a **head index and a tail index, both shared memory words**. The producer advances the tail after writing the entry; the consumer advances the head after reading it. Because the two sides run concurrently on different CPUs, the ordering between "entry contents visible" and "tail visible" is the load-bearing invariant: the entry must be written before the tail update becomes observable, or the consumer reads a slot whose contents are not yet valid. Axboe's *Efficient IO with io_uring* documents this explicitly, and it is the principal reason applications are told to use liburing rather than manipulate the indices directly — **the barriers, not the arithmetic, are what hand-rolled ring code gets wrong.** A ring is a fixed-size array; when the tail reaches the head the queue is full and submission must wait for the consumer to drain it.
 
-Push further with `IORING_SETUP_SQPOLL`: the kernel spins up a dedicated thread that polls the SQ ring itself and submits work it finds there, so a steady-state producer can add SQEs and read CQEs with **no syscalls at all**, as long as the poll thread hasn't gone idle (it naps after ~1 second of no work and needs one wake-up call to restart). That's the mode people mean when they say io_uring can do I/O without ever entering the kernel per-request.
+The one remaining syscall is `io_uring_enter()`, and its meaning is different in kind from `read()`: rather than "perform this operation", it means "consider everything queued since the last call, and optionally block until at least *N* completions are available". Fifty queued reads cost one `io_uring_enter()`. LWN's original coverage states that applications "fill in an `io_uring_sqe` structure" per operation and can "add multiple SQEs before making the system call as well" — **batching is the interface, not a later optimisation**.
 
-The other half of the win, independent of the ring design: io_uring gave Linux real async **buffered** I/O for the first time. The older AIO interface only stayed non-blocking for direct I/O or when the page was already cached; io_uring's worker-thread fallback means a buffered read that misses cache doesn't stall your whole submission path.
+`IORING_SETUP_SQPOLL` removes even that call. The kernel creates a dedicated thread that polls the submission ring and picks up entries as they appear, so a steady-state producer adds SQEs and reaps CQEs with **no syscalls at all**. The qualification matters: the poll thread sleeps after a configurable idle period (`sq_thread_idle`), and the application must then issue one `io_uring_enter()` to wake it. The wake-up condition is signalled in the ring's shared flags word (`IORING_SQ_NEED_WAKEUP`), so the application checks a memory location rather than guessing.
 
-## liburing: don't hand-roll the ring math
+Independently of the ring mechanics, io_uring supplied Linux with genuinely asynchronous **buffered** I/O. The older AIO interface stayed non-blocking only for direct I/O, or when the requested page happened to be resident in the page cache; a cache miss reverted to a blocking submission. io_uring's fallback to kernel worker threads means a buffered read that misses cache does not stall the submitter's progress on the rest of the batch.
 
-The raw interface means calling `io_uring_setup()`, `mmap()`-ing the SQ/CQ regions yourself, and doing the index arithmetic on the ring by hand. Nobody does this in application code anymore — you use **liburing**, Axboe's companion library, which wraps setup and gives you a request-scoped API:
+## liburing
+
+The raw interface requires `io_uring_setup()`, `mmap()`-ing the SQ and CQ regions, and maintaining the index arithmetic and barriers by hand. Application code uses **liburing**, Axboe's companion library, which performs setup and exposes a request-scoped API.
 
 ```c
 #include <liburing.h>
@@ -64,23 +66,22 @@ int main(void) {
 
     io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
 
-    /* --- submission side: fill an SQE, no syscall yet --- */
-    sqe = io_uring_get_sqe(&ring);
+    /* submission side: fill an SQE; no syscall is made here */
+    sqe = io_uring_get_sqe(&ring);            /* NULL when the SQ ring is full */
     io_uring_prep_read(sqe, fd, buf, sizeof(buf) - 1, 0);
-    io_uring_sqe_set_data(sqe, "hostname-read"); /* tag for the completion */
+    io_uring_sqe_set_data(sqe, "hostname-read"); /* echoed back in the CQE */
 
-    /* the one syscall: submit everything queued since last call */
-    io_uring_submit(&ring);
+    io_uring_submit(&ring);                   /* the one syscall */
 
-    /* --- completion side: block until a CQE shows up --- */
+    /* completion side: block until a CQE is available */
     io_uring_wait_cqe(&ring, &cqe);
-    if (cqe->res < 0) {
+    if (cqe->res < 0) {                       /* negative errno, not -1 */
         fprintf(stderr, "read failed: %s\n", strerror(-cqe->res));
     } else {
         printf("read %d bytes, tag=%s: %s", cqe->res,
                (char *)io_uring_cqe_get_data(cqe), buf);
     }
-    io_uring_cqe_seen(&ring, cqe); /* mark this CQE consumed */
+    io_uring_cqe_seen(&ring, cqe);            /* advances the CQ head */
 
     io_uring_queue_exit(&ring);
     close(fd);
@@ -88,20 +89,32 @@ int main(void) {
 }
 ```
 
-Build it with `cc file.c -luring -o read_demo`. The four functions that matter are `io_uring_get_sqe` (grab the next free submission slot), `io_uring_prep_read` (fill it in — there's a `prep_*` for nearly every syscall: `writev`, `accept`, `connect`, `openat`, `fsync`, `send`, `recv`, `timeout`, and more), `io_uring_submit` (the actual syscall), and `io_uring_wait_cqe` (block for a result). Real programs queue many SQEs before one `submit()`, and drain many CQEs per `wait_cqe` loop — that's the batching liburing's own `io_uring-cp.c` example demonstrates: it keeps up to 64 reads in flight, calling `io_uring_prep_readv` for each and pairing each completed read with a queued write, so disk and memory bandwidth stay saturated instead of ping-ponging syscall-by-syscall.
+Built with `cc file.c -luring -o read_demo`. Four calls carry the mechanism: `io_uring_get_sqe` claims the next free submission slot, `io_uring_prep_*` fills it (a preparation helper exists for most syscalls — `writev`, `accept`, `connect`, `openat`, `fsync`, `send`, `recv`, `timeout`), `io_uring_submit` performs the boundary crossing, and `io_uring_wait_cqe` blocks for a result. `io_uring_cqe_seen` is not bookkeeping: **until it is called the slot is not released, and a loop that omits it will exhaust the completion ring.**
 
-Check whether your kernel actually has it before you rely on it:
+The single-request form above shows the API, not the design point. liburing's own `io_uring-cp.c` example demonstrates the intended shape: it keeps up to **64 reads in flight**, issuing `io_uring_prep_readv` for each and pairing every completed read with a queued write, so storage and memory bandwidth stay occupied instead of alternating one syscall at a time. Completions arrive in **whatever order the kernel finishes the work, not submission order**, which is why every request carries a `user_data` tag: reassociating a CQE with its request is the application's responsibility.
+
+Availability is checkable before it is relied upon:
 
 ```bash
-uname -r                                  # want 5.1+; SQPOLL/fixed files/etc need newer
+uname -r                                  # 5.1+ minimum; SQPOLL, fixed files etc. need newer
 grep -i io_uring /boot/config-$(uname -r) # CONFIG_IO_URING=y
-ls /sys/kernel/debug/tracing/events/io_uring/ 2>/dev/null  # tracepoints, if debugfs mounted
+ls /sys/kernel/debug/tracing/events/io_uring/ 2>/dev/null  # tracepoints, if debugfs is mounted
 ```
 
-## The security caveat
+The kernel version check is necessary but not sufficient: a seccomp-BPF (Berkeley Packet Filter) policy or container runtime profile can block `io_uring_setup` on a kernel that supports it, in which case setup fails at runtime rather than at build time.
 
-io_uring's power is also its problem: it hands userspace a fast, direct path to a huge surface of kernel operations, and several years of fuzzing found that surface was full of holes. In mid-2023, Google's security team published "Our learnings from 42 Linux kernel exploits, we are limiting io_uring" on the oss-security mailing list, reporting that a large share of the Linux kernel exploits submitted through Google's vulnerability rewards program used io_uring as the primary bug class. The response was concrete, not theoretical: **ChromeOS disabled io_uring entirely**, **Android blocks app access via seccomp-bpf** (with SELinux confinement to system processes planned), **GKE Autopilot moved to disable it by default**, and Google restricted its use across internal production infrastructure. The pattern repeats across the industry — several container runtimes and hardened distro configs seccomp-filter `io_uring_setup`/`io_uring_enter` by default, and it has since shown up as a mechanism in Linux rootkit proof-of-concepts specifically because it lets an attacker perform I/O-adjacent operations without going through the traditional syscalls that EDR tools hook.
+## The security position
 
-The practical takeaway for anyone reaching for io_uring: it's genuinely worth it for a trusted, performance-critical service (databases, storage engines, proxies) that controls its own inputs — but treat it like you'd treat any large new kernel attack surface exposed to untrusted code: gate it behind a seccomp profile, don't expose it to sandboxed or multi-tenant workloads without checking your distro's current default, and expect that default to keep tightening as more CVEs land.
+The same property that makes io_uring fast — a direct userspace path to a wide range of kernel operations — enlarged the attack surface, and years of fuzzing found defects in it. In mid-2023 Google's security team published an oss-security mailing list post on limiting io_uring, drawn from an analysis of 42 Linux kernel exploits, reporting that a large share of the Linux kernel exploits submitted through Google's vulnerability rewards programme used io_uring as the primary bug class. The reported response was operational: **ChromeOS disabled io_uring entirely**, **Android blocks application access via seccomp-BPF** with SELinux confinement to system processes planned, **GKE Autopilot moved to disable it by default**, and use was restricted across Google's internal production infrastructure. Similar defaults appear elsewhere: container runtimes and hardened distribution profiles filter `io_uring_setup`, and io_uring has featured in Linux rootkit proof-of-concept work because it performs I/O without invoking the traditional syscalls that endpoint-detection tooling hooks.
 
-**Try next:** rebuild the example above with `io_uring_prep_readv` across several files queued before a single `io_uring_submit()`, then trace it with `strace -c` to count how few `io_uring_enter` calls you actually made per completed read.
+The resulting position is narrow rather than universal. io_uring suits a trusted, performance-critical service that controls its own inputs — a database, a storage engine, a proxy — and is treated elsewhere as a large kernel attack surface: gated behind an explicit seccomp profile, kept away from sandboxed or multi-tenant workloads, and re-checked against the platform's current default, which has been tightening rather than loosening.
+
+## Pitfalls
+
+- **`io_uring_get_sqe` returns NULL when the submission ring is full**, and dereferencing it faults; the fix is to submit and drain completions before claiming more slots, not to enlarge the queue depth.
+- **Omitting `io_uring_cqe_seen` leaks completion slots.** The head index never advances, the CQ fills, and further completions are dropped or the ring reports overflow — presenting as work that was submitted but whose results never arrive.
+- **Completions are unordered relative to submissions.** Code that assumes the *n*-th CQE corresponds to the *n*-th SQE corrupts state as soon as one operation finishes out of order; the `user_data` tag is the only correlation.
+- **A negative `cqe->res` is an errno value, not −1.** Testing `res < 0` and then reading `errno` yields an unrelated stale value; the error is `-cqe->res`.
+- **Buffers and file descriptors referenced by an SQE must remain valid until the matching CQE arrives.** A stack buffer that goes out of scope, or a descriptor closed early, is still referenced by an in-flight kernel operation.
+- **SQPOLL is not unconditionally syscall-free.** After the configured idle period the poll thread sleeps, and a submitter that never re-checks the ring's wake-up flag queues entries that are never picked up.
+- **Kernel version is a weak availability test.** seccomp filters in container runtimes and hardened distributions reject `io_uring_setup` on kernels that fully support io_uring, so setup must be error-checked and a fallback I/O path retained.

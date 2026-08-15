@@ -1,9 +1,9 @@
 ---
-title: "TCP BBR: model-based congestion control you can enable today"
+title: "TCP BBR: model-based congestion control"
 date: 2026-08-15
 track: linux-tools
-summary: "CUBIC infers congestion from packet loss, which means it either fills every buffer on the path (bufferbloat) or collapses on links where loss isn't congestion. BBR instead builds an explicit model of the bottleneck — bandwidth times RTT — and paces to it. Two sysctls turn it on; ss -ti shows you the model it built. Also: why BBRv1 was accused of bullying CUBIC, and where BBRv3 actually stands in 2026."
-reading_time: 5
+summary: "CUBIC infers congestion from packet loss, so it either fills every buffer on the path (bufferbloat) or collapses on links where loss is not congestion. BBR instead builds an explicit model of the bottleneck — bandwidth times round-trip propagation time — and paces to it. Two sysctls enable it; ss -ti prints the model it built. Includes why BBRv1 was accused of crowding out CUBIC, and where BBRv3 stands in 2026."
+reading_time: 6
 tags: [tcp, bbr, congestion-control, networking, bufferbloat, sysctl]
 sources:
   - title: "tcp: BBR congestion control algorithm — patch series (LWN.net)"
@@ -18,28 +18,47 @@ sources:
     url: "https://fasterdata.es.net/host-tuning/linux/recent-tcp-enhancements/bbr-tcp/"
 ---
 
-Linux's default congestion control, **CUBIC**, belongs to the loss-based family: push more packets until one is dropped, back off, repeat. That heuristic has two failure modes baked in. On a path with **deep buffers**, the drop only happens after every queue is full, so CUBIC *operates* at maximum queue depth — that standing queue is **bufferbloat**, and it taxes every other flow's latency. On a path with **random loss** — WiFi, cellular, a long transatlantic link with a 0.1% loss floor — CUBIC treats every stray drop as congestion and halves its window, so a 10 Gbit pipe delivers a trickle. The [cake qdisc article](/articles/linux-tools/2026-07-30-cake-qdisc-bufferbloat) attacked bufferbloat from the router side; **BBR** attacks it from the sender side.
+**Gist.** Loss-based congestion control treats a dropped packet as the only evidence of congestion, which forces the sender to fill the bottleneck queue before it learns anything, and misreads non-congestive loss as overload. BBR (Bottleneck Bandwidth and Round-trip propagation time) replaces that inference with a measured model of the path — bottleneck bandwidth and minimum round-trip time (RTT) — and paces transmission to it. The cost is that a sender running a model which excludes loss can hold more than its share of a shallow-buffered bottleneck against loss-based flows, and that the model must be maintained by periodic probing phases that deliberately perturb the flow.
 
-## The model instead of the heuristic
+## Where the loss heuristic fails
 
-BBR (Bottleneck Bandwidth and Round-trip propagation time), from Google and merged in **Linux 4.9** (2016), doesn't wait for loss. It continuously estimates two numbers that fully describe the pipe:
+Linux's default congestion control, **CUBIC**, belongs to the loss-based family: increase the sending rate until a packet is dropped, reduce the congestion window, repeat. Two failure modes follow directly from that rule.
 
-- **BtlBw** — bottleneck bandwidth, the windowed *max* of recent delivery rate samples.
-- **RTprop** — the propagation RTT, the windowed *min* of recent RTT samples (the RTT with no queue standing).
+On a path with **deep buffers**, a drop occurs only once a queue is full, so the steady state of a CUBIC flow *is* maximum queue depth. The resulting standing queue is **bufferbloat**: every packet, including those of latency-sensitive flows sharing the bottleneck, waits behind it. On a path with **non-congestive loss** — wireless links, cellular links, a long intercontinental path with a residual loss floor — CUBIC cannot distinguish a corrupted frame from an overflowing queue and reduces its window on both, so a high-capacity long-RTT pipe delivers a fraction of its capacity. The [cake qdisc article](/articles/linux-tools/2026-07-30-cake-qdisc-bufferbloat) addresses bufferbloat at the router; **BBR** addresses it at the sender.
 
-Their product is the **bandwidth-delay product** — exactly the amount of data that fits in the path with zero queue. BBR paces transmission at BtlBw and caps data in flight near the BDP, cycling through phases (STARTUP, DRAIN, PROBE_BW, PROBE_RTT) that periodically probe for more bandwidth and periodically drain the queue to re-measure the true RTT. Loss is (in v1, literally) not part of the model. The payoff: on lossy long-fat paths BBR routinely sustains **orders of magnitude** more throughput than CUBIC, while keeping the bottleneck queue — and therefore RTT — short.
+## The two estimates and the invariant
+
+BBR, developed at Google and merged in **Linux 4.9** (2016), does not wait for loss. It maintains two quantities that between them describe the pipe:
+
+- **BtlBw** — bottleneck bandwidth, the windowed **maximum** of recent delivery-rate samples.
+- **RTprop** — round-trip propagation time, the windowed **minimum** of recent RTT samples, that is, the RTT observed when no queue is standing.
+
+Each is a windowed extremum rather than an average, and the choice of extremum is forced by what each measurement is contaminated by. Delivery rate can only be *understated* by an idle or application-limited sender, so the maximum is the least-corrupted sample. RTT can only be *overstated* by queueing delay, so the minimum is the least-corrupted sample. The two cannot be measured at the same instant: raising the rate to find BtlBw builds a queue that inflates RTT, and draining the queue to find RTprop requires sending below BtlBw. **The estimates are therefore acquired in alternation, not simultaneously.**
+
+Their product is the **bandwidth-delay product (BDP)** — the amount of data that fits in the path with an empty bottleneck queue. BBR paces transmission at BtlBw and caps data in flight near the BDP. Operating at that point is the invariant: the pipe is full and the queue is not.
+
+## The phase machine
+
+BBR cycles through four states, each defined by a gain applied to the pacing rate and to the in-flight cap:
+
+- **STARTUP** — the rate rises rapidly to discover BtlBw on a new connection, in the manner of slow start.
+- **DRAIN** — the rate drops below BtlBw to remove the queue that STARTUP's overshoot created.
+- **PROBE_BW** — the steady state. The pacing gain cycles above and below unity, briefly sending faster than BtlBw to test whether more bandwidth has appeared, then slower to return the queue to empty.
+- **PROBE_RTT** — in-flight data is reduced sharply so the bottleneck queue drains and a fresh, uninflated RTprop sample can be taken.
+
+PROBE_RTT is the visible cost of the model: **a flow that must periodically stop filling the pipe in order to re-measure the empty-queue RTT gives up throughput during that interval.** In BBRv1 the model contained no loss term at all.
 
 | | CUBIC (loss-based) | BBR (model-based) |
 |---|---|---|
-| Congestion signal | packet loss | measured bandwidth + RTT |
-| Steady state | buffer full, then drop | ~1 BDP in flight, short queue |
-| Random-loss link | throughput collapses | mostly unaffected |
+| Congestion signal | packet loss | measured bandwidth and RTT |
+| Steady state | buffer full, then drop | approximately 1 BDP in flight, short queue |
+| Non-congestive loss | throughput falls sharply | largely unaffected |
 | Deep-buffer link | bufferbloat | low standing latency |
-| Shallow-buffer sharing | polite | v1: aggressive vs. CUBIC |
+| Shallow-buffer sharing | yields to competitors | v1: holds a disproportionate share |
 
 ## Enabling it
 
-BBR ships as a module in every mainstream distro kernel. Pair it with the **fq** qdisc — BBR is a *pacing* algorithm, and fq implements per-flow pacing in the qdisc layer (since 4.13 BBR can fall back to internal TCP-layer pacing, but fq is the recommended pairing):
+BBR ships as a module in mainstream distribution kernels. It is a **pacing** algorithm and is paired with the **fq** queueing discipline, which implements per-flow pacing in the qdisc layer. Since Linux 4.13 BBR can fall back to pacing inside the TCP layer, but fq remains the documented pairing:
 
 ```bash
 modprobe tcp_bbr
@@ -51,34 +70,42 @@ sysctl net.ipv4.tcp_available_congestion_control
 sysctl net.ipv4.tcp_congestion_control
 ```
 
-Persist via `/etc/sysctl.d/90-bbr.conf`. This affects **outbound** connections from this host — it's a sender-side change, which is why it's popular on servers pushing data to far-away or lossy clients.
+The settings persist via `/etc/sysctl.d/90-bbr.conf`. The change affects **outbound** connections from the host only — congestion control is a sender-side decision, which is why the setting is applied on servers pushing data toward distant or lossy clients. It is tunable per network namespace, so a single container's egress can be switched before the host default is.
 
-## Measuring what it does
+## Observing the model
 
-`iperf3` can select the algorithm per test, so you can A/B on the same path:
+`iperf3` selects the algorithm per test, which permits an A/B comparison over one path:
 
 ```bash
 iperf3 -c remote-host -C cubic -t 30
 iperf3 -c remote-host -C bbr   -t 30
 ```
 
-On a clean LAN the numbers will tie. Add distance or loss (or emulate it: `tc qdisc add dev eth0 root netem loss 1% delay 40ms`) and BBR pulls away. To see BBR's model live on a real connection, `ss -ti` prints the internal state per socket:
+On a short, clean local path the two are expected to tie: with negligible RTT and no loss, CUBIC's heuristic is not being misled. Adding distance or loss — or emulating both with `tc qdisc add dev eth0 root netem loss 1% delay 40ms` — separates them. `ss -ti` prints the live per-socket model:
 
 ```
 bbr:(bw:9.2Gbps,mrtt:4.3ms,pacing_gain:1.25,cwnd_gain:2)
 pacing_rate 11.4Gbps delivery_rate 9.1Gbps ...
 ```
 
-`bw` is the BtlBw estimate, `mrtt` the min-RTT, and the gains tell you which phase the flow is in. Watching `mrtt` stay flat while a CUBIC flow's RTT balloons is the whole argument in one line.
+`bw` is the BtlBw estimate, `mrtt` the minimum RTT, and the gains identify the current phase. A `pacing_gain` above unity indicates a probing interval within PROBE_BW. **The diagnostic worth watching is `mrtt`: if it stays flat while a competing CUBIC flow's RTT grows, the queue is being kept short.**
 
-## The fairness fight, and where v3 stands
+## Fairness, and the version shipped upstream
 
-BBRv1's clean model has a dirty secret: because it ignores loss entirely, a BBRv1 flow sharing a **shallow-buffered** bottleneck with CUBIC flows keeps sending through their loss signals and can take a grossly unfair share — measurement studies showed BBRv1 claiming a fixed ~40% of such links regardless of how many CUBIC flows competed, plus elevated retransmit rates from the loss it shrugged off. **BBRv2** answered by folding loss and **ECN** signals back into the model as guardrails; **BBRv3** (presented at IETF 117, 2023) fixed further bugs and is what Google deploys fleet-wide for google.com and YouTube traffic, reporting ~12% fewer retransmits than v2.
+Because BBRv1 excludes loss from its model, a BBRv1 flow sharing a **shallow-buffered** bottleneck with CUBIC flows continues sending through the loss signal that causes the CUBIC flows to back off. Measurement studies reported a BBRv1 flow holding a share of such a link that does not shrink as the number of competing CUBIC flows grows, together with elevated retransmission rates from the loss it ignored. **BBRv2** reintroduced loss and explicit congestion notification (ECN) signals into the model as bounds on the sending rate. **BBRv3** carries further fixes and is the version Google has described deploying on its own traffic; the sources cited here give no measured v3-versus-v2 comparison.
 
-The upstream status deserves honesty, because blog posts routinely get it wrong: **mainline Linux still ships BBRv1** as `tcp_bbr` in 2026. Google said in 2023 it intended to upstream v3, but the code lives in the [google/bbr](https://github.com/google/bbr) repository's `v3` branch (periodically rebased onto recent kernels, e.g. v6.13.x) and in patched distro kernels like XanMod and Zen — not in `net-next`. If a tutorial claims `sysctl` gave you "BBRv3" on a stock kernel, it didn't.
+The upstream status is frequently misreported: **mainline Linux still ships BBRv1 as `tcp_bbr` in 2026.** Google stated in 2023 an intention to upstream v3, but the code resides in the `v3` branch of the [google/bbr](https://github.com/google/bbr) repository, periodically rebased onto recent kernels, and in patched distribution kernels such as XanMod and Zen — not in `net-next`. A `sysctl` on a stock kernel does not select v3.
 
-## Should you switch?
+## Applicability
 
-BBR is a clear win for senders pushing bulk data over long-RTT or lossy paths — CDN edges, cross-region replication, download servers with mobile clients — and it self-inflicts far less latency than CUBIC on buffered links. Skip it (or test carefully) when your traffic mostly competes with CUBIC flows across a shallow-buffered bottleneck you also care about, and don't expect miracles inside a low-latency datacenter, where CUBIC was never the problem. It's per-namespace tunable, so you can enable it for one container's egress before touching the host default.
+The measured benefit concentrates on senders pushing bulk data over long-RTT or lossy paths: content-delivery edges, cross-region replication, download servers serving mobile clients. On such paths BBR sustains substantially higher throughput than CUBIC while holding the bottleneck queue, and therefore RTT, short. Inside a low-latency datacenter the loss heuristic was not the limiting factor, and no comparable gain should be assumed.
 
-**Try next:** run the `iperf3 -C cubic` vs `-C bbr` comparison through `netem` with `loss 1% delay 40ms` on a veth pair, watching `ss -ti` in a loop on the sender — you should see CUBIC's cwnd sawtooth and BBR's steady `bw` estimate side by side.
+## Pitfalls
+
+- Enabling `tcp_bbr` without setting `net.core.default_qdisc=fq` leaves pacing to the TCP layer fallback; on kernels before 4.13 there is no such fallback, and the burst behaviour is not what the model assumes.
+- Setting `net.ipv4.tcp_congestion_control=bbr` on a host that only *receives* bulk data changes nothing measurable, because the algorithm governs the sender.
+- Benchmarking BBR against CUBIC on a clean local link produces a tie and is read as "BBR does not work"; the heuristic BBR replaces only misfires under loss or long RTT.
+- A BBRv1 sender sharing a shallow-buffered bottleneck with CUBIC traffic that also matters will hold a disproportionate share and raise retransmissions on that link.
+- Treating `ss -ti` output as a throughput report conflates `pacing_rate` with achieved rate; `delivery_rate` is the measured figure, and `bw` is a windowed maximum, not an instantaneous value.
+- Assuming a `sysctl`-enabled BBR on a distribution kernel is BBRv3: mainline ships v1, so the v2 and v3 loss and ECN bounds are absent unless a patched kernel is running.
+- Reading a rise in `mrtt` as path degradation when it can equally indicate that the PROBE_RTT interval has not recently produced a fresh minimum sample.

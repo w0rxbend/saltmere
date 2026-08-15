@@ -1,8 +1,8 @@
 ---
-title: "bootc: ship your Linux host as a container image, roll it back like one"
+title: "bootc: shipping a Linux host as a container image"
 date: 2026-07-31
 track: linux-tools
-summary: "bootc lets you build a whole bootable OS as an OCI image, push it to a registry, and switch a running machine to it atomically — with a one-command rollback to the previous image. It's the same Containerfile you already know, applied to the host instead of an app."
+summary: "bootc builds an entire bootable operating system as an OCI image, transports it through a registry, and switches a running machine onto it transactionally, with rollback to the previous deployment. The build input is an ordinary Containerfile; the target is the host rather than an application."
 reading_time: 5
 tags: [bootc, ostree, containers, immutable, atomic-updates]
 sources:
@@ -14,14 +14,16 @@ sources:
     url: "https://coreos.github.io/rpm-ostree/container/"
 ---
 
-Configuration management exists because a running Linux box drifts: packages get layered on by hand, `/etc` accumulates edits, and two machines that started identical slowly diverge. **bootc** attacks that from the other end. Instead of converging a mutable host toward a desired state, you *build* the desired state as an OCI container image and boot the machine from it. Updates are `podman pull` for the whole operating system, and rollback is picking the previous image at the bootloader.
+**Gist.** A running Linux host drifts: packages are layered by hand, `/etc` accumulates edits, and two machines that began identical diverge without any record of how. bootc removes the convergence problem by making the operating system a build artefact — an Open Container Initiative (OCI) image — that is pulled from a registry and checked out as an OSTree deployment, so an update is a whole-image replacement staged beside the running system and rollback is the selection of the previous deployment. The cost is that the image is the only supported channel for host state: anything not baked into it must live in mutable directories that the image model deliberately does not own, and every change to the host requires a rebuild, a push, and a reboot.
 
-## The model in one breath
+## Two mechanisms, cleanly separated
 
-bootc reuses the container toolchain as the *build and transport* mechanism, and OSTree underneath as the *on-disk deployment* mechanism. You write a `Containerfile` that `FROM`s a bootc base image and adds whatever you want baked in. The result isn't run by a container runtime — bootc pulls it (via skopeo), checks it out as an OSTree deployment, and wires it into the bootloader. Because the running system *is* the image, there's a clean definition of "correct", and updates are transactional: they stage into a new deployment and take effect on reboot, leaving the old one intact to roll back to.
+bootc does not invent a packaging format. It uses the **container toolchain as build and transport** and **OSTree as the on-disk deployment mechanism**. Those roles do not overlap, and keeping them apart is what makes the model legible.
+
+The build side is an ordinary `Containerfile` whose base is a bootc base image. Every layer, cache and registry behaviour that applies to application images applies here unchanged, because the artefact genuinely is an OCI image.
 
 ```dockerfile
-# Containerfile — this is your whole OS, as an image
+# Containerfile — the entire operating system, expressed as an image
 FROM quay.io/fedora/fedora-bootc:42
 
 RUN dnf -y install tmux vim htop chrony && dnf clean all
@@ -29,36 +31,57 @@ COPY chrony.conf /etc/chrony.conf
 COPY sshd_hardening.conf /etc/ssh/sshd_config.d/10-hardening.conf
 ```
 
-Build and push it like any other image:
-
 ```bash
 podman build -t registry.example.com/fleet/edge-node:1.4 .
 podman push registry.example.com/fleet/edge-node:1.4
 ```
 
-## Switching a machine onto it
+The deployment side is where the container runtime stops being involved. **The image is never executed by a container runtime on the target host.** bootc fetches it over the ordinary registry protocol, checks its contents out as an OSTree deployment, and wires that deployment into the bootloader. The running system is a checkout of the image rather than a process isolated from the host — the isolation primitives that define a container at runtime (namespaces, cgroups) play no part.
 
-On a host already running a bootc image, point it at yours and reboot:
+## The state machine of an update
+
+The property that matters operationally is that **an update never mutates the deployment that is currently booted**. The sequence has three distinguishable states:
+
+1. **Booted.** One deployment is live. Its content corresponds to a specific image digest, reported by `bootc status`.
+2. **Staged.** `bootc upgrade` resolves the tag the host is tracking, pulls the image if the digest changed, and materialises a *new* deployment on disk. The booted deployment is untouched. A crash, a power loss or an operator's change of mind at this point leaves the machine exactly as it was.
+3. **Applied.** A reboot makes the staged deployment the default. The previous deployment remains on disk as the rollback target.
+
+```bash
+bootc status      # booted image and digest; whether a deployment is staged
+bootc upgrade     # resolve the tag, pull, stage a new deployment
+bootc rollback    # make the PREVIOUS deployment the default again
+```
+
+Moving a host onto a different image — a different repository or tag rather than a newer build of the same tag — is `bootc switch`:
 
 ```bash
 sudo bootc switch registry.example.com/fleet/edge-node:1.4
 sudo systemctl reboot
 ```
 
-From then on, `bootc upgrade` fetches whatever the tag now points to, stages it, and (with `--apply`) reboots into it. The commands that matter day to day:
+`bootc upgrade --apply` collapses the stage-and-reboot pair into one command.
 
-```bash
-bootc status      # what image am I booted into, and what's staged?
-bootc upgrade      # pull + stage the newest image for this tag
-bootc rollback     # make the PREVIOUS deployment the default again
-```
+The consequence for recovery is structural rather than procedural. Because a bad update did not modify anything in the previous deployment, recovery does not require determining what the update touched; the previous deployment is still present and bootable. This is what makes an automated health check paired with `bootc rollback` a coherent design: the rollback target is known before the upgrade begins, not reconstructed after the failure.
 
-`bootc rollback` is the part that changes how the 3 a.m. call goes. A bad update didn't mutate your host in place — the previous deployment is still on disk — so recovery is "boot the last image" rather than "figure out what the update touched". Many setups pair it with a health check that auto-rolls-back if the new boot doesn't come up clean.
+## Relationship to rpm-ostree
 
-## How it relates to what you know
+bootc and rpm-ostree share the same OSTree backing store. When the source of a deployment is a container image, `rpm-ostree upgrade` and `bootc upgrade` are effectively equivalent operations; Fedora's OstreeNativeContainerStable change made the container-native path the stable delivery mechanism.
 
-If you've used **rpm-ostree** or Fedora Silverblue, bootc shares the same OSTree backing store; when the source is a container image, `rpm-ostree upgrade` and `bootc upgrade` are effectively equivalent. The difference is philosophy: bootc enforces a *pure* image model and errors if you try to mutate system state client-side, where rpm-ostree still permits package layering. That strictness is the point — it's what makes every machine on a tag bit-for-bit reproducible. This is the same mechanism behind RHEL "image mode" and Fedora/CentOS bootc images, so it's not a science project; it's shipping.
+The difference is in what each tool permits after boot. **rpm-ostree allows client-side package layering — modifications applied on the machine, on top of the image.** bootc offers no client-side layering operation: the supported way to add a package is a derived image. The practical effect is on the identity of a fleet: with layering permitted, a tag identifies a *base* that hosts may have extended differently; with layering refused, the digest a host reports in `bootc status` fully determines the operating system content. The same mechanism underlies Red Hat Enterprise Linux (RHEL) "image mode" and the Fedora and CentOS bootc images.
 
-One honest limit: everything you want on the host goes in the image, so per-machine state (databases, `/var`, secrets) lives outside it and you plan for that explicitly. bootc gives you an immutable, reproducible *OS*; your stateful data is still your problem to manage.
+## What the image does not cover
 
-**Try next:** in a throwaway VM, `bootc switch` to a base image, then build a derived image that just adds `htop`, push it, `bootc upgrade`, reboot, and confirm `htop` is present. Then run `bootc rollback` and watch it vanish on the next boot — that round trip is the entire value proposition in five minutes.
+The model applies to the operating system, not to the machine's data. Per-machine state — databases, the contents of `/var`, secrets — is outside the image by construction, and must be planned for as a separate concern with its own backup and migration story. An image rollback returns the operating system to a previous state; it does not return data written by the newer software to a schema the older software understands.
+
+A second consequence of the pure image model is latency of change. **Every host modification, including a one-line configuration edit, is a rebuild, a registry push, an upgrade and a reboot.** There is no supported in-place edit that survives as part of the defined system state.
+
+A minimal end-to-end exercise in a disposable virtual machine: `bootc switch` to a base image, build a derived image adding a single package, push it, run `bootc upgrade`, reboot, confirm the package is present, then `bootc rollback` and confirm it is absent after the next boot. That round trip exercises transport, staging, activation and reversal.
+
+## Pitfalls
+
+- **Expecting a configuration edit to persist as system state.** A file changed by hand on a booted deployment is not part of the image; the next upgrade replaces the deployment with a checkout of the new image, and any change not expressed in the `Containerfile` is absent from it.
+- **Treating rollback as a data rollback.** `bootc rollback` restores the previous operating system deployment. Data written to `/var` by the newer release remains as the newer release left it, including schema migrations the older release cannot read.
+- **Tracking a mutable tag across a fleet.** `bootc upgrade` resolves whatever the tag currently points to, so two hosts upgrading at different times can land on different digests from the same tag. `bootc status` reports the digest; the tag alone does not identify the running system.
+- **Assuming a container runtime is involved at boot.** The image is checked out as an OSTree deployment, not run. Debugging steps that depend on `podman` inspecting a running container do not apply to the host itself.
+- **Looking for a client-side package-layering command under bootc.** bootc exposes none; the equivalent operation is a new derived image and an upgrade.
+- **Ignoring registry availability in the update path.** An upgrade requires reaching the registry to resolve the tag and fetch the image; a host that cannot reach it stays on its current deployment rather than partially updating.

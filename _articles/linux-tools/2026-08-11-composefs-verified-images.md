@@ -2,7 +2,7 @@
 title: "composefs: content-addressed, tamper-evident root filesystems"
 date: 2026-08-11
 track: linux-tools
-summary: "composefs stacks EROFS, overlayfs, and fs-verity into a read-only mount whose files are content-addressed and shared across images, with the whole tree pinned to a single root digest. It's the integrity layer under ostree and bootc's immutable-OS story."
+summary: "composefs stacks EROFS, overlayfs, and fs-verity into a read-only mount whose files are content-addressed and shared across images, with the whole tree pinned to a single root digest. It is the integrity layer under ostree and bootc's immutable-OS story."
 reading_time: 6
 tags: [composefs, fs-verity, erofs, ostree, immutable, integrity]
 sources:
@@ -18,27 +18,33 @@ sources:
     url: "https://bootc.dev/bootc/experimental-composefs.html"
 ---
 
-An immutable OS makes a promise: the running root filesystem is exactly the one that was built, byte for byte, and nothing has swapped a binary underneath you. dm-verity keeps that promise for a whole block device, but it does so by freezing an image — you lose the file-level sharing that makes container storage cheap. **composefs** is the project that squares that circle. Its tagline says it plainly: "the reliability of disk images, the flexibility of files."
+**Gist.** An immutable operating system asserts that the running root filesystem is byte-for-byte the one that was built; device-mapper verity (dm-verity) enforces that assertion over a whole block device, but only by freezing an image, which forfeits the file-level sharing that makes container storage cheap. composefs obtains the same assertion at file granularity by splitting a tree into an Enhanced Read-Only File System (EROFS) metadata image whose inodes redirect, through overlayfs, into a content-addressed object store, with fs-verity digests chaining every object back to **a single root digest**. The cost is a three-layer mount whose integrity holds only when each link of that chain is enabled — an unverified mount is structurally identical to a verified one and fails open.
 
-## What it actually is
+## Composition, not a new filesystem
 
-composefs is not a filesystem driver of its own. It stores no persistent data. Instead it composes three existing kernel features into a read-only mount:
+composefs implements no on-disk format of its own and stores no persistent data. It composes three existing kernel features into one read-only mount:
 
-- **EROFS** holds the *metadata* layer — the directory tree, inodes, permissions, and xattrs — as a compact, mmap-friendly image. Crucially, this EROFS image contains no file *contents*.
-- **overlayfs** is the mount mechanism. Each metadata inode carries a `trusted.overlay.redirect` xattr pointing at where the real bytes live, and overlayfs resolves those redirects at read time.
-- **fs-verity** (optional) provides the integrity chain, validating both the metadata image and each backing file against an expected digest.
+- **EROFS** holds the *metadata* layer — directory tree, inodes, permissions, extended attributes (xattrs) — as a compact, mmap-friendly image. This image contains **no file contents**.
+- **overlayfs** is the mount mechanism. Each metadata inode carries a `trusted.overlay.redirect` xattr naming where the real bytes live, and overlayfs resolves those redirects at read time.
+- **fs-verity** supplies the integrity chain, validating both the metadata image and each backing file against an expected digest. It is optional, and that optionality is the security-relevant part.
 
-The file bytes themselves live in a separate **content-addressed object store** — a directory of files named by their hash, exactly like ostree or a container layer store. Because two images that contain the same `/usr/bin/bash` redirect to the same object, that file exists once on disk and is cached once in the page cache, no matter how many mounted images reference it. You get disk and RAM deduplication *across* images while each image keeps its own independent metadata.
+File bytes live in a separate **content-addressed object store**: a directory of files named by their hash, on the same model as ostree or a container layer store. Two images containing the same `/usr/bin/bash` redirect to the same object, so that file occupies one copy on disk and **one set of page-cache pages**, irrespective of how many mounted images reference it. Deduplication is therefore *across* images, while each image retains independent metadata — a rename or permission change in one image rewrites only its EROFS blob.
 
-## Why the digest matters
+## The digest chain
 
-Here is the property that makes composefs interesting for security, not just storage. Every backing object can have fs-verity enabled, so the kernel computes and enforces a Merkle-tree digest for its contents on every read. The metadata image records the expected per-file digests, so a swapped object is rejected. And the metadata image *itself* has a single fs-verity digest — a root digest that covers the entire directory structure and, transitively, every file it points at.
+fs-verity computes a Merkle tree over a file's contents and has the kernel enforce it on every read, so corruption is detected at page-fault time rather than at open time. composefs uses this at two levels. Each backing object may have fs-verity enabled, and the metadata image records the expected per-file digest, so **a substituted object is rejected at read**. The metadata image in turn has its own fs-verity digest, a **root digest covering the entire directory structure and, transitively, every file the structure points at**.
 
-That means you can reduce "is this root filesystem the one I built?" to a single hash comparison. Pin the root digest — in an initrd, in a signed commit, in firmware — and any tampering anywhere in the tree changes it. This is the integrity guarantee of dm-verity with the file-level sharing of a content store.
+The consequence is that the question "is this root filesystem the one that was built?" reduces to one hash comparison. Pinning the root digest — in an initramfs, in a signed commit, in firmware — makes any modification anywhere in the tree observable as a changed digest. The guarantee is dm-verity's; the storage layout is a content store's.
 
-## Building and mounting one
+| Layer | Role | Verified by |
+|-------|------|-------------|
+| EROFS image | directory tree + metadata | fs-verity digest of `image.cfs` |
+| overlayfs | mount / redirect resolution | — (mechanism) |
+| Object store | file contents, deduplicated | per-file fs-verity digests |
 
-The tooling ships in the `composefs` package (the C library is `libcomposefs`); as of 2026 the project sits at the stable 1.0.x series (v1.0.8, January 2025), with the userspace helpers below. Start from an ordinary directory tree:
+## Building and mounting
+
+The tooling ships in the `composefs` package; the C library is `libcomposefs`. Construction begins from an ordinary directory tree:
 
 ```sh
 # Build a metadata image and populate a content-addressed object store.
@@ -48,32 +54,33 @@ mkcomposefs --digest-store=objects /path/to/rootfs image.cfs
 
 # Print the root digest that covers the whole tree.
 mkcomposefs --print-digest-only /path/to/rootfs
-# -> sha256:9a5f...c17
+# -> 9a5f...c17
 
 # Mount it, resolving file contents out of ./objects.
 sudo mount -t composefs -o basedir=objects image.cfs /mnt
 ```
 
-The mount above trusts the local files. To make it *verified*, hand `mount.composefs` the expected root digest and let it refuse to mount anything else:
+That mount trusts whatever is on local disk: it reads `image.cfs` as given and follows its redirects. Verification requires handing `mount.composefs` the expected root digest, which makes the mount itself the enforcement point:
 
 ```sh
 sudo mount.composefs -o basedir=objects,digest=9a5f...c17 image.cfs /mnt
 ```
 
-The `digest=` option validates `image.cfs` against that fs-verity digest before use and automatically turns on verity checking, establishing a trust chain from the root digest down to individual files. Going further, `-o verity` requires that *every* file in the image carry an fs-verity digest and that each backing object match it — that mode needs a kernel with file-backed EROFS verity support (6.6 or newer).
+`digest=` validates `image.cfs` against that fs-verity digest **before use** and turns on verity checking, establishing the chain from root digest down to individual files; a mismatched image fails the mount rather than producing a subtly wrong tree. The stricter `-o verity` requires that *every* file in the image carry an fs-verity digest and that each backing object match it. That mode depends on the running kernel supporting verity checking through overlayfs; where that support is absent the mount fails rather than falling back to an unverified tree.
 
-| Layer | Role | Verified by |
-|-------|------|-------------|
-| EROFS image | directory tree + metadata | fs-verity digest of `image.cfs` |
-| overlayfs | mount / redirect resolution | — (mechanism) |
-| Object store | file contents, deduplicated | per-file fs-verity digests |
+## Adoption
 
-## Where it's being adopted
+composefs was designed with ostree in mind, and ostree is where it landed first. ostree can generate composefs metadata for a commit (`--generate-composefs-metadata`), storing the digest as commit metadata so that it falls inside the region covered by the commit's signature. At boot, `ostree prepare-root` reads `ostree/prepare-root.conf`; its `[composefs]` section decides whether `/` is mounted as a composefs image and whether the expected digest must carry a valid signature. One documented pattern uses a transient per-build keypair: sign the digest, embed the public key in the initramfs, discard the private key. The result is a verified, read-only `/usr`.
 
-composefs was designed with ostree in mind, and that is where it has landed first. ostree can generate composefs metadata for a commit (`--generate-composefs-metadata`), storing the digest under `ostree.composefs.v0` so it is covered by the commit's signature. At boot, `ostree prepare-root` reads `ostree/prepare-root.conf` and, depending on the `composefs` setting — `enabled = yes`, `signed`, or `verity` — mounts `/` as a composefs image and can require an Ed25519 signature over the expected digest. A common pattern uses a transient per-build keypair: sign the digest, embed the public key in the initrd, discard the private key. The result is a fully verified, read-only `/usr`.
+**bootc**, covered previously in [bootc: shipping a Linux host as a container image](/articles/linux-tools/2026-07-31-bootc-bootable-containers), builds on this directly: bootc deploys Open Container Initiative (OCI) images by way of ostree, so composefs is the mechanism that renders a bootc host's root filesystem tamper-evident. bootc additionally carries an experimental composefs-native backend. Downstream this is the trajectory for the Fedora/CentOS Atomic and CoreOS family, where the content-addressed model already backing container images comes to back the operating-system root as well. On the container side, `containers/storage` can invoke `mkcomposefs` to mount image layers the same way.
 
-**bootc**, covered previously in [bootc: ship your Linux host as a container image](/articles/linux-tools/2026-07-31-bootc-bootable-containers), builds directly on this: bootc deploys OCI images via ostree, so composefs is the mechanism that makes a bootc host's root filesystem tamper-evident. bootc also has an experimental composefs-native backend that leans on it more directly. Downstream, this is the trajectory for the Fedora/CentOS Atomic and CoreOS family — the same content-addressed model that already backs their container images now backing the OS root itself. On the container side, `containers/storage` can use `mkcomposefs` to mount image layers the same way.
+composefs is not an alternative to EROFS or fs-verity but the glue that turns them into a deduplicating, end-to-end-verifiable root filesystem: EROFS supplies the compact metadata image, fs-verity the root digest, overlayfs the mount, and the object store the sharing.
 
-The through-line is that composefs is not a competitor to EROFS or fs-verity — it is the glue that turns them into a practical, deduplicating, end-to-end-verifiable root filesystem. EROFS gives it a compact metadata image, fs-verity gives it a root digest, overlayfs gives it a mount, and the content store gives it sharing.
+## Pitfalls
 
-**Try next:** build a composefs image from `/usr` on a test box with `mkcomposefs --digest-store=objects /usr usr.cfs`, note the `--print-digest-only` value, then mount it with `digest=` and confirm that flipping a single byte in an object file makes the read fail.
+- **Mounting without `digest=` verifies nothing.** The mount succeeds and the tree looks correct, because `basedir=` alone instructs overlayfs to follow redirects into whatever objects exist locally; the failure is silent by construction.
+- **`--digest-store` enables fs-verity only where the kernel supports it.** On a filesystem or kernel lacking fs-verity, objects are written without digests, and an image built there will not satisfy `-o verity` later.
+- **`-o verity` fails on a kernel without verity support in overlayfs**, not because any digest is wrong; the diagnostic points at the mount, not at the image.
+- **A modified file changes the root digest.** Any pinned digest held in an initramfs, a signed commit, or firmware becomes stale after a rebuild, and the mount refuses rather than degrading.
+- **Objects are shared across images.** Deleting an object because one image was removed breaks every other image whose metadata redirects to it; reads fail at the redirect, not at mount time.
+- **Metadata lives in EROFS, contents do not.** Copying `image.cfs` to another host without the corresponding object store yields a mountable tree whose files are unreadable.

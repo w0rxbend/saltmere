@@ -1,9 +1,9 @@
 ---
-title: "strace: watch what a process actually asks the kernel"
+title: "strace: observing what a process asks the kernel"
 date: 2026-07-26
 track: linux-tools
-summary: "When a program 'can't find the config' or just hangs, guessing wastes time. strace attaches via ptrace and prints every syscall a process makes — the file it really opened, the syscall it's stuck in, the errno it swallowed. Here's how it works, what it costs, and the flags worth memorizing."
-reading_time: 5
+summary: "When a program reports a missing configuration file or stops making progress, the source code describes intent rather than behaviour. strace attaches through ptrace(2) and prints every system call a process issues — the file actually opened, the call it is blocked in, the errno it discarded. This article covers the mechanism, its measured cost, and the flags that carry the work."
+reading_time: 6
 tags: [strace, ptrace, syscalls, debugging, linux-tools]
 sources:
   - title: "strace(1) — Linux manual page (man7.org)"
@@ -18,44 +18,50 @@ sources:
     url: "https://blog.packagecloud.io/strace-cheat-sheet/"
 ---
 
-A process says "config not found." You've checked the obvious path three times and it's right there. This is exactly the moment to stop reasoning about what the program *should* do and go look at what it *actually* does. `strace` prints every syscall a process makes, with arguments and return values, in real time. It doesn't care what the program thinks its logic is — it shows you the conversation with the kernel, which is the only conversation that determines behavior.
+**Gist.** A process's source code states what it intends to do; only its system calls determine what it does, and the two diverge whenever a fallback path, an environment variable or a swallowed error code intervenes. `strace` uses `ptrace(2)` to stop the traced process at every system-call boundary and print the call with decoded arguments and return value. The mechanism costs **two stops per system call**, each requiring a switch to the tracer and back, which on a syscall-bound workload dominates the runtime entirely.
 
-## How it works: ptrace, and what that costs you
+## Mechanism: ptrace and the per-syscall stop
 
-`strace` is built entirely on the `ptrace(2)` system call — the same primitive debuggers use to control a process's execution. When you `strace` a program, the kernel puts the tracee into a stopped state at every syscall entry and exit, hands control to `strace`, lets it inspect and print the syscall, then resumes the tracee. That's a full context switch to `strace` and back, twice per syscall.
+`strace` is built on the `ptrace(2)` system call, the same primitive that debuggers use to control another process's execution. The tracer establishes a tracing relationship with the tracee; thereafter the kernel places the tracee in a **stopped state at system-call entry and again at system-call exit**. At each stop the kernel hands control to `strace`, which reads the tracee's registers and memory to decode the call and its arguments, prints a line, and resumes the tracee.
 
-This is why a traced process runs slower — the man page says so directly: "a traced process runs slowly." Brendan Gregg measured the worst case with `dd`, a program that does nothing but issue syscalls back to back: unt­raced it finished in 0.1 seconds, traced it took 46 seconds — a **442x slowdown**. That's an extreme case (dd has essentially no work between syscalls, so the tracing overhead *is* the runtime), but it makes the point: strace is a debugging tool, not a profiler, and definitely not something to leave attached to a latency-sensitive production process without a plan. If you need low-overhead visibility into what syscalls a live service is making, reach for `perf trace` or eBPF-based tools first and save `strace` for the cases where you need the full argument/return detail on a process you can afford to slow down.
+The invariant that makes the output trustworthy is that **the tracee cannot make forward progress past a boundary until the tracer resumes it**. Nothing is sampled and nothing is dropped: every call in the selected set appears, in issue order, with the value the kernel returned. That same invariant is the cost. Each system call now involves the tracee stopping, the scheduler running `strace`, `strace` reading tracee memory, and the tracee being resumed — twice.
 
-One consequence of the ptrace mechanism worth knowing: it needs `CAP_SYS_PTRACE` (or to be tracing your own process as your own user), and containers commonly block it. Docker's default seccomp profile doesn't whitelist `ptrace`, so `strace` inside a stock container fails outright — not because of a missing Linux capability but because the seccomp filter drops the syscall before it reaches the kernel's permission check. `--cap-add=SYS_PTRACE` works because Docker's implementation also widens the seccomp whitelist when you add that capability, not because the capability alone was the blocker.
+The man page states the consequence plainly: "a traced process runs slowly." Brendan Gregg measured the extreme with `dd`, a program that issues system calls back to back with almost no computation between them, and reported a **442x slowdown** under tracing. The ratio is worst-case precisely because `dd` has no work to amortise the stops against; a process that spends most of its time in userspace computation is affected far less. The operational reading is that `strace` is a debugging tool rather than a profiler. For low-overhead visibility into the system calls a live service issues, `perf trace` and eBPF-based tools are the appropriate instruments; `strace` is for cases that require full argument and return detail on a process that can afford to be slowed.
+
+## Why it fails inside a container
+
+Tracing requires either `CAP_SYS_PTRACE` or that the tracer and tracee belong to the same user. Containers frequently block it, and **the blocking layer is seccomp rather than capabilities**. Docker's default seccomp profile does not whitelist `ptrace`, so the call is rejected by the filter before the kernel's permission check is ever reached. The observable symptom is that `strace` fails outright inside such a container even when the process is owned by the same user that would be permitted to trace it outside one. Whether a given deployment exhibits this depends on the runtime's profile: the failure is a property of the seccomp profile in force, not of containers as such.
+
+`--cap-add=SYS_PTRACE` restores tracing because **Docker's implementation also widens the seccomp whitelist when that capability is added**, not because the capability by itself was the obstacle. Diagnosing this as a capability problem leads to the right command for the wrong reason, and the reasoning fails on any runtime whose seccomp profile is configured independently of capabilities.
 
 ## The essential flags
 
-| Flag | What it does |
+| Flag | Effect |
 |---|---|
-| `-f` | Follow forks — trace child processes created via `fork`/`vfork`/`clone` too |
-| `-e trace=SET` | Restrict output to a syscall set: names (`open,read`), or classes like `%file`, `%network`, `%process`, `%signal`, `%memory`; prefix `!` to exclude |
-| `-p PID` | Attach to an already-running process (or comma-separated list of PIDs) |
-| `-c` | Suppress per-call output, print a summary: calls, errors, and time per syscall |
-| `-T` | Show wall-clock time spent inside each syscall, appended as `<seconds>` |
-| `-y` | Decode file descriptors — print the path/socket behind each fd argument |
-| `-s SIZE` | Max length of printed strings (default 32); raise it to stop truncated buffers |
-| `-o FILE` | Write trace output to a file instead of stderr |
-| `-tt` | Print a timestamp with microsecond precision on each line |
+| `-f` | Follow forks — trace children created via `fork`/`vfork`/`clone` |
+| `-e trace=SET` | Restrict output to a system-call set: names (`open,read`) or classes such as `%file`, `%network`, `%process`, `%signal`, `%memory`; a `!` prefix excludes |
+| `-p PID` | Attach to an already-running process; the option is repeatable to attach to several |
+| `-c` | Suppress per-call output and print a summary of calls, errors and time per system call |
+| `-T` | Append the wall-clock time spent inside each call as `<seconds>` |
+| `-y` | Decode file descriptors — print the path or socket behind each descriptor argument |
+| `-s SIZE` | Maximum printed string length, default 32; raising it prevents truncated buffers |
+| `-o FILE` | Write output to a file rather than standard error |
+| `-tt` | Prefix each line with a timestamp at microsecond precision |
 
 ## Reading the output
 
-Each line is `syscall(args) = return_value`, with errors decoded automatically:
+Each line has the form `syscall(args) = return_value`, with error returns decoded to their symbolic name and message:
 
 ```
 openat(AT_FDCWD, "/etc/myapp/config.yml", O_RDONLY) = -1 ENOENT (No such file or directory)
 openat(AT_FDCWD, "/etc/myapp.conf", O_RDONLY) = 3
-read(3, "port: 8080\nhost: 0.0.0.0\n", 4096) = 26
+read(3, "port: 8080\nhost: 0.0.0.0\n", 4096) = 25
 close(3)                                = 0
 ```
 
-Two things jump out immediately: the program tried `/etc/myapp/config.yml` first (and it doesn't exist), then fell back to `/etc/myapp.conf`, which it opened as fd 3 and read from. No amount of reading the source beats seeing this — maybe the fallback path was undocumented, maybe an env var pointed somewhere unexpected. The trace doesn't lie about it.
+The sequence establishes two facts that the source alone does not: the program attempted `/etc/myapp/config.yml`, received `ENOENT`, and **continued to a second path that is the file in effect**. Whether the fallback is undocumented or an environment variable redirected the lookup, the trace records the resolution rather than the intent.
 
-For multi-threaded or forked traces (`-f`), each line is prefixed with `[pid NNNN]`. Long-running syscalls that haven't returned yet show as `<unfinished ...>`, and completion appears later as `<... syscall resumed>`:
+Under `-f`, each line is prefixed with `[pid NNNN]`. A call that has not yet returned is printed as `<unfinished ...>` and its completion appears later as `<... syscall resumed>`, so lines belonging to one call may be separated by lines from other threads:
 
 ```
 [pid  8842] read(4, <unfinished ...>
@@ -63,34 +69,34 @@ For multi-threaded or forked traces (`-f`), each line is prefixed with `[pid NNN
 [pid  8842] <... read resumed>"GET / HTTP/1.1\r\n", 8192) = 342
 ```
 
-## Practical recipes
+## Recipes
 
-**"Why can't it find that file?"** Filter to filesystem calls and grep for the failing path:
+**Locating a failed path lookup.** Restricting to the filesystem class and filtering for `ENOENT` isolates every unsuccessful name resolution:
 
 ```bash
 strace -f -e trace=%file -o /tmp/trace.log ./myapp
 grep ENOENT /tmp/trace.log
 ```
 
-`%file` covers every syscall that takes a filename argument (`open`, `openat`, `stat`, `access`, `unlink`, `chmod`, and friends), so this catches path lookups even when the app uses a function you didn't expect.
+`%file` covers every system call that takes a filename argument — `open`, `openat`, `stat`, `access`, `unlink`, `chmod` and others — so the filter catches lookups performed through an unanticipated library function.
 
-**"Which config does it actually read?"** Attach to a running process (or trace from launch) and watch for opens against paths matching your config's basename:
+**Identifying the configuration file in effect.** Attaching to a running process and restricting to `openat` shows which of several candidate files is opened:
 
 ```bash
 strace -f -e trace=openat -p 12345
 ```
 
-If the binary is already running, `-p` attaches live — Ctrl-C detaches cleanly and leaves the process running. This is the fastest way to settle an argument about which of three `nginx.conf` copies is the one actually in effect.
+`-p` attaches to a live process; interrupting `strace` detaches and leaves the process running.
 
-**"Where is it hanging on a syscall?"** Attach and just watch the last line printed — whatever syscall is sitting `<unfinished ...>` (or simply the last line with no return value yet) is where it's stuck:
+**Locating a stall.** The call left without a return value is the one the process is blocked in:
 
 ```bash
 strace -f -T -p 12345
 ```
 
-Common culprits: `futex` (waiting on a lock), `read`/`recvfrom` on a socket with nothing arriving (network stall, not a hang), or `connect` taking forever (firewall silently dropping SYNs rather than rejecting). `-T` shows how long each completed call took, so a `connect` that finally returns after 21 seconds is a giveaway even without watching it stall live.
+Frequent cases are `futex` (blocked on a lock), `read` or `recvfrom` on a socket receiving nothing, and `connect` blocked because SYN packets are being dropped rather than rejected. `-T` records the duration of each completed call, so a `connect` that returns only after the kernel exhausts its SYN retransmissions is visible in a saved trace without observing the stall live.
 
-**"What's actually slow?"** Skip the firehose and get numbers:
+**Aggregating instead of reading every line.** The summary mode reports counts, error counts and time per system call:
 
 ```bash
 strace -f -c -o /tmp/summary.txt ./myapp
@@ -104,14 +110,20 @@ strace -f -c -o /tmp/summary.txt ./myapp
   9.88    0.007738           9       841           futex
 ```
 
-That `errors` column on `openat` — 12 failed opens — is often the whole investigation right there.
+The `errors` column is often the entire result: **12 failed `openat` calls out of 387** localises the problem without reading a single per-call line.
 
-**Bonus: decode the fds.** Add `-y` to any of the above and file descriptor numbers get annotated with what they point to:
+**Descriptor decoding.** Adding `-y` annotates each descriptor with its target, removing the need to correlate descriptor numbers against earlier `open` calls by hand:
 
 ```
-read(3</etc/myapp.conf>, "port: 8080\n", 4096) = 12
+read(3</etc/myapp.conf>, "port: 8080\n", 4096) = 11
 ```
 
-No more cross-referencing fd numbers against earlier `open` calls by hand.
+## Pitfalls
 
-**Try next:** run `strace -c -f` against a normal shell command you think you understand well (`ls -la`, `curl` to localhost) and read the summary before looking at per-call output — you'll usually find one syscall dominating that you didn't expect, which is the right instinct to build before you need it on something broken.
+- Attaching to a latency-sensitive process in production can slow it by orders of magnitude; on a syscall-bound workload the reported worst case is 442x, because every call costs two stops and the switches to the tracer and back that each one implies.
+- Tracing inside a container whose seccomp profile omits `ptrace` fails even for a same-user process, because the filter rejects the call before the capability check runs.
+- Adding `--cap-add=SYS_PTRACE` and concluding the capability was the missing piece misattributes the fix: Docker widens the seccomp whitelist alongside the capability, and the same reasoning does not transfer to a runtime that configures the two separately.
+- Omitting `-f` loses everything a forked or cloned child does, so a program that performs its real work in a subprocess produces a trace that ends shortly after `clone`.
+- The default `-s 32` truncates printed strings, so a path or buffer longer than 32 characters is shown cut off and can be misread as a different value.
+- Under `-f`, a call printed as `<unfinished ...>` has its return value on a later, non-adjacent line; reading the interleaved output as if each line were complete attributes results to the wrong call.
+- Descriptor numbers are reused after `close`, so without `-y` a descriptor correlated against an earlier `open` may refer to a different file by the time the line in question was written.

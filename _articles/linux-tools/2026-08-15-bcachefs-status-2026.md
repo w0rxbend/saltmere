@@ -2,8 +2,8 @@
 title: "bcachefs in 2026: Out of the Kernel Tree, Not Out of the Game"
 date: 2026-08-15
 track: linux-tools
-summary: "bcachefs was merged in Linux 6.7 (January 2024), marked \"externally maintained\" in 6.17, and deleted from the tree entirely in 6.18 after the Overstreet–Torvalds split — yet development sped up. It now ships as a DKMS module versioned with bcachefs-tools: 1.37 (March 2026) stabilized erasure coding and added Linux 7.0 support, and 1.38.6 (June 2026) dropped the experimental label altogether. What the filesystem actually offers, and how to run a tiered multi-device array today."
-reading_time: 6
+summary: "bcachefs was merged in Linux 6.7 (January 2024), marked \"externally maintained\" in 6.17, and deleted from the tree entirely in 6.18 after the Overstreet–Torvalds split — yet development continued out of tree. It now ships as a DKMS module versioned with bcachefs-tools: 1.37 (March 2026) stabilized erasure coding and added Linux 7.0 support, and 1.38.6 (June 2026) dropped the experimental label altogether. What the filesystem offers, and how to run a tiered multi-device array today."
+reading_time: 7
 tags: [bcachefs, filesystems, dkms, storage, copy-on-write]
 sources:
   - title: "Bcachefs removed from the mainline kernel — LWN.net"
@@ -18,39 +18,43 @@ sources:
     url: "https://www.phoronix.com/news/Bcachefs-1.37-Released"
 ---
 
-Few filesystems have had a stranger trajectory than **bcachefs**: a decade out of tree, merged into Linux 6.7 in January 2024 as the great experimental hope for a trustworthy copy-on-write filesystem, and deleted from the kernel again 23 months later — while simultaneously getting *better*. If you stopped tracking it during the mailing-list drama, the operator-relevant summary is: it now lives as a **DKMS module** shipped alongside `bcachefs-tools`, the pace of releases has increased, erasure coding went stable in **1.37** (March 15, 2026), and the **1.38.6** "performance release" (June 19, 2026) removed the experimental designation entirely. Whether you should trust it with data is a different question than whether it's interesting — it is now defensible on both counts, with caveats.
+**Gist.** bcachefs is a copy-on-write (CoW) filesystem that folds device tiering, replication, checksumming and encryption into a single B+tree-based on-disk format, removing the need for a stack of block-layer components beneath it. It was merged into Linux 6.7 in January 2024, frozen as "externally maintained" in 6.17, and removed from the tree in 6.18; it now ships as a Dynamic Kernel Module Support (DKMS) module versioned in lockstep with `bcachefs-tools`. The cost of that arrangement is an out-of-tree build dependency: every kernel upgrade must rebuild the module before the filesystem can be mounted, which converts a routine update into a potential boot failure.
 
-## The timeline, precisely
+## The timeline
 
 - **January 2024** — merged in Linux 6.7, flagged `EXPERIMENTAL`.
 - **November 2024** — Kent Overstreet suspended for the 6.13 cycle over a Code of Conduct violation (an abusive mailing-list exchange with a memory-management maintainer).
-- **June 2025** — repeated fights about shipping recovery features (notably `journal_rewind`) as late `-rc` "fixes" ended with Torvalds writing that "we'll be parting ways in the 6.17 merge window."
-- **September 2025** — Linux 6.17 marks bcachefs **externally maintained**: code frozen in-tree, patches no longer accepted. Overstreet announces the DKMS plan the same week.
-- **November–December 2025** — Torvalds removes the code for 6.18: "It's now a DKMS module, making the in-kernel code stale, so remove it to avoid any version confusion."
+- **June 2025** — repeated disputes about shipping recovery features (notably `journal_rewind`) as late `-rc` "fixes" ended with Torvalds announcing a parting of ways in the 6.17 merge window.
+- **September 2025** — Linux 6.17 marks bcachefs **externally maintained**: the in-tree code is frozen and patches are no longer accepted. The DKMS plan is announced around the same time.
+- **November–December 2025** — the code is removed for 6.18: "It's now a DKMS module, making the in-kernel code stale, so remove it to avoid any version confusion."
 
-Both sides had a point. Overstreet was landing genuine data-recovery fixes for real users at speeds the kernel's rc discipline doesn't allow; Torvalds runs a process where "fixes only after rc1" is non-negotiable for everyone. Out of tree, that tension simply vanishes: the module and the tools release together, versioned as one, on Overstreet's cadence. The cost is on you — a filesystem your kernel can't mount without a third-party module is a real operational dependency, exactly the class of risk ZFS users have managed for fifteen years.
+The structural conflict is a release-cadence mismatch. The kernel's rule after `-rc1` admits fixes only; bcachefs was landing data-recovery features that its users needed sooner than the next merge window. Out of tree the two release trains are one: **module and tools carry the same version number and are released together**, on the maintainer's cadence rather than the kernel's. The in-tree arrangement could not couple the two that way, since the userspace tools were never part of the kernel release.
 
-## What you actually get
+Subsequent releases moved quickly: **erasure coding was declared stable in 1.37 (March 2026)**, which also added Linux 7.0 support, and **1.38.6 (June 2026) removed the experimental designation**.
 
-Technically, bcachefs is the most ambitious general-purpose Linux filesystem design since ZFS. Everything lives in one **B+tree** implementation with unusually large nodes (256KiB default, log-structured internally), which is where much of its metadata performance comes from. On top of that:
+## On-disk structure
 
-- **Copy-on-write** with full data and metadata **checksumming** (crc32c default, xxhash/crc64 optional) and **compression** (lz4, zstd, gzip), settable per file, directory, or target.
-- **Replication**: `--replicas=2` mirrors every extent across devices; unlike mdraid it is extent-granular, so mixed-size devices work.
-- **Erasure coding**: Reed–Solomon striping instead of mirroring — declared stable in 1.37 after years behind an experimental flag. Newest major feature; treat it with proportional respect.
-- **Tiered storage**: devices carry labels; `foreground_target` picks where writes land, `background_target` where data is rewritten to in the background, `promote_target` where hot data is cached on read. This is the bcache heritage — SSD writeback caching in front of spinning disks, native to the filesystem.
-- **Encryption** with **ChaCha20/Poly1305** — authenticated encryption covering data *and* metadata, a stronger design than dm-crypt-under-a-filesystem or [fscrypt's](/articles/linux-tools/2026-07-31-fscrypt-per-directory-encryption) per-directory model.
-- **Snapshots** and subvolumes, writable and cheap.
+bcachefs stores every kind of metadata — inodes, dirents, extents, snapshots, allocation information — in **one B+tree implementation** rather than in separate purpose-built structures. Nodes are unusually large, **256 KiB by default**, and are **log-structured internally**: updates append to a node's journal area and are merged into sorted sets rather than rewriting the node in place. The consequence is that a small metadata update costs an append, not a 256 KiB write; the counterpart cost is that a read of a node must merge across its sorted sets.
 
-## Hands-on: a tiered array
+The feature set layered on this structure:
 
-On Debian/Ubuntu, Overstreet's apt repository (and, increasingly, distro archives — Arch and CachyOS package `bcachefs-dkms` directly) provides matched tools and module; the DKMS module builds against current kernels including [7.1](/articles/linux-tools/2026-08-13-linux-7-1-whats-new-for-ops), and note that recent releases are migrating code to Rust, so your kernel headers must have Rust support enabled (all major distro kernels now do):
+- **Copy-on-write** with **checksumming of both data and metadata** (crc32c by default; xxhash and crc64 available) and **compression** (lz4, zstd, gzip), each settable per file, per directory, or per target.
+- **Replication.** `--replicas=2` keeps every extent on two devices. Because the unit of replication is the **extent, not the device**, devices of unequal size can be combined without the wasted capacity an mdraid mirror of mismatched members incurs.
+- **Erasure coding.** Reed–Solomon striping in place of whole-extent mirroring, behind an experimental flag for years and **declared stable in 1.37**. It is the newest major feature and has the least field exposure of anything listed here.
+- **Tiered storage.** Devices carry labels, and three targets decide placement: `foreground_target` where writes first land, `background_target` where the rebalance thread rewrites data afterwards, and `promote_target` where extents read from slow devices are cached. This is the bcache lineage — solid-state writeback caching in front of rotational disks — implemented inside the filesystem rather than in a separate block-layer cache.
+- **Encryption** using **ChaCha20/Poly1305**, an authenticated construction covering **data and metadata**. This differs from dm-crypt beneath a filesystem and from [fscrypt's](/articles/linux-tools/2026-07-31-fscrypt-per-directory-encryption) per-directory model.
+- **Snapshots and subvolumes**, writable.
+
+## Configuring a tiered array
+
+On Debian and Ubuntu the upstream apt repository provides matched tools and module; Arch and CachyOS package `bcachefs-dkms` directly. The module builds against current kernels including [7.1](/articles/linux-tools/2026-08-13-linux-7-1-whats-new-for-ops). Recent releases migrate code to Rust, so **the kernel headers must have Rust support enabled** for the DKMS build to succeed.
 
 ```bash
 apt install bcachefs-tools bcachefs-dkms   # module builds via dkms
 modprobe bcachefs
 
-# One SSD in front of two HDDs, everything stored twice on HDD,
-# hot data cached and first-written on flash:
+# One SSD in front of two HDDs, every extent stored twice on HDD,
+# hot data cached on and first written to flash:
 bcachefs format \
   --label=ssd.ssd1 /dev/nvme0n1 \
   --label=hdd.hdd1 /dev/sda \
@@ -67,11 +71,13 @@ bcachefs subvolume create /mnt/data
 bcachefs subvolume snapshot /mnt/data /mnt/data.2026-08-15
 ```
 
-Writes land on the NVMe, get rewritten to the HDD pair (two copies) in the background, and reads promote hot extents back to flash. That configuration — one command, no lvmcache/mdraid/dm-crypt stack — is the honest pitch for bcachefs.
+The label syntax is `group.device`: `ssd.ssd1` places the NVMe device in a group named `ssd`, which the three target options then reference by group name. Writes land on the NVMe device, the rebalance thread rewrites them to the HDD pair as two copies, and reads of cold extents promote them back to flash. The mount specifies every member device explicitly, separated by colons.
 
-## Is it safe yet?
+## Repair and recovery
 
-The 2026 answer is "cautiously, with backups you'd want anyway." In its favor: the repair story is unusually strong — `bcachefs fsck` is aggressive about reconstructing from redundant metadata, every fsck pass has an online counterpart, and `journal_rewind` (the feature that triggered the 6.16 blowup) can roll the entire filesystem back to a pre-corruption point; 1.37 declared it safe for general use. Overstreet's stated bar is that filesystems should be "bulletproof," and user reports of unrecoverable filesystems have become genuinely rare. Against it: the DKMS dependency means a distro kernel upgrade can leave you unbootable if the module fails to build (keep a fallback kernel and a rescue image that carries the module — SystemRescue does since 13.x); erasure coding is one year past its stability declaration; and performance still trails XFS on some profiles (Overstreet's own June 2026 numbers show ~700K random-write IOPS where XFS hits 1M). For a NAS, a backup target, or any box where tiering and checksums matter more than the last 30% of IOPS, it's a credible choice in 2026. For the database volume, not yet — not because it eats data, but because it hasn't had the decade of boring that earns that job.
+Repair is where the implementation invests most. `bcachefs fsck` reconstructs from redundant metadata, **fsck can be run online** against a mounted filesystem rather than only offline, and `journal_rewind` — the feature whose late submission precipitated the 6.16 dispute — **rolls the whole filesystem back to a point before a corrupting event**.
+
+The countervailing facts are concrete. The DKMS dependency means a distribution kernel upgrade whose module build fails leaves the root filesystem unmountable, so a fallback kernel and a rescue image carrying the module are prerequisites rather than precautions. Erasure coding has been declared stable for months, not years. No published benchmark set separates bcachefs from XFS across a representative range of profiles, so the throughput gap is not quantified here. For a network-attached storage box or a backup target, where tiering and checksums are the deciding properties, the trade is defensible. For a database volume the accumulated operational history is not yet there.
 
 | | bcachefs (1.38.x) | btrfs | ZFS |
 |---|---|---|---|
@@ -81,4 +87,13 @@ The 2026 answer is "cautiously, with backups you'd want anyway." In its favor: t
 | Erasure coding / parity RAID | stable 2026 | RAID5/6 still unsafe | raidz, mature |
 | Native encryption | ChaCha20/Poly1305, all metadata | no | AES-GCM, partial metadata |
 
-**Try next:** build the three-device layout above out of loopback files (`truncate -s 10G a.img b.img c.img; losetup ...`), write 5GB, then `bcachefs fs usage -h` to watch the rebalance thread drain data from the "ssd" device to the "hdd" pair — then pull one loop device out from under a mounted filesystem and see what `-o degraded` and `bcachefs fsck` actually do.
+## Pitfalls
+
+- **A kernel upgrade whose DKMS build fails yields an unbootable system**, because the root filesystem cannot be mounted without the module. The symptom is a rescue shell with no root device; the cause is that the module is not part of the newly installed kernel package.
+- **Mismatched tool and module versions are unsupported.** bcachefs-tools and the DKMS module are released as one version; upgrading one alone (for example, tools from a distribution archive against a module built earlier) is outside the tested combination.
+- **Kernel headers built without Rust support fail the module build.** The symptom is a DKMS compile error rather than a mount failure, because recent releases contain Rust code.
+- **`--replicas=2` does not by itself pin copies to the slow tier.** Placement is governed by `foreground_target`, `background_target` and `promote_target`; without `background_target`, data written to flash is not rewritten to the rotational devices.
+- **Erasure coding has the least production exposure of any feature listed here**, having been declared stable only in 1.37 (March 2026).
+- **Omitting a member device from the colon-separated mount argument prevents a normal mount**; a degraded mount requires `-o degraded` and is a distinct, reduced-redundancy state.
+
+**Try next:** build the three-device layout above from loopback files (`truncate -s 10G a.img b.img c.img; losetup ...`), write 5 GB, then run `bcachefs fs usage -h` to observe the rebalance thread drain data from the `ssd` device to the `hdd` pair — then detach one loop device beneath the mounted filesystem and compare the behaviour of `-o degraded` and `bcachefs fsck`.

@@ -3,7 +3,7 @@ title: 'Incus: one CLI for system containers and VMs, the LXD fork that stuck'
 date: 2026-08-13
 track: linux-tools
 summary: Incus is the community fork of LXD, run by its original maintainers under Linux Containers. It manages full-OS system containers and KVM virtual machines behind one API — a different tool from Docker, not a competitor to it.
-reading_time: 5
+reading_time: 6
 tags:
 - incus
 - lxd
@@ -35,11 +35,11 @@ sources:
   url: https://zabbly.com/incus/
 ---
 
-When Canonical moved LXD in-house in 2023 and put it behind a CLA, the people who had built it forked it. **Incus** is that fork — Apache-2.0, hosted under the neutral **Linux Containers** project, and led by LXD's original maintainers. Two-plus years on it's the version the distros ship: it's in Debian, Ubuntu, Fedora and Arch, and it moves fast. The current line is **Incus 7.3** (released 31 July 2026) on a monthly cadence, with **7.0 LTS** for people who want stability over features.
+**Gist.** Workloads that need a whole operating system — an init system, users, cron, a package manager — do not fit the one-process, immutable-image model that application-container tooling assumes. Incus, the Apache-2.0 fork of LXD maintained under the Linux Containers project after Canonical moved LXD in-house in 2023 and placed it behind a contributor licence agreement (CLA), exposes **system containers built on LXC and full KVM virtual machines through a single command-line interface and REST application programming interface (API)**. The cost is that instances become long-lived mutable state: they are not rebuilt from a Dockerfile on every deploy, so their drift, snapshots and storage pools must be managed as machines rather than as artefacts.
 
 ## System containers are not application containers
 
-This is the whole point, so get it straight before the commands. Docker runs *application* containers: one process, an ephemeral layered image, torn down and rebuilt on every deploy. Incus runs *system* containers: a full userland booting `systemd` (or OpenRC), with its own users, cron, logs and package manager — a lightweight machine you `ssh` into, not an image you rebuild. It uses LXC underneath, so there's no second kernel and near-zero overhead.
+The distinction governs everything that follows. An *application* container runs one process from a layered image and is torn down and recreated on each deployment. A *system* container runs **a complete userland whose PID 1 is an init system — `systemd` or OpenRC — with its own user database, scheduled jobs, log files and package manager**. Incus drives these through LXC, so the guest **shares the host kernel**: there is no second kernel to boot and no hardware emulation layer.
 
 | Axis          | Docker (app container)   | Incus (system container)     |
 |---------------|--------------------------|------------------------------|
@@ -48,9 +48,9 @@ This is the whole point, so get it straight before the commands. Docker runs *ap
 | Feels like    | a packaged binary        | a small VM                   |
 | Also does VMs | no                       | yes, same CLI (`--vm`)       |
 
-The last row matters: the same `incus` command that launches a container launches a **KVM virtual machine**. When you need a different kernel or hard isolation, you add one flag — not a new tool.
+The final row carries the practical weight. **The same `incus launch` invocation that creates a container creates a KVM virtual machine when `--vm` is appended.** A virtual machine boots its own kernel and is isolated by the hypervisor rather than by namespaces and control groups, which is the configuration required when the workload needs a different kernel version, a kernel module the host does not provide, or a stronger isolation boundary. Moving between the two changes one flag, not the tooling.
 
-## The five commands you'll actually use
+## The core command set
 
 ```bash
 # one-time setup
@@ -68,14 +68,16 @@ incus shell web1                   # same thing, shorthand
 incus stop web1 && incus delete web1
 ```
 
-`incus exec` runs any command in the instance; pair it with `--` so flags go to the guest, not to Incus. Files move with `incus file push ./app.conf web1/etc/app.conf`.
+`incus exec` executes an arbitrary command inside the instance. **The `--` separator is load-bearing: without it, flags intended for the guest command are parsed by the Incus client instead.** File transfer is explicit — `incus file push ./app.conf web1/etc/app.conf` — because there is no build context to copy from.
 
-## Profiles: configuration you attach, not repeat
+`incus list` reports instance state, and the state machine is that of a machine rather than of a process: an instance is `STOPPED`, `RUNNING` or `FROZEN`, and `incus delete` refuses a running instance unless it is stopped first.
 
-A profile is a reusable bundle of instance config and devices. Every instance gets the `default` profile; you compose more on top. Define one once and stamp it across many instances:
+## Profiles: configuration attached rather than repeated
+
+A profile is a named, reusable bundle of instance configuration keys and device definitions. **An instance created without an explicit profile list receives the `default` profile; when a list is given, the profiles compose in the order stated**, so a later profile's key overrides an earlier one's.
 
 ```bash
-incus profile show default            # inspect what you start with
+incus profile show default            # the configuration applied by default
 incus profile create web
 incus profile edit web                # opens the YAML below
 ```
@@ -100,11 +102,11 @@ devices:
 incus launch images:debian/12 web2 --profile default --profile web
 ```
 
-That `web2` now has 2 CPUs, a 2 GiB cap, autostart, and a proxy device forwarding host port 80 to the container's 8080 — all from the profile, nothing repeated on the command line. Change the profile and every instance using it picks it up.
+The resulting `web2` has two CPUs, a 2 GiB memory cap, autostart at daemon start, a bridged network interface on `incusbr0`, and a **proxy device that listens on host port 80 and forwards to port 8080 inside the instance**. None of this is repeated per instance. **Editing the profile propagates to every instance that references it**, which is the reason profile changes are a fleet-wide operation and must be treated as such.
 
-## Snapshots, images, and one line on clustering
+## Snapshots, images and clustering
 
-Instances snapshot and clone cheaply, which makes them a good base for reproducible dev environments:
+Instances snapshot and clone through the storage pool, which makes them a usable base for reproducible development environments:
 
 ```bash
 incus snapshot create web1 clean
@@ -112,25 +114,26 @@ incus publish web1/clean --alias web-base   # freeze it into an image
 incus launch web-base web3                    # stamp new instances from it
 ```
 
-**Clustering:** `incus cluster` joins many hosts into one logical Incus that schedules instances across nodes and shares images — the same CLI and API, now spanning a fleet, with no external control plane.
+`incus publish` converts a snapshot into a local image with an alias; subsequent launches from that alias produce instances with identical starting state.
 
-Incus isn't a Docker replacement; reach for it when you want machines rather than packaged processes — CI runners, per-project dev boxes, or a homelab where containers and VMs live behind one command.
+**Clustering:** `incus cluster` joins multiple hosts into one logical Incus that schedules instances across member nodes and shares the image store, presented through the same CLI and API. No external control plane is introduced.
 
-**Try next:** `incus launch images:ubuntu/24.04 lab --vm`, then `incus launch images:ubuntu/24.04 lab-c` — put a VM and a container side by side, `incus list` them, and feel how little the VM flag costs you.
+Incus does not replace application-container tooling. It applies where the unit of work is a machine rather than a packaged process: continuous-integration runners, per-project development boxes, and hosts where containers and virtual machines are administered through one command.
 
-## Where it is in 2026
+## Release lines and packaging
 
-Incus does yearly LTS lines plus a monthly feature stream. As of August 2026 the current feature release is **Incus 7.1** (released May 29, 2026), and the supported LTS is the **7.0 series** (7.0.0, May 2026), with the older 6.0 LTS still receiving fixes. On packaging: Incus is in Debian (since Debian 13) and available on Ubuntu, and for the newest builds the project points at the **Zabbly** repositories maintained by Stéphane Graber, which ship both the stable and LTS channels for Debian and Ubuntu.
+Incus publishes **a long-term-support (LTS) line alongside a frequent feature-release stream**; the LTS line receives fixes without the feature churn, which is the line distributions package. Incus is present in Debian (from Debian 13) and available on Ubuntu, Fedora and Arch. For builds newer than a distribution ships, the project points at the **Zabbly** repositories maintained by Stéphane Graber, which carry both the stable and LTS channels for Debian and Ubuntu.
 
-Install from Zabbly on a Debian/Ubuntu host:
+Installation from Zabbly on a Debian or Ubuntu host:
 
 ```sh
 curl -fsSL https://pkgs.zabbly.com/key.asc | sudo tee /etc/apt/keyrings/zabbly.asc
-sudo sh -c 'cat > /etc/apt/sources.list.d/zabbly-incus-stable.sources' <<'EOF'
+CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+sudo sh -c "cat > /etc/apt/sources.list.d/zabbly-incus-stable.sources" <<EOF
 Enabled: yes
 Types: deb
 URIs: https://pkgs.zabbly.com/incus/stable
-Suites: $(. /etc/os-release && echo $VERSION_CODENAME)
+Suites: $CODENAME
 Components: main
 Signed-By: /etc/apt/keyrings/zabbly.asc
 EOF
@@ -140,12 +143,20 @@ sudo incus admin init --minimal      # storage pool + default network, no prompt
 
 ## Migrating off LXD
 
-You don't dump and re-import. Incus ships **`lxd-to-incus`**, an official one-shot migrator that reads your running LXD's instances, profiles, storage pools, and networks and moves them over in place, leaving LXD stopped afterward:
+Migration is not a dump-and-reimport. Incus ships **`lxd-to-incus`**, an official one-shot migrator that reads the running LXD daemon's instances, profiles, storage pools and networks and transfers them in place, leaving LXD stopped afterwards:
 
 ```sh
 sudo lxd-to-incus          # interactive; verifies both daemons, then transfers state
 ```
 
-It refuses to run on configurations it can't translate cleanly, so it fails loudly rather than silently dropping data — read its preflight output before confirming.
+**The migrator refuses to run on configurations it cannot translate cleanly**, so an untranslatable setup surfaces as a failure during preflight rather than as silently missing data after the fact. The preflight output is the record of what will move.
 
-**Try next:** On a spare Debian/Ubuntu box, install Incus from Zabbly, `incus launch images:debian/13 t1` and `incus launch images:debian/13 t2 --vm`, then `incus list` and compare how fast each reaches `RUNNING`.
+## Pitfalls
+
+- Omitting `--` in `incus exec web1 ls -l` causes the Incus client to consume `-l` as its own flag; the guest command then runs without it, or the invocation errors on an unrecognised option.
+- Editing a shared profile changes every instance referencing it, including production instances that were never the target of the change — a memory limit lowered in `default` applies fleet-wide.
+- A quoted heredoc delimiter (`<<'EOF'`) suppresses shell expansion, so a `Suites:` line containing `$(. /etc/os-release && echo $VERSION_CODENAME)` is written literally into the `.sources` file and `apt update` fails to resolve the suite. Expand the codename before the heredoc, or leave the delimiter unquoted.
+- `incus delete` on a running instance is rejected; the instance must reach `STOPPED` first, which is why teardown is `incus stop` followed by `incus delete`.
+- A container shares the host kernel, so a guest requiring a kernel module absent on the host, or a different kernel version, will fail at runtime rather than at launch. That workload belongs in a `--vm` instance.
+- Treating system containers as immutable images leads to drift: package updates, log growth and local configuration accumulate inside a long-lived instance, and only an explicit `incus snapshot create` captures a recoverable point.
+- `incus publish` operates on a snapshot of an instance; publishing a running instance without first snapshotting captures whatever state the filesystem happens to be in.

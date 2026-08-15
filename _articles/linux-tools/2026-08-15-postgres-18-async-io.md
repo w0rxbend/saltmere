@@ -1,8 +1,8 @@
 ---
-title: "Postgres 18's Async I/O: io_uring Reaches Your Read Path"
+title: "Postgres 18 Asynchronous I/O: io_uring in the Read Path"
 date: 2026-08-15
 track: linux-tools
-summary: "PostgreSQL 18 (released September 25, 2025; now at 18.6 as of August 13, 2026) ships a real asynchronous I/O subsystem: a new io_method GUC with sync, worker (default, 3 I/O workers), and io_uring modes, effective_io_concurrency raised from 1 to 16, and a pg_aios view showing I/Os in flight. Sequential scans, bitmap heap scans, and vacuum reads get up to 2-3x faster on cold cache; writes and WAL are untouched until 19. The catch: io_uring needs a liburing-enabled build, and Docker's default seccomp profile blocks it."
+summary: "PostgreSQL 18 (released September 25, 2025; 18.6 as of August 13, 2026) ships an asynchronous I/O subsystem: an io_method setting with sync, worker (default, 3 I/O workers) and io_uring modes, effective_io_concurrency raised from 1 to 16, and a pg_aios view exposing I/Os in flight. Sequential scans, bitmap heap scans and vacuum reads benefit; writes and the write-ahead log are unchanged. io_uring requires a liburing-enabled build, and Docker's default seccomp profile blocks the required syscalls."
 reading_time: 6
 tags: [postgresql, io-uring, async-io, performance, databases]
 sources:
@@ -16,60 +16,78 @@ sources:
     url: "https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/"
 ---
 
-For thirty years, when a Postgres backend needed a page that wasn't in shared buffers, it called `pread()` and stopped dead until the kernel produced the bytes. The workarounds were indirect: `posix_fadvise()` hints, OS readahead heuristics, and hope. **PostgreSQL 18** — released September 25, 2025, and now at minor 18.6 (August 13, 2026) — finally lands the asynchronous I/O subsystem Andres Freund spent the better part of a decade building. Backends can now queue batches of reads and keep executing while the kernel fills buffers, and on Linux the mechanism underneath can be **io_uring** — the [two-ring submission/completion design](/articles/linux-tools/2026-07-26-io-uring-async-syscalls) that eliminates a syscall per I/O. On cold-cache scans, reputable benchmarks show 2–3x.
+**Gist.** Until PostgreSQL 18, a backend that needed a page absent from shared buffers issued a synchronous `pread()` and blocked until the kernel returned the bytes, leaving storage parallelism to `posix_fadvise()` hints and operating-system readahead. **PostgreSQL 18 adds an asynchronous I/O (AIO) subsystem**: a backend submits a batch of reads, continues executing, and collects completions later, with the submission mechanism selected by the **`io_method`** setting — including **io_uring**, the [two-ring submission/completion interface](/articles/linux-tools/2026-07-26-io-uring-async-syscalls) that removes a system call per I/O. The cost is a narrower deployment envelope: io_uring is a compile-time option, needs Linux 5.1 or later, and is blocked by the default container seccomp (secure computing mode) profile, so the portable mode remains a process pool that still performs ordinary blocking reads.
+
+PostgreSQL 18 was released September 25, 2025; the current minor release is 18.6, dated August 13, 2026. The subsystem is the result of work by Andres Freund carried over many release cycles.
 
 ## The three io_methods
 
-Everything hangs off one new GUC, **`io_method`** (restart required):
+All behaviour hangs off one setting, **`io_method`**, which requires a server restart to change.
 
-| `io_method` | Mechanism | Default? | Platform |
+| `io_method` | Mechanism | Default | Platform |
 |---|---|---|---|
-| `sync` | synchronous `pread()` + `posix_fadvise`, ~PG17 behavior | no | all |
+| `sync` | synchronous `pread()` plus `posix_fadvise`, equivalent to PostgreSQL 17 behaviour | no | all |
 | `worker` | pool of dedicated I/O worker processes (**`io_workers`**, default 3) | **yes** | all |
-| `io_uring` | one io_uring instance per backend, kernel completes reads in-ring | no | Linux 5.1+, built `--with-liburing` |
+| `io_uring` | one io_uring instance per backend; the kernel completes reads in-ring | no | Linux 5.1+, built `--with-liburing` |
 
-`worker` is the conservative default: backends hand read requests to shared I/O workers over shared memory, and it works on every OS. Three workers is deliberately modest — an NVMe-backed box doing heavy sequential work often wants 8–16 (`io_workers` is `postgresql.conf`-settable, no restart in 18.x for the count itself, but watch CPU on the workers). `io_uring` removes the middleman: each backend owns a submission/completion ring pair and the kernel writes completions directly, so there is no per-I/O process hop at all. In pganalyze's cold-cache test of a 3.5GB sequential scan, PG17 took 15.8s, PG18 `worker` 10.1s, and PG18 `io_uring` 5.7s — roughly 2.8x over the old read path.
+Under `worker`, a backend places a read request in shared memory and an I/O worker process performs the read on its behalf. The submitting backend is free to continue, but **the read itself is still a blocking `pread()`, merely executed in another process**, so the mechanism costs a process hop and shared-memory handoff per I/O and works on every supported operating system.
 
-Two related defaults moved: **`effective_io_concurrency`** jumped from 1 to **16**, and `maintenance_io_concurrency` is also 16. These now mean what they say — the number of I/Os Postgres itself keeps in flight — rather than being a `posix_fadvise` hint multiplier. `io_max_concurrency` (default -1 = auto, capped at 64) bounds per-backend in-flight I/O.
+Under `io_uring`, **each backend owns its own submission and completion ring pair**; requests are written into the submission queue and the kernel posts completions directly into the completion queue, so no separate PostgreSQL process participates. The per-I/O process hop disappears.
 
-## What's async, what isn't
+The relevant concurrency knobs moved with the subsystem. **`effective_io_concurrency` changed from 1 to 16**, and `maintenance_io_concurrency` is also 16. Both now denote the number of I/Os PostgreSQL itself keeps in flight, rather than acting as a multiplier on `posix_fadvise` hints. **`io_max_concurrency`** (default `-1`, meaning a value derived automatically from `shared_buffers` and `max_connections`) bounds in-flight I/O per backend.
 
-Read paths converted in 18: **sequential scans**, **bitmap heap scans**, and **vacuum** (including analyze's block sampling). That list is shorter than people assume: ordinary B-tree index scans and index-only scans still read synchronously, and *all writes* — WAL, checkpoints, backend flushes — remain the old code. This is deliberate sequencing, not a limitation of the design; PostgreSQL 19 (beta 3 shipped August 13, 2026) continues extending AIO coverage. So the wins concentrate where cold data meets big scans: analytics queries, `pg_dump`, vacuum on large tables, sequential-heavy batch jobs. A pgbench OLTP workload hitting hot shared buffers will barely notice.
+The pganalyze write-up reports a cold-cache sequential scan completing faster under both new methods than under the synchronous path, with `io_uring` ahead of `worker`. That is a single workload on a single storage device; it bounds nothing about other hardware, and no published benchmark separates the three methods across a range of storage types.
 
-## Turning it on and proving it works
+## Converted and unconverted paths
+
+The read paths converted in 18 are **sequential scans**, **bitmap heap scans**, and **vacuum**, including the block sampling performed by `ANALYZE`. Paths that remain synchronous include **ordinary B-tree index scans and index-only scans**, and **all write paths**: the write-ahead log (WAL), checkpoints, and backend buffer flushes. PostgreSQL 19 is in beta as of August 13, 2026; which further paths it converts is not settled by the 18 documentation.
+
+The consequence for workload selection follows directly from that list. Gains concentrate where **cold data meets large scans**: analytics queries, `pg_dump`, vacuum over large tables, sequential-heavy batch jobs. An OLTP (online transaction processing) workload whose working set is resident in shared buffers issues few physical reads and therefore has little for the subsystem to overlap.
+
+## Configuration and verification
 
 ```ini
 # postgresql.conf — requires restart
 io_method = 'io_uring'          # or 'worker'
-io_workers = 8                  # only used by io_method=worker
+io_workers = 8                  # used only by io_method=worker
 effective_io_concurrency = 32   # per-backend read window for scans
 shared_buffers = '8GB'
 ```
 
-Verification from psql:
+Verification from `psql`:
 
 ```sql
 SHOW io_method;
 SHOW server_version;            -- 18.6
 
--- watch I/Os in flight during a cold sequential scan
-SELECT pg_prewarm('big') \gset  -- or just seq scan something cold
+-- observe I/Os in flight during a cold sequential scan
 SELECT state, operation, count(*)
 FROM   pg_aios GROUP BY 1, 2;
 ```
 
-**`pg_aios`** is the new observability surface: one row per in-flight async I/O handle, with the operation (`readv`), target file, offset, length, and state. If it's empty during a cold multi-gigabyte `SELECT count(*)`, you are not actually doing async I/O — check `io_method` and whether the relation is already cached. `EXPLAIN (ANALYZE, BUFFERS)` shows `shared read` counts as before; the AIO win shows up as wall-clock time, not different plans. The cumulative view `pg_stat_io` (added in 16) also grew `read_bytes`/`write_bytes` columns in 18, so you can attribute I/O volume per backend type over time rather than eyeballing a single scan.
+**`pg_aios`** is the new observability surface: **one row per in-flight asynchronous I/O handle**, carrying the operation (`readv`), the target file, the offset, the length, and the handle state. Because the rows describe only I/Os currently outstanding, the view is empty whenever nothing is in flight — an empty result during a cold multi-gigabyte `SELECT count(*)` indicates either that `io_method` is `sync` or that the relation is already cached, not that the query is inexpensive.
 
-One packaging note: `io_uring` support is compile-time (`--with-liburing` / `-Dliburing=enabled`). The PGDG apt/yum packages ship with it; if `ALTER SYSTEM SET io_method = 'io_uring'` fails at startup with "not supported by this build," your binaries weren't linked against liburing.
+`EXPLAIN (ANALYZE, BUFFERS)` reports `shared read` counts exactly as before, and plan shapes are unchanged; **the effect of AIO appears as wall-clock time, not as a different plan**. The cumulative view `pg_stat_io`, introduced in PostgreSQL 16, gained `read_bytes` and `write_bytes` columns in 18, which allows I/O volume to be attributed per backend type over time rather than inferred from a single scan.
 
-## The Linux and container gotchas
+io_uring support is a build-time option (`--with-liburing`, or `-Dliburing=enabled` under Meson). The PGDG apt and yum packages are built with it. A binary built without it rejects the setting: `ALTER SYSTEM SET io_method = 'io_uring'` followed by a restart fails with a message stating the method is not supported by this build.
 
-`io_method = 'io_uring'` imports io_uring's operational baggage, which is nontrivial in containerized fleets:
+## Linux and container constraints
 
-- **Seccomp**: Docker's default profile has blocked `io_uring_setup`/`io_uring_enter`/`io_uring_register` since early 2023 (Docker 23.0, after a string of io_uring CVEs; containerd and Kubernetes' `RuntimeDefault` follow suit). Postgres in a container will fail to start with `EPERM` unless you ship a custom seccomp profile that allowlists the three syscalls — don't reach for `seccomp=unconfined`.
-- **Sysctl**: kernels ≥ 6.6 have `kernel.io_uring_disabled` (0/1/2). Hardened hosts set `2` (disabled entirely); `1` restricts creation to processes with `CAP_SYS_ADMIN` or a group named by `kernel.io_uring_group`. Check it before debugging anything else.
-- **RLIMIT_MEMLOCK**: on kernels older than 5.12 the rings count against locked memory, and Postgres creates one ring *per backend* — hundreds of connections can exhaust a stingy `memlock` ulimit at scale. Modern kernels account rings to memcg instead, so this is mostly a legacy-host concern.
+Selecting `io_method = 'io_uring'` imports io_uring's operational constraints into the database process.
 
-If any of these bite, `io_method = 'worker'` gets you most of the benefit with zero syscall exotica — it's plain `pread()` from worker processes, allowed everywhere. That's the pragmatic fleet default in 2026: `worker` universally, `io_uring` on bare-metal or VM hosts you control end-to-end.
+- **Seccomp.** Docker's default seccomp profile has blocked `io_uring_setup`, `io_uring_enter` and `io_uring_register` since Docker 23.0; containerd and the Kubernetes `RuntimeDefault` profile follow the same policy. A containerised PostgreSQL configured for io_uring fails at startup with `EPERM` unless a custom profile allowlists those three system calls. Allowlisting three calls is narrower than `seccomp=unconfined`, which removes the filter entirely.
+- **Sysctl.** Kernels 6.6 and later expose `kernel.io_uring_disabled` with values 0, 1 and 2. A value of **2 disables io_uring entirely**; **1 restricts ring creation to processes holding `CAP_SYS_ADMIN` or belonging to the group named by `kernel.io_uring_group`**. Hardened host images commonly set 2.
+- **RLIMIT_MEMLOCK.** On kernels older than 5.12, ring memory counts against the locked-memory limit, and **PostgreSQL creates one ring per backend**, so a connection count in the hundreds can exhaust a small `memlock` limit. Kernels from 5.12 account ring memory to the control group instead, which confines this to legacy hosts.
 
-**Try next:** on a Linux box with PGDG 18.6, create a 10GB table, then time `SELECT count(*)` cold (`echo 3 > /proc/sys/vm/drop_caches`, restart Postgres) under `io_method = 'sync'`, `'worker'` with `io_workers = 3` and `8`, and `'io_uring'` — while a second session polls `pg_aios` — and record the four numbers; the spread on your own storage is worth more than any published benchmark.
+Where any of these constraints apply, `io_method = 'worker'` remains available: it performs ordinary `pread()` calls from worker processes and requires no io_uring syscalls, at the cost of the per-I/O process hop that separates it from `io_uring` in the pganalyze measurement.
+
+## Pitfalls
+
+- **Empty `pg_aios` read as "no I/O".** The view lists only outstanding handles; a cached relation or `io_method = 'sync'` produces zero rows during a scan that nonetheless reads every page.
+- **Expecting index scans to accelerate.** B-tree index scans and index-only scans were not converted in 18, so a plan dominated by index access shows no wall-clock change after switching `io_method`.
+- **Expecting write or WAL latency to change.** All write paths remain synchronous in 18; checkpoint and WAL flush behaviour is unaffected by `io_method`.
+- **Container startup failing with `EPERM`.** The default Docker and `RuntimeDefault` seccomp profiles block the three io_uring system calls, so the failure occurs at server start rather than at query time.
+- **Silent unavailability on hardened hosts.** `kernel.io_uring_disabled = 2` prevents ring creation regardless of capabilities or seccomp configuration, and `= 1` restricts it to `CAP_SYS_ADMIN` or the `kernel.io_uring_group` group.
+- **Setting `io_method` without a restart.** The parameter is restart-only; a reload leaves the previous method in force while `postgresql.conf` shows the new value.
+- **Raising `io_workers` without watching worker CPU.** Under `worker`, every request costs a process hop, so added workers convert I/O wait into process-level CPU consumption.
+- **Assuming a build supports io_uring.** Support is compile-time; a binary lacking liburing rejects the setting at startup rather than falling back to another method.

@@ -1,8 +1,8 @@
 ---
-title: "sched_ext: writing CPU schedulers as BPF programs"
+title: "sched_ext: CPU schedulers as BPF programs"
 date: 2026-07-30
 track: linux-tools
-summary: "Merged in Linux 6.12, sched_ext lets you implement a CPU scheduler as a loadable BPF program, hot-swap it at runtime, and rely on a kernel watchdog to revert to the default scheduler the moment your policy misbehaves. Here's what the framework is, the callbacks that make up a scheduler, and how to load a real one in about five minutes."
+summary: "Merged in Linux 6.12, sched_ext allows a CPU scheduling policy to be implemented as a loadable BPF program, swapped at runtime, and reverted to the default scheduler by a kernel watchdog whenever the policy misbehaves. This article covers the framework, the callbacks that constitute a scheduler, the dispatch-queue model, and the loading procedure."
 reading_time: 6
 tags: [sched-ext, scx, bpf, ebpf, cpu-scheduler, linux-tools]
 sources:
@@ -18,59 +18,63 @@ sources:
     url: "https://wiki.cachyos.org/configuration/sched-ext/"
 ---
 
-For decades, changing how Linux picks the next task to run meant patching the kernel scheduler in C, rebuilding, rebooting, and hoping you didn't deadlock the machine. The feedback loop was measured in kernel releases. `sched_ext` — the extensible scheduler class merged in **Linux 6.12** (released 17 November 2024, an LTS kernel) — collapses that loop to seconds. You write a scheduling policy as a **BPF program**, load it into a running kernel, and it takes over CPU scheduling immediately. Get it wrong and a watchdog rips it out and hands control back to the default scheduler before your box locks up.
+**Gist.** Altering how Linux selects the next task to run has historically required patching the in-kernel scheduler in C, rebuilding, and rebooting, so the feedback loop was bounded by kernel release cadence. `sched_ext` — the extensible scheduler class merged in **Linux 6.12** (released 17 November 2024, a long-term-support kernel) — permits a scheduling policy to be expressed as a **Berkeley Packet Filter (BPF)** program that is loaded into a running kernel and assumes CPU scheduling immediately. The cost is that the policy is never trusted: the program is checked by the BPF verifier before it loads and watched by a runtime stall detector once it runs, and any detected fault discards the policy and restores the default scheduler mid-flight.
 
-That safety net is the whole reason this is usable in practice, so start there.
+## The abort path is the load-bearing mechanism
 
-## The watchdog is the point
-
-A CPU scheduler is about the most dangerous thing you can hand to an untrusted program. Forget to ever run a task and the system wedges. sched_ext's answer is that the BPF scheduler is never trusted to be correct. From the kernel documentation:
+A CPU scheduler is among the most dangerous components to delegate to an external program: a policy that never selects some runnable task wedges the system, and no amount of static checking can prove liveness of an arbitrary program. The kernel documentation states the guarantee directly:
 
 > The system integrity is maintained no matter what the BPF scheduler does. The default scheduling behavior is restored anytime an error is detected, a runnable task stalls, or on invoking the SysRq key sequence SysRq-S.
 
-Three independent triggers, then: the BPF verifier rejects a program that could crash the kernel before it ever loads; a runtime **watchdog** watches for a runnable task that never gets CPU time (a stall) and aborts the scheduler if one appears; and you always have `SysRq-S` as a manual kill switch. On abort, every task is moved back to the fair-class scheduler (EEVDF/CFS) and the machine keeps running. This is what makes it reasonable to test an experimental scheduler on a laptop you care about — the failure mode is "the experiment stops," not "hold the power button."
+Three independent triggers therefore exist. **The BPF verifier** rejects, before load, a program that could crash the kernel — memory safety and termination of individual callbacks are established statically. **The runtime watchdog** covers what the verifier cannot: it observes runnable tasks that receive no CPU time, and aborts the scheduler when such a stall appears. **`SysRq-S`** is the manual override, available even when the policy is starving the process that would otherwise be used to unload it.
 
-## What a scheduler actually is here
+The invariant is that on any of these triggers every task is migrated back to the fair-class scheduler (EEVDF/CFS) and execution continues. The observable failure mode is the experiment terminating with a logged reason, not an unresponsive machine.
 
-A sched_ext scheduler is a BPF struct_ops that fills in a set of callbacks in `struct sched_ext_ops`. You don't have to implement all of them; the kernel supplies defaults. The core of the hot path is three:
+## The scheduler as a set of callbacks
 
-| Callback | When it fires | What you do |
+A sched_ext scheduler is a BPF `struct_ops` instance populating callbacks in `struct sched_ext_ops`. The set need not be complete; the kernel supplies defaults for callbacks left unimplemented. Three constitute the hot path:
+
+| Callback | When it fires | Responsibility |
 |---|---|---|
-| `select_cpu()` | A task wakes up | Pick a target CPU (an optimization hint); optionally wake an idle CPU |
-| `enqueue()` | Task becomes runnable | Insert it into a dispatch queue (DSQ), or hold it internally |
-| `dispatch()` | A CPU runs out of work | Move tasks from your DSQs onto that CPU's local queue |
+| `select_cpu()` | A task wakes | Choose a target CPU (an optimisation hint); optionally wake an idle CPU |
+| `enqueue()` | A task becomes runnable | Insert into a dispatch queue (DSQ), or retain it internally |
+| `dispatch()` | A CPU exhausts its work | Move tasks from DSQs onto that CPU's local queue |
 
-The unit of bookkeeping is the **dispatch queue (DSQ)**. There's a built-in global DSQ and one local DSQ per CPU, and you can create your own. `enqueue` decides where a runnable task waits; `dispatch` decides what a hungry CPU pulls next. A surprising amount of useful policy — priority tiers, per-workload isolation, latency boosting for interactive tasks — is just "which DSQ does this task land in, and in what order do I drain them." Lifecycle callbacks like `init()` and `exit()` bracket the run; `exit()` receives the reason the scheduler is stopping, which is where you find out *why* the watchdog fired.
+The unit of bookkeeping is the **dispatch queue (DSQ)**. A built-in global DSQ exists, one local DSQ exists per CPU, and a scheduler may create further DSQs of its own. **`enqueue` determines where a runnable task waits; `dispatch` determines what an idle CPU pulls next.** A substantial range of policy — priority tiers, per-workload isolation, latency boosting for interactive tasks — reduces to the choice of destination DSQ and the drain order over DSQs.
 
-Because the policy is BPF, it can read BPF maps populated from user space, so many real schedulers are split: a fast BPF component making per-task decisions plus a userspace daemon computing heavier things (load balancing, topology) and pushing them down through maps. `scx_rusty` is exactly this shape.
+The result returned by `select_cpu()` is a hint rather than a binding placement, so a policy cannot express affinity by that callback alone; placement is settled when a task is dispatched onto a CPU's local queue.
 
-## Why anyone bothers
+Lifecycle callbacks `init()` and `exit()` bracket the run. **`exit()` receives the reason the scheduler is stopping**, which is where the cause of a watchdog abort surfaces: a runnable task stall, a runtime error, or an explicit SysRq.
 
-Two audiences, pulling in opposite directions:
+Because the policy is BPF, it can read BPF maps written from user space. Several production schedulers are split accordingly: a fast BPF component making per-task decisions, plus a userspace daemon computing heavier quantities (load balancing, topology) and pushing them down through maps. `scx_rusty` has this shape.
 
-- **Latency / desktop / gaming.** `scx_lavd` (Latency-Aware Virtual Deadline) targets interactivity — it minimizes latency spikes and includes "core compaction" that packs work onto fewer cores at higher frequency when utilization is low, for power. `scx_bpfland` is a vruntime-based scheduler that prioritizes interactive tasks with cache-aware CPU selection. Distros like CachyOS ship these to make desktops feel snappier under load.
-- **Throughput / servers.** `scx_rusty` is a general-purpose, tunable multi-domain scheduler; `scx_layered` lets you carve tasks into configurable "layers" with different policies — the kind of thing you tune per fleet. LWN's write-up on [SCHED_EXT and IOCost](https://lwn.net/Articles/966618/) documents Meta using it to claw back production performance without shipping a custom kernel.
+## Existing schedulers
 
-The common thread is iteration speed: you can A/B two scheduling policies on the same running kernel in the time it takes to Ctrl-C one and start the other. That was previously impossible.
+Two directions are represented in the [sched-ext/scx](https://github.com/sched-ext/scx) tree:
 
-## Trying it
+- **Latency-oriented.** `scx_lavd` (Latency-criticality Aware Virtual Deadline) targets interactivity and includes "core compaction", packing work onto fewer cores when utilisation is low. `scx_bpfland` is a vruntime-based scheduler prioritising interactive tasks with cache-aware CPU selection. CachyOS packages both.
+- **Throughput-oriented.** `scx_rusty` is a general-purpose, tunable multi-domain scheduler; `scx_layered` partitions tasks into configurable "layers" carrying different policies. LWN's account of [SCHED_EXT and IOCost](https://lwn.net/Articles/966618/) documents Meta's use of sched_ext against production workloads.
 
-**1. Confirm the kernel supports it.** You need `CONFIG_SCHED_CLASS_EXT=y` (plus the usual BPF stack: `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`, `CONFIG_DEBUG_INFO_BTF`):
+The property common to both is iteration speed: two policies can be compared on the same running kernel by stopping one process and starting another.
+
+## Loading procedure
+
+**1. Confirm kernel support.** `CONFIG_SCHED_CLASS_EXT=y` is required, together with the BPF stack (`CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`, `CONFIG_DEBUG_INFO_BTF`):
 
 ```bash
-# whichever your distro provides
+# whichever the distribution provides
 zcat /proc/config.gz | grep SCHED_CLASS_EXT
 grep CONFIG_SCHED_CLASS_EXT /boot/config-$(uname -r)
 ```
 
-If it's enabled, the runtime interface exists under sysfs. `state` reads `disabled` when nothing is loaded, and `ops` names the active scheduler once one is:
+When enabled, the runtime interface appears under sysfs. `state` reads `disabled` while nothing is loaded; `ops` names the active scheduler once one is running:
 
 ```bash
 cat /sys/kernel/sched_ext/state          # -> disabled
 cat /sys/kernel/sched_ext/root/ops       # (populated when a scheduler is running)
 ```
 
-You need a **6.12+ kernel**. On CachyOS/Arch the schedulers are packaged directly; Fedora and Ubuntu pull them from community/enablement repos:
+A **6.12 or later kernel** is required. Arch and CachyOS package the schedulers directly; Fedora obtains them from a community repository:
 
 ```bash
 # Arch / CachyOS
@@ -81,23 +85,32 @@ sudo dnf copr enable bieszczaders/kernel-cachyos-addons
 sudo dnf install scx-scheds
 ```
 
-**2. Load a scheduler.** Each scheduler is a standalone binary that loads its BPF program and stays in the foreground; it runs until you stop it. Start simple, then try a real one:
+**2. Load a scheduler.** Each scheduler is a standalone binary that loads its BPF program and remains in the foreground until stopped:
 
 ```bash
-sudo scx_simple      # trivial global-vtime example — good first smoke test
-sudo scx_rusty       # general-purpose production-grade scheduler
+sudo scx_simple      # global-vtime example, minimal smoke test
+sudo scx_rusty       # general-purpose scheduler
 ```
 
-While it runs, `/sys/kernel/sched_ext/state` flips to `enabled` and `root/ops` shows the name. Press **Ctrl-C** and it unloads cleanly, reverting every task to the default scheduler. That clean unload is the same code path the watchdog uses on failure — so "stop it" and "it crashed" land you in the same safe place.
+While it runs, `/sys/kernel/sched_ext/state` reads `enabled` and `root/ops` reports the name. **Ctrl-C unloads cleanly, returning every task to the default scheduler**, which is the same end state the watchdog produces on failure.
 
-**3. Watch the watchdog do its job.** You don't have to trust the docs on this. Load a scheduler, then trigger the manual kill switch:
+**3. Exercise the abort path.** Load a scheduler, then invoke the manual kill switch:
 
 ```bash
 echo s | sudo tee /proc/sysrq-trigger    # SysRq-S: abort the BPF scheduler
 ```
 
-`state` drops back to `disabled`, the scheduler process exits, and `dmesg` records the abort with the reason (`runnable task stall`, a verifier/runtime error, or the SysRq you just sent). That reason string is exactly what a buggy scheduler's `exit()` callback would surface — the difference between debugging a scheduler and debugging a hang is that here you get a log line instead of a dead machine.
+`state` returns to `disabled`, the scheduler process exits, and `dmesg` records the abort together with its reason (`runnable task stall`, a runtime error, or the SysRq described above). That reason string is the same one a defective scheduler's `exit()` callback receives.
 
-For managing schedulers as a service (auto-start at boot, switch modes), the `scx_loader` daemon and `scxctl` client wrap all of this — e.g. `scxctl start --sched rusty` / `scxctl stop`.
+For operating schedulers as a service — automatic start at boot, switching policies — the `scx_loader` daemon and its `scxctl` client wrap the above, for example `scxctl start --sched rusty` and `scxctl stop`.
 
-**Try next:** load `scx_simple`, confirm `/sys/kernel/sched_ext/root/ops` shows it, then clone [sched-ext/scx](https://github.com/sched-ext/scx) and open `scheds/c/scx_simple.bpf.c` — it's under ~200 lines and implements `select_cpu`/`enqueue`/`dispatch` against a single global DSQ, which is the smallest complete mental model of the framework you can hold in your head before reaching for `scx_rusty`.
+A useful next step is loading `scx_simple`, confirming `/sys/kernel/sched_ext/root/ops` names it, then reading `scheds/c/scx_simple.bpf.c` in the scx tree: it implements `select_cpu`/`enqueue`/`dispatch` against a single global DSQ, which is the smallest complete model of the framework.
+
+## Pitfalls
+
+- **Treating `select_cpu()` as placement.** The callback returns a hint; the task can still be dispatched elsewhere, so a policy that encodes affinity only there observes tasks running on CPUs it did not choose.
+- **Omitting `dispatch()` work for a DSQ.** A task enqueued onto a custom DSQ that no `dispatch()` path ever drains is runnable and never scheduled; the symptom is the watchdog aborting with a runnable task stall rather than a visible hang.
+- **Assuming verifier acceptance implies a working policy.** The verifier establishes memory safety and termination of individual callbacks, not that every runnable task eventually runs; liveness bugs load successfully and are caught only at runtime.
+- **Running on a kernel below 6.12.** Without `CONFIG_SCHED_CLASS_EXT`, `/sys/kernel/sched_ext` is absent and the scheduler binary fails at load rather than falling back.
+- **Interpreting a clean Ctrl-C as evidence of correctness.** Orderly unload and watchdog abort leave the system in the same state, so a successful exit does not distinguish a policy that scheduled every task from one that was torn down.
+- **Losing the abort reason.** The cause is delivered to `exit()` and recorded in `dmesg`; once the scheduler process has exited, the console output alone does not indicate whether the stop was requested or forced.

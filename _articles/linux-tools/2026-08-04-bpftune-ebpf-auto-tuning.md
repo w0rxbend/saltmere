@@ -1,9 +1,9 @@
 ---
-title: "bpftune: let eBPF retune your kernel so your sysctls don't go stale"
+title: "bpftune: eBPF-driven continuous retuning of kernel sysctls"
 date: 2026-08-04
 track: linux-tools
-summary: "The sysctl values you set at boot were right for the load you had at boot. Traffic shifts, buffers saturate, congestion control stays wrong, and nobody ever revisits /etc/sysctl.d. Oracle's bpftune runs a low-overhead eBPF daemon that watches actual kernel behaviour and nudges tunables like tcp_rmem, somaxconn, and the congestion control algorithm as conditions change — and gets out of the way the moment you touch a setting by hand. Here's how to build it, run it, and read what it changed."
-reading_time: 6
+summary: "Sysctl values set at boot are correct for the load present at boot. Traffic shifts, buffers saturate, congestion control stays wrong, and /etc/sysctl.d is never revisited. Oracle's bpftune runs a low-overhead eBPF daemon that observes kernel behaviour and adjusts tunables such as tcp_rmem, somaxconn and the congestion control algorithm as conditions change, and stops managing any tunable that is set by hand. This covers building it, running it, and reading what it changed."
+reading_time: 7
 tags: [ebpf, bpf, bpftune, sysctl, tcp, autotuning, linux-tools]
 sources:
   - title: "oracle/bpftune: bpftune uses BPF to auto-tune Linux systems"
@@ -16,38 +16,41 @@ sources:
     url: "https://www.phoronix.com/news/Oracle-bpftune-0.4-1"
 ---
 
-A modern Linux kernel exposes something on the order of 1,500 tunables, and almost all of them ship with a single static default. The ones that matter for a given workload get set once — in `/etc/sysctl.d`, a Chef recipe, an image build — using numbers that were correct for the traffic pattern in front of you *that day*. Then the workload moves. A service that was mostly small RPCs starts streaming large payloads, an instance is rehomed to a link with ten times the bandwidth-delay product, container density triples. The sysctl values don't move with it. `net.ipv4.tcp_rmem` that was generous at boot is now clamping throughput; a `somaxconn` sized for a quiet service drops connections during a spike. Nobody notices, because retuning is nobody's job and there's no signal telling you the values went stale.
+**Gist.** A modern Linux kernel exposes a large number of tunables — the bpftune README counts 1,624 sysctls on a 6.2 kernel — nearly all shipping with a single static default, and the handful that matter for a workload are set once and then left to go stale as the traffic pattern moves. bpftune is a daemon that attaches extended Berkeley Packet Filter (eBPF) programs to kernel events, infers from those events that a tunable is constraining the system, and rewrites it in place. The cost is that machine state changes without a human in the loop: configuration drifts from whatever is recorded in `/etc/sysctl.d`, and reproducing a past run means reconstructing a sequence of daemon decisions rather than reading a file.
 
-bpftune is Oracle's answer to that gap: a daemon that uses eBPF to watch real kernel behaviour and adjust the relevant sysctls continuously, so the tuning tracks the workload instead of freezing at boot.
+## The staleness problem
 
-## The design philosophy is deliberately conservative
+Tuning is normally applied once — in `/etc/sysctl.d`, a configuration-management recipe, an image build — using numbers correct for the traffic pattern of that day. The workload then moves. A service dominated by small remote procedure calls begins streaming large payloads; an instance is rehomed to a link with a much larger bandwidth-delay product; container density rises. The sysctl values do not move with it. A `net.ipv4.tcp_rmem` maximum that was generous at boot clamps throughput; a `somaxconn` sized for a quiet service drops connections during a spike. **No signal exists that reports a tunable has become the binding constraint**, so nothing prompts a revisit.
 
-bpftune is not an aggressive optimizer, and that's the point. Its stated tenets, from the Oracle blog and the README, are worth internalizing before you run it:
+## Stated design tenets
 
-- **Don't tune unless needed.** It avoids high-frequency tracing; the observability overhead has to stay negligible or the cure is worse than the disease. It reacts to events (buffer saturation, loss, namespace creation) rather than polling hot paths.
-- **Keep out of the way.** If an administrator sets a tunable manually, bpftune detects that write and *stops* managing it. Your explicit choice always wins over the daemon's guess.
-- **Explain every change.** Each adjustment is logged with what changed and why, so the system's behaviour never becomes a mystery.
+The Oracle blog post and the project README state four tenets, and each constrains what the daemon may do.
 
-Tuning is also bidirectional: bpftune raises a value to gain performance headroom, but pulls it back down when it sees the system approaching a limit — memory pressure, for instance — rather than ratcheting only upward.
+- **Do not tune unless needed.** bpftune avoids high-frequency tracing; it reacts to discrete events — buffer saturation, loss, namespace creation — rather than polling hot paths. The stated intent is that observability overhead remains negligible.
+- **Keep out of the way.** When an administrator writes a tunable manually, bpftune detects the write and **stops managing that tunable**. The explicit setting wins over the daemon's inference.
+- **Explain every change.** Each adjustment is logged with the tunable, the scenario that triggered it, and the old and new values.
+- **Do not replace tunables with more tunables.** The daemon is stated to be zero-configuration: no options are required, and the README says unexplained constants are avoided where possible.
 
-## What it actually tunes
+The README describes adjustment as bidirectional rather than a ratchet: a value is raised to gain headroom and pulled back down when the daemon observes the system approaching a limit such as memory pressure.
 
-bpftune is built from dynamically linked plugins called *tuners*, each hooking a slice of kernel behaviour through BPF and receiving events over a ring buffer. The current set is network-heavy:
+## Tuners and the event path
 
-- **tcp_buffer** — auto-sizes TCP send/receive buffers by correlating buffer size against smoothed RTT, adjusting `net.ipv4.tcp_rmem` and `tcp_wmem` max values as flows demand more.
-- **tcp_conn** (congestion control) — selects the congestion control algorithm based on observed conditions, e.g. switching toward BBR when loss climbs.
-- **net_buffer** — core networking tunables including the listen backlog / `somaxconn` family.
-- **neigh_table** — grows the neighbour (ARP/ND) table before it overflows.
-- **route_table**, **ip_frag** — routing table sizing and IP fragmentation memory limits.
+bpftune is assembled from dynamically linked plugins called *tuners*. Each attaches BPF programs to a slice of kernel behaviour and receives events in user space over a **BPF ring buffer**. The current set is network-heavy:
+
+- **tcp_buffer** — sizes TCP send and receive buffers by correlating buffer size against smoothed round-trip time (RTT), adjusting the maximum fields of `net.ipv4.tcp_rmem` and `tcp_wmem`.
+- **tcp_conn** — selects the congestion control algorithm from observed conditions, for example moving toward BBR as loss climbs.
+- **net_buffer** — core networking tunables including the listen backlog and `somaxconn` family.
+- **neigh_table** — grows the neighbour (Address Resolution Protocol / Neighbor Discovery) table before it overflows.
+- **route_table** and **ip_frag** — routing table sizing and IP fragmentation memory limits.
 - **udp_buffer** — non-TCP buffer sizing.
-- **netns** — detects network namespace creation and teardown so tuning is per-namespace, which matters on container hosts.
-- **sysctl** — the meta-tuner that watches for manual sysctl writes and disables the tuner that would otherwise fight you.
+- **netns** — detects network namespace creation and teardown, so tuning is applied per namespace. This is what makes the daemon usable on container hosts, where a single global value would be wrong for most namespaces.
+- **sysctl** — the meta-tuner that watches for manual sysctl writes and disables the tuner that would otherwise contend with the administrator.
 
-On a plain laptop the LWN reviewer saw bpftune bump `net.ipv4.tcp_rmem` by roughly 25% within seconds of starting, then continue nudging it over the following minutes as it learned the workload.
+The LWN review reports that on the author's machine bpftune increased `net.ipv4.tcp_rmem` by 25% almost immediately, by a further 25% a few minutes later, and twice more about fifteen minutes after that.
 
-## Build and install
+## Build prerequisites
 
-bpftune builds against libbpf and needs BTF in the running kernel (`CONFIG_DEBUG_INFO_BTF=y`) plus BPF ring buffer support, which means roughly a 5.6+ kernel (5.4 on Oracle Linux). Install the toolchain, then build:
+bpftune builds against libbpf and requires **BPF Type Format (BTF) in the running kernel** (`CONFIG_DEBUG_INFO_BTF=y`) together with BPF ring buffer support. That combination puts the floor at roughly a 5.6 kernel, or 5.4 on Oracle Linux where the features are backported.
 
 ```bash
 # Fedora/RHEL-family dependencies
@@ -57,69 +60,75 @@ sudo dnf install -y libbpf libbpf-devel libcap-devel bpftool \
 git clone https://github.com/oracle/bpftune
 cd bpftune
 make
-sudo make install        # installs bpftuned, the tuner plugins, and a systemd unit
+sudo make install        # installs the bpftune binary, the tuner plugins, and a systemd unit
 
-# On some distros the plugin dir is lib not lib64:
+# On some distributions the plugin directory is lib rather than lib64:
 #   make libdir=lib && sudo make install libdir=lib
 ```
 
-Before committing to it, ask bpftune whether your kernel can support it fully:
+The support probe reports whether the running kernel satisfies what each tuner needs:
 
 ```bash
 $ bpftune -S
 bpftune works fully
 ```
 
-`-S` (`--support`) scans for BTF, ring buffer, and the BPF features each tuner needs, and reports whether support is full, partial (legacy mode), or none.
+`-S` (`--support`) scans the system for the BPF features bpftune needs and reports the level found: the README shows `bpftune works fully` and, on a system with less support, `bpftune works in legacy mode`. The same probe reports separately whether per-network-namespace policy is available (it depends on the netns cookie). Legacy mode means reduced capability rather than that the daemon fails to start.
 
-## Run it and watch what it does
+## Running and reading the log
 
-Run in the foreground with logs to stderr while you're getting a feel for it:
+Foreground operation with logs on standard error is the mode for initial observation:
 
 ```bash
 sudo bpftune -s
 ```
 
-`-s` (`--stderr`) sends log output to standard error instead of syslog. In steady state you'll run it as a service instead:
+`-s` (`--stderr`) directs log output to standard error instead of syslog. Steady-state operation uses the installed unit:
 
 ```bash
 sudo systemctl enable --now bpftune
 ```
 
-Either way, every adjustment is logged with a before/after. Tail it through journald:
+Every adjustment is logged with before and after values:
 
 ```bash
 $ journalctl -u bpftune -f
-bpftuned[1123]: bpftune works in full mode
-bpftuned[1123]: Applying tcp buffer tuner
-bpftuned[1123]: Scenario 'need to increase TCP buffer size(s)' occurred for tunable
-  'net.ipv4.tcp_rmem' in global ns. Need to increase buffer size(s) to maximize
-  throughput
-bpftuned[1123]: change net.ipv4.tcp_rmem(min default max) from (4096 131072 6291456)
+bpftune[2778]: bpftune works fully
+bpftune[2778]: Scenario 'specify bbr congestion control' occurred for tunable
+  'TCP congestion control' in global ns.
+bpftune[2778]: Due to need to increase max buffer size to maximize throughput
+  change net.ipv4.tcp_rmem(min default max) from (4096 131072 6291456)
   -> (4096 131072 7864320)
 ```
 
-That log line is the whole value proposition in one place: which tunable, which namespace, the reason, and the exact old and new triple. When bpftune runs as a service the same lines land in syslog (`/var/log/messages` or `journalctl -u bpftune`); when it runs in the foreground it also prints a summary of everything it changed on exit.
+The lines carry four pieces of state: **the tunable, the namespace, the scenario name that fired, and the exact old and new triple**. Under the service unit these lines reach syslog (`/var/log/messages`, or `journalctl -u bpftune`).
 
-## Inspecting and steering it
+## Querying and constraining the daemon
 
-bpftune answers live queries over its `-q` (`--query`) interface, backed by a small local port. The queries that matter day to day:
+bpftune answers live queries over its `-q` (`--query`) interface, backed by a local port:
 
 ```bash
 bpftune -q tuners      # loaded tuners and their state (active / disabled)
 bpftune -q tunables    # every sysctl the loaded tuners can touch
-bpftune -q summary     # what has been changed so far
-bpftune -q help        # list supported queries
+bpftune -q summary     # changes made so far
+bpftune -q help        # supported queries
 ```
 
-`bpftune -q tuners` is where you confirm a tuner is actually active — a tuner drops to a disabled state if you've set its sysctl by hand, or if the kernel lacks a feature it needs.
+`bpftune -q tuners` is the check that a tuner is active. **A tuner can be inactive for two distinct reasons**: its target sysctl was written manually, or the kernel lacks a BPF feature it requires. Both leave the tuner not tuning, so a tuner absent on an older kernel is easily read as one deliberately overridden.
 
-There's no per-tuner on/off switch you flip in a config file, and that's intentional — bpftune's design goal is zero configuration. You disable a tuner in the way the daemon expects: **set its target sysctl manually.** Write `net.ipv4.tcp_rmem` in `/etc/sysctl.d` and reload, and the sysctl tuner sees the write and deactivates the TCP buffer tuner, leaving your value untouched. If you want to constrain what the daemon loads in the first place — testing a single tuner, say — use `-a`/`--allow` to permit only named plugins (e.g. `-a tcp_buffer_tuner.so`); the flag is repeatable.
+There is no per-tuner on/off switch in a configuration file; the design goal is zero configuration. Disabling a tuner is done through the mechanism the daemon already watches: **set its target sysctl manually**. Writing `net.ipv4.tcp_rmem` in `/etc/sysctl.d` and reloading causes the sysctl tuner to observe the write and deactivate the TCP buffer tuner, leaving the administrator's value in place. To constrain what loads at startup — testing a single tuner, for instance — `-a`/`--allow` permits only named plugins (`-a tcp_buffer_tuner.so`), and the flag is repeatable.
 
-Two more knobs are worth knowing. `-r`/`--learning_rate` (0–4, default 4) controls how aggressively the reinforcement-learning tuners explore alternatives such as congestion control algorithms; the default is usually right. And `-R`/`--rollback` restores the original sysctl values when the daemon exits, which is exactly what you want on a machine where you're evaluating bpftune and don't want it to leave state behind.
+Two further options matter. `-r`/`--learning_rate` (range 0–4, default 4) sets the step size of an adjustment relative to the relevant limit: the manual page documents 0 as changing tunables by or within 1.0625% of the limit and 4 as 25%, so lower values are more conservative. `-R`/`--rollback` restores the original sysctl values when the daemon exits, which bounds the blast radius on a machine where bpftune is under evaluation.
 
-## When not to reach for it
+## Where the fit is poor
 
-LWN's caveat is fair: any tool that changes configuration without a human in the loop will eventually make a change you didn't want, at a moment you didn't expect. bpftune is a good fit for fleets of general-purpose hosts that nobody hand-tunes and where a bit more throughput is pure upside. It's a worse fit where predictability and reproducibility outrank performance — a benchmark rig, a latency-SLA'd box you've already tuned to the metal, anything where "the numbers changed themselves overnight" is an incident. For those, run it in `-R` mode to observe what it *would* do, read the log, and lift the good changes into your static config by hand.
+The LWN caveat holds: a tool that changes configuration without a human in the loop will eventually make an unwanted change at an unexpected moment. bpftune fits fleets of general-purpose hosts that nobody hand-tunes and where additional throughput carries no downside. It fits poorly where predictability and reproducibility outrank throughput — a benchmark rig, a host already tuned against a latency service-level agreement, any environment in which unexplained overnight configuration change constitutes an incident. In those cases `-R` mode permits observing the proposed changes, after which the useful ones can be lifted into static configuration by hand.
 
-**Try next:** run `sudo bpftune -s -R` on a busy host for an hour, then `bpftune -q summary` — compare its proposed `tcp_rmem`/`tcp_wmem` and congestion-control choices against whatever you've currently baked into `/etc/sysctl.d`.
+## Pitfalls
+
+- **Rebuilding without `libdir=lib` on a distribution that uses `lib`** installs the tuner plugins where the daemon does not look; bpftune starts, loads no tuners, and appears inert.
+- **A kernel built without `CONFIG_DEBUG_INFO_BTF`** does not expose `/sys/kernel/btf/vmlinux`, so `bpftune -S` reports reduced or absent support; the daemon can then run in legacy mode, or run while tuning nothing.
+- **Setting a sysctl in `/etc/sysctl.d` after bpftune has already raised it** deactivates that tuner permanently for the boot, freezing the value at whatever was written manually — the intended behaviour, but it silently ends the auto-tuning that was previously observed working.
+- **Omitting `-R` during evaluation** leaves adjusted sysctl values in place after the daemon exits, so the machine's post-test state is neither the boot configuration nor the tuned one.
+- **Reading `-q tuners` output as a health check** conflates a tuner inactive because of a manual override with one inactive for a missing kernel feature; neither is tuning anything.
+- **Restricting the loaded set with `-a` on a container host** without including the netns tuner removes the component that tracks namespace creation and teardown, so per-namespace tuning is not in effect.

@@ -1,9 +1,9 @@
 ---
-title: "uutils coreutils: the Rust rewrite of ls, cp and friends heads into Ubuntu"
+title: "uutils coreutils: the Rust reimplementation of ls, cp and friends enters Ubuntu"
 date: 2026-08-11
 track: linux-tools
-summary: "uutils is a from-scratch, MIT-licensed Rust reimplementation of GNU coreutils that now ships by default in Ubuntu. What it is, where it stands on compatibility, the MIT-vs-GPL fight it started, and how to install and test it on any distro today."
-reading_time: 5
+summary: "uutils is a from-scratch, MIT-licensed Rust reimplementation of GNU coreutils that now ships by default in Ubuntu. Its scope, its measured compatibility with the GNU test suite, the licensing dispute it provoked, and how to install and test it on any distribution."
+reading_time: 6
 tags: [uutils, coreutils, rust, ubuntu, memory-safety, linux-tools]
 sources:
   - title: "uutils/coreutils — Cross-platform Rust rewrite of the GNU coreutils (GitHub)"
@@ -18,64 +18,75 @@ sources:
     url: "https://github.com/uutils/coreutils/issues/2757"
 ---
 
-For half a century the tiny programs you run a thousand times a day — `ls`, `cp`, `mv`, `cat`, `sort`, `dd`, `head`, `wc` — have been C code from GNU coreutils. `uutils` is a bet that they don't have to be. It's a from-scratch reimplementation of the whole set in Rust, and after years as a curiosity it has crossed into something bigger: it now ships as the default userland on a mainstream distribution.
+**Gist.** The base userland of a Linux system — `ls`, `cp`, `mv`, `cat`, `sort`, `dd`, `head`, `wc` — has been GNU coreutils C code for decades, and that code carries the memory-safety exposure of manual pointer and buffer handling. uutils reimplements the same command set from scratch in Rust, matching GNU behaviour flag for flag, and now ships as the default userland on Ubuntu. The cost is compatibility: release **0.10** passes **93.48%** of the upstream GNU test suite (**645 of 690 tests**), so the remaining fraction is a set of behavioural differences concentrated in less common flags, locale handling and symbolic-link corner cases.
 
-## What uutils actually is
+## Scope of the reimplementation
 
-uutils is a complete, from-scratch rewrite — not a fork, not a wrapper around the GNU binaries. Every utility is reimplemented in Rust, with the explicit goal of matching GNU behaviour flag-for-flag. Two properties fall out of that choice.
+uutils is a complete rewrite, not a fork of the GNU sources and not a wrapper that shells out to GNU binaries. Each utility is written afresh in Rust, with the stated goal of matching GNU behaviour flag for flag. Two properties follow from that structure.
 
-First, it's cross-platform. The same codebase builds and runs on Linux, macOS, the BSDs, **Windows**, and WASI. A `sort` or `cut` that behaves the same on a Linux CI runner and a Windows dev box is genuinely useful, and it's something the GNU tools never targeted.
+The first is portability. The same codebase builds and runs on Linux, macOS, the BSDs, **Windows**, and WASI (the WebAssembly System Interface). A `sort` or `cut` invocation therefore has one implementation across a Linux continuous-integration runner and a Windows developer machine; GNU coreutils does not target Windows.
 
-Second, it's **MIT-licensed**, where GNU coreutils is GPLv3-or-later. That single line in the `LICENSE` file is the source of most of the political heat around the project — more on that below.
+The second is licensing. uutils is **MIT-licensed**, whereas GNU coreutils is GPLv3-or-later (GNU General Public License, version 3 or later). That difference is the subject of the dispute described below.
 
-The project ships as a BusyBox-style *multicall binary*: one executable named `coreutils` that dispatches to a subcommand, so `coreutils ls -l` runs the `ls` implementation. Symlink that binary to a bare name (`ln -s coreutils ls`) and it behaves like the tool whose name it was invoked under.
+The project ships as a BusyBox-style **multicall binary**: a single executable named `coreutils` that dispatches on a subcommand, so `coreutils ls -l` runs the `ls` implementation. The binary also inspects the name it was invoked under, so a symbolic link named `ls` pointing at the multicall binary behaves as `ls`. This is the mechanism that allows the Rust set to be substituted for the GNU set without altering any caller: **the dispatch key is `argv[0]`**, and every caller in a shell script supplies that implicitly.
 
-## Where it stands in 2026
+## Measured state at release 0.10
 
-The current release is **0.10**, tagged 5 August 2026. On the project's own scoreboard — the upstream GNU coreutils test suite, run against the Rust binaries — it passes **93.48%** of tests (645 of 690). That number has climbed steadily: it was in the mid-80s a year earlier. The 0.10 cycle sharpened `date`, `du`, `head`, `tail`, `ls`, `stat` and others, added conveniences like `mv --exchange` (atomic path swap) and `install --reflink`, and closed a batch of time-of-check-to-time-of-use (TOCTOU) races in `touch`, `mkfifo`, `head` and `split`.
+The current release is **0.10**, tagged **5 August 2026**. The project's compatibility figure is produced by building the upstream GNU coreutils test suite and running it against the Rust binaries rather than the GNU ones: **645 of 690 tests pass, 93.48%**. The figure was in the mid-eighties a year earlier.
 
-93% is close, but the missing 7% is not noise. Real gaps remain in obscure flag combinations, locale and collation edge cases in `sort`, and corner behaviours of `cp`/`mv`/`rm` around symlinks and cross-filesystem moves. If you have a script that leans on a rarely-used GNU flag, test it — don't assume.
+The 0.10 cycle improved `date`, `du`, `head`, `tail`, `ls` and `stat` among others, added `mv --exchange` (an atomic swap of two paths) and `install --reflink`, and closed a batch of **time-of-check-to-time-of-use (TOCTOU)** races in `touch`, `mkfifo`, `head` and `split`. A TOCTOU race is the interval between a program checking a property of a path — that it exists, that it is a regular file, that it is owned by the caller — and acting on that path. If an attacker replaces the path with a symbolic link inside that interval, the action lands on a target the check never approved. The defence is to eliminate the interval by operating on a file descriptor obtained once, rather than re-resolving the name.
 
-## The Ubuntu news hook
+The residual **6.52%** is not uniform noise. The gaps reported are in **uncommon flag combinations, locale and collation behaviour in `sort`, and the corner cases of `cp`, `mv` and `rm` around symbolic links and cross-filesystem moves**. Which of those gaps a given system meets is not derivable from the aggregate figure; the test-suite harness described below reports them by name.
 
-Canonical shipped **rust-coreutils as the default in Ubuntu 25.10 "Questing Quokka"** (October 2025), deliberately, to get maximum real-world exposure ahead of the LTS. It stuck: **Ubuntu 26.04 LTS** (April 2026) also defaults to uutils — with one important asterisk. After two rounds of security audit, Canonical judged `cp`, `mv` and `rm` not yet ready because of unresolved TOCTOU concerns, so **those three are still provided by GNU coreutils in 26.04**. The rest of the set is Rust. Full migration, including the last three, is targeted for 26.10.
+## Deployment status in Ubuntu
 
-So the accurate framing as of mid-2026 is: default on Ubuntu, but not yet *all* of it, and not (yet) the default anywhere else. Fedora and others are watching, not shipping.
+Canonical shipped **rust-coreutils as the default in Ubuntu 25.10 "Questing Quokka"** (October 2025) in order to obtain real-world exposure before the long-term-support release. **Ubuntu 26.04 LTS** (April 2026) also defaults to uutils, with one exclusion: after two rounds of security audit, Canonical judged `cp`, `mv` and `rm` not yet ready owing to unresolved TOCTOU concerns, so **those three utilities are still supplied by GNU coreutils in 26.04**. The remainder of the set is the Rust implementation. Full migration, including the three excluded utilities, is targeted for 26.10.
 
-## The MIT-vs-GPL fight
+The accurate statement as of mid-2026 is therefore: default on Ubuntu, not the whole set, and not the default on any other distribution. Fedora and others have not shipped it.
 
-Replacing the base userland's licence is the part that turned into a genuine debate rather than a changelog note. GNU coreutils is copyleft: derivatives must stay open. uutils is permissive, so a vendor can take it, modify it, and ship a proprietary build with no obligation to release source. Critics — including a long-running [request to relicense under the GPL](https://github.com/uutils/coreutils/issues/2757) and heated threads on the Rust forums — argue that swapping GPL tools for MIT ones quietly erodes the copyleft foothold that has kept the Linux base system open for decades. Defenders counter that permissive licensing is exactly what drives adoption, and that a memory-safe, cross-platform userland is worth it. The maintainers have kept MIT. Wherever you land, it's a real trade-off, not a technicality.
+## The licensing dispute
 
-This is the same wave that brought **[sudo-rs](/articles/linux-tools/2026-07-31-sudo-rs-memory-safe)** — the Rust `sudo`/`su` that also became default in Ubuntu 25.10 — and it's fair to read both as one project: oxidising the small, root-adjacent, memory-unsafe C programs that sit at the bottom of every Linux box.
+Replacing the base userland's licence is the part of the change that produced sustained argument rather than a changelog entry. GNU coreutils is copyleft: a derivative work must be distributed under the same terms, so modifications remain available in source form. uutils is permissive: a vendor may take the code, modify it, and ship a proprietary build with no obligation to release source.
 
-## Try it today, on any distro
+Critics — including a long-running [request to relicense under the GPL](https://github.com/uutils/coreutils/issues/2757) — argue that substituting MIT-licensed tools for GPL ones removes copyleft from the base system. Defenders argue that permissive licensing widens adoption and that a memory-safe, cross-platform userland justifies the change. The maintainers have retained MIT. The trade-off is substantive rather than procedural.
 
-You don't need Ubuntu 25.10 to kick the tyres. The crate is on crates.io:
+The same pattern produced **[sudo-rs](/articles/linux-tools/2026-07-31-sudo-rs-memory-safe)**, the Rust implementation of `sudo` and `su` that also became the Ubuntu 25.10 default. Both replace small C programs that run with or adjacent to root privilege.
+
+## Installing and testing on any distribution
+
+The crate is published on crates.io, so Ubuntu is not required to evaluate the tools.
 
 ```bash
-# Build and install the multicall binary (needs a Rust toolchain)
+# Build and install the multicall binary (requires a Rust toolchain)
 cargo install coreutils
 
-# The installed binary is `coreutils`; call any util as a subcommand
+# The installed binary is `coreutils`; each utility is a subcommand
 coreutils ls -l --color=auto
 coreutils sort -h < sizes.txt
 coreutils --help          # lists every implemented utility
 
-# Prefer bare names? Symlink them into a dir early on your PATH
+# Bare names require symlinks in a directory early on PATH
 mkdir -p ~/.local/uutils && cd ~/.local/uutils
 for u in ls cp mv cat sort head tail wc; do ln -sf "$(command -v coreutils)" "$u"; done
 export PATH="$HOME/.local/uutils:$PATH"
-ls --version              # -> "ls (uutils coreutils) 0.10"
+ls --version              # names uutils coreutils, not GNU coreutils
 ```
 
-On Debian/Ubuntu you can instead `apt install rust-coreutils`, which registers the tools through the alternatives system. To measure compatibility yourself, clone the repo and run the GNU suite harness:
+On Debian and Ubuntu, `apt install rust-coreutils` registers the tools through the alternatives system instead. The compatibility figure can be reproduced locally with the project's own harness:
 
 ```bash
 git clone https://github.com/uutils/coreutils && cd coreutils
-bash util/build-gnu.sh        # fetches & builds GNU tests against uutils
+bash util/build-gnu.sh        # fetches and builds the GNU tests against uutils
 bash util/run-gnu-test.sh     # runs them; prints pass/fail totals
 ```
 
-That last step is the honest way to answer "will this break my workflow?" — point it at the utilities you care about and read the failures.
+Running that harness, and then running the workload's own scripts against symlinked uutils binaries on a disposable container, converts the aggregate 93.48% into the specific list of failures that apply to one system.
 
-**Try next:** on a throwaway VM or container, symlink the uutils multicall over `ls`, `sort` and `wc`, run your most-used shell scripts against them, then diff the output against the GNU originals — the failures you find are exactly the 7% the compatibility number is warning you about.
+## Pitfalls
+
+- **Assuming the whole Ubuntu 26.04 LTS userland is Rust.** `cp`, `mv` and `rm` are still GNU coreutils there, so a bug reproduced on 26.04 against those three is a GNU bug, and behaviour observed for them will change again at 26.10.
+- **Reading 93.48% as "6.52% of invocations differ".** The figure counts GNU test-suite cases, not weighted real usage; a script may exercise only passing behaviour, or may sit entirely inside a failing case.
+- **Trusting `sort` output to be byte-identical across the switch.** Locale and collation handling is one of the named gap areas, so a pipeline that depends on a specific ordering under a non-C locale can produce a different order without any error.
+- **Symlinking the multicall binary under a name it does not implement.** Dispatch is by `argv[0]`; an unimplemented name fails at invocation rather than falling through to the GNU binary still on `PATH`.
+- **Treating the closed TOCTOU races as a general guarantee.** The 0.10 notes cover `touch`, `mkfifo`, `head` and `split`; Canonical's audit left `cp`, `mv` and `rm` outstanding, which is why those three were excluded from the default.
+- **Deploying via `cargo install` and expecting distribution updates.** A crates.io build is outside the package manager, so it receives no security updates from the distribution and shadows the packaged tools for every process that inherits the modified `PATH`.

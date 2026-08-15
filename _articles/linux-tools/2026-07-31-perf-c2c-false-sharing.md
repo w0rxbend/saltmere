@@ -1,8 +1,8 @@
 ---
-title: "perf c2c: find the cacheline two threads are fighting over"
+title: "perf c2c: locating the cacheline two threads contend for"
 date: 2026-07-31
 track: linux-tools
-summary: "A flame graph shows you which function burns CPU, but it can't see two threads bouncing one 64-byte cacheline between cores. perf c2c samples memory loads and stores, ranks cachelines by remote HITM, and points at the exact struct offset and source line where false sharing lives. Here's the record-to-report workflow and a C program that exhibits the bug and its fix."
+summary: "A flame graph identifies which function burns CPU but cannot see two threads bouncing one 64-byte cacheline between cores. perf c2c samples memory loads and stores, ranks cachelines by remote HITM, and reports the struct offset and source line where false sharing occurs. This article covers the record-to-report workflow and a C program that exhibits the defect and its fix."
 reading_time: 6
 tags: [perf, c2c, false-sharing, cache-coherency, numa, linux-tools, performance]
 sources:
@@ -16,13 +16,15 @@ sources:
     url: "https://coffeebeforearch.github.io/2020/03/27/perf-c2c.html"
 ---
 
-A CPU flame graph answers "which function is hot." It is blind to a different, nastier class of scaling bug: your code adds threads and gets *slower*, every thread is busy, and no single function looks expensive because the cost is spread across a memory access that should have been free. That cost is **cache coherency traffic** — cores taking turns invalidating each other's copy of a cacheline. `perf c2c` (cache-to-cache) is the tool built specifically to find it, and it reports down to the byte offset inside a struct.
+**Gist.** A multithreaded program can slow down as threads are added while every thread remains busy and no single function appears expensive, because the cost is spread across memory accesses that ought to be nearly free — **cache coherency traffic**, cores taking turns invalidating each other's copy of a shared cacheline. `perf c2c` (cache-to-cache) uses hardware memory-access sampling to rank cachelines by cross-core contention and report the byte offset inside a structure at which the contention occurs. The cost of the diagnosis is a high-rate, system-wide sampling session requiring elevated privileges; the cost of the usual fix is memory, since separating two contended fields onto distinct lines inflates the structure.
 
-## What false sharing actually is
+## The coherency mechanism behind the symptom
 
-CPUs move memory in 64-byte units called **cachelines**, and coherency is tracked per line, not per byte. When a core writes any byte in a line, the MESI protocol forces every other core holding that line to drop its copy. The next core to read must re-fetch the modified data from the writer's cache — a **HITM** (a load that *hits* a line in the *Modified* state in another core's cache).
+CPUs move memory between caches in fixed units, commonly **64 bytes**, called **cachelines**, and **coherency state is tracked per line, not per byte**. Under the MESI protocol (Modified, Exclusive, Shared, Invalid), a line held in the Modified state by one core is the sole valid copy. When a core writes any byte within a line, every other core holding that line must drop its copy to Invalid. A subsequent read on another core cannot be served locally: the data must come from the writer's cache, or from memory once the modified line has been written back. That event is a **HITM** — a load that *hits* a line in the *Modified* state in another core's cache. A HITM sourced from a cache on a different socket is a **remote** HITM and is the more expensive of the two.
 
-**False sharing** is when two threads write two *logically independent* variables that happen to land in the same line:
+The invariant is per line: **two independent variables placed in one line are indistinguishable from one variable, as far as the coherency protocol is concerned.**
+
+**False sharing** is the case where two threads write two *logically independent* variables that happen to occupy the same line:
 
 ```c
 struct counters {
@@ -31,13 +33,13 @@ struct counters {
 };                // sizeof == 16, so a and b share ONE cacheline
 ```
 
-Thread 0 never touches `b` and thread 1 never touches `a`, so the program is correct — but every `a++` invalidates thread 1's line and every `b++` invalidates thread 0's. The line ping-pongs between cores at cache-miss latency on every iteration. **True sharing** (both threads hammering the same variable, e.g. a shared atomic) produces the same HITM signature; c2c finds both, and the offset column tells them apart.
+Thread 0 never touches `b` and thread 1 never touches `a`, so the program is correct. Every `a++` nevertheless invalidates thread 1's copy of the line and every `b++` invalidates thread 0's. The line ping-pongs between cores, and each iteration pays cache-miss latency rather than the L1 hit latency the source suggests. **True sharing** — both threads writing the same variable, for example a shared atomic counter — produces the same HITM signature. `perf c2c` reports both; **the offset column is what distinguishes them**, since true sharing concentrates all HITM on a single offset while false sharing spreads it across two or more.
 
 ## How the sampling works
 
-`perf c2c record` doesn't instrument anything. On Intel it arms two PEBS (Precise Event-Based Sampling) events — `cpu/mem-loads,ldlat=30/P` and `cpu/mem-stores/P` — that capture, for a sampled memory access, the **data address**, the **access type**, and the **load latency in cycles**. The `ldlat=30` threshold means only loads that took at least 30 cycles are eligible, which is exactly the population you care about: a line served from a remote core's cache is slow, an L1 hit isn't. AMD uses IBS and Arm uses SPE, but the idea is identical — hardware tags a subset of loads/stores with where the data came from.
+`perf c2c record` does not instrument the program. On Intel it arms two Precise Event-Based Sampling (PEBS) events, `cpu/mem-loads,ldlat=30/P` and `cpu/mem-stores/P`. For a sampled memory access these capture the **data address**, the **access type**, and the **load latency in cycles**. The `ldlat=30` threshold makes **only loads that took at least 30 cycles eligible**, which restricts the sampled population to accesses slow enough to have been served from somewhere other than a nearby cache level. AMD uses Instruction-Based Sampling (IBS) and Arm uses the Statistical Profiling Extension (SPE); the principle is the same, in that hardware tags a subset of loads and stores with the location the data was sourced from.
 
-Record system-wide while the workload runs (needs `CAP_PERFMON` or root, and `perf_event_paranoid` low enough):
+Because the events are hardware performance-monitoring events, recording requires `CAP_PERFMON` (or root) and a `perf_event_paranoid` setting permissive enough to allow them.
 
 ```console
 # high sample rate, all CPUs, user-space accesses only, for a running binary
@@ -45,13 +47,15 @@ $ sudo perf c2c record -F 60000 -a --all-user -- ./false_sharing
 $ sudo perf c2c report -NN -c pid,iaddr --stdio
 ```
 
-`-c pid,iaddr` groups the Pareto output by process and instruction address so you see the exact PC doing the damage; `-NN` shows full symbol names; `--stdio` dumps text instead of the TUI.
+`-c pid,iaddr` groups the Pareto output by process and instruction address, so the report identifies the exact program counter performing the access; `-NN` prints full symbol names; `--stdio` emits text rather than the interactive terminal interface.
 
 ## Reading the report
 
-Two tables matter. First, the **Trace Event Information** header gives you the go/no-go signal — the line `LLC Misses to Remote Cache (HITM)`. If that percentage is more than a few percent, you have cross-core cacheline contention worth chasing. Zero means false sharing is not your problem.
+Two tables carry the diagnosis.
 
-Second, the **Shared Data Cache Line Table**, sorted so the most-contended line is row 0. Each row is one 64-byte line with its virtual address and its `Rmt LLC Load Hitm` / `Lcl LLC Load Hitm` counts. Expand the hottest line into the **Pareto** distribution and you get the payoff:
+The **Trace Event Information** header reports the share of last-level-cache misses satisfied from a remote cache in the line `LLC Misses to Remote Cache (HITM)`. **A non-trivial percentage there is the signal that cross-socket cacheline contention is present and the rest of the report is worth reading.** A near-zero percentage does not by itself rule false sharing out, because contention confined to one socket is counted as local rather than remote.
+
+The **Shared Data Cache Line Table** lists one 64-byte line per row, sorted so that the most-contended line is row 0, with its virtual address and its `Rmt LLC Load Hitm` and `Lcl LLC Load Hitm` counts. Expanding the hottest line into the **Pareto** distribution yields the offset-level breakdown:
 
 ```
 =================================================
@@ -59,15 +63,15 @@ Second, the **Shared Data Cache Line Table**, sorted so the most-contended line 
 =================================================
 --- cacheline 0x557... ---
   Rmt  Lcl   Data offset   Pid    code addr   symbol        object   cpu
-  50%  49%   0x0           4123   worker_a    ./false_sharing  0,1..
-  49%  50%   0x8           4124   worker_b    ./false_sharing  0,1..
+  51%  49%   0x0           4123   worker_a    ./false_sharing  0,1..
+  49%  51%   0x8           4124   worker_b    ./false_sharing  0,1..
 ```
 
-Two different **offsets** (`0x0` and `0x8`) in the *same* line, written from two different threads on different CPUs — that is the textbook false-sharing fingerprint. `a` sits at offset 0, `b` at offset 8, both inside one line, both hot. (If a *single* offset showed all the HITM, that would be true sharing of one variable instead.)
+**Two distinct offsets (`0x0` and `0x8`) within the same line, written by two different threads running on different CPUs, is the false-sharing fingerprint.** Field `a` occupies offset 0 and field `b` offset 8; both are inside one line and both are hot. Were a single offset to account for all the HITM traffic, the diagnosis would instead be true sharing of one variable, and padding would not help.
 
-## The fix: give each writer its own line
+## Separating the writers onto distinct lines
 
-Pad or align so the two fields can never coexist in a line. C11's `alignas` (via `<stdalign.h>`) forces each field onto its own 64-byte boundary:
+The fix is to pad or align the structure so that the two fields cannot coexist in a line. C11's `alignas`, declared in `<stdalign.h>`, places each field on its own 64-byte boundary:
 
 ```c
 #include <stdalign.h>
@@ -79,6 +83,18 @@ struct counters {
 };                            // sizeof == 128 now
 ```
 
-In C++17, prefer `alignas(std::hardware_destructive_interference_size)`, which names the intent. The struct doubles in size — that is the deliberate trade: you spend memory to buy back cache independence. Re-run `perf c2c record` and the remote-HITM percentage on that line collapses toward zero. For per-thread scratch state the cleaner answer is often to not share the struct at all — give each thread its own object, or use **per-CPU data** (`__thread`, or `alloc_percpu` in kernel code) so the line is never contended in the first place.
+In C++17, `alignas(std::hardware_destructive_interference_size)` names the intent rather than hard-coding a line size. **The structure doubles in size: memory is exchanged for cache independence.** Re-running `perf c2c record` after the change shows the remote-HITM percentage for that line collapsing toward zero.
 
-**Try next:** Compile the 2-field `struct counters` above with two threads each spinning a billion increments, time it, then run `sudo perf c2c record -a --all-user -- ./yourbin` and confirm both offsets show up under one cacheline in `perf c2c report --stdio`. Add `alignas(64)` to both fields, rebuild, and compare the wall-clock time and the HITM count — on most multi-socket boxes you'll see a multiple-x speedup from a one-line change.
+For per-thread scratch state, an alternative that avoids the padding entirely is to not share the structure: give each thread its own object, or use per-CPU data (`__thread` in user space, `alloc_percpu` in kernel code), so that the line is never held by more than one core.
+
+A reproduction that exercises the whole workflow: compile the two-field `struct counters` above with two threads each performing a large number of increments, time the run, then record with `sudo perf c2c record -a --all-user -- ./yourbin` and confirm that both offsets appear under a single cacheline in `perf c2c report --stdio`. Adding `alignas(64)` to both fields, rebuilding, and comparing wall-clock time against the HITM count isolates the effect of the alignment change alone.
+
+## Pitfalls
+
+- **A zero HITM percentage on a single-socket machine does not prove the absence of contention.** The remote-HITM counter concerns lines sourced from another socket's cache; contention confined to one socket appears under `Lcl LLC Load Hitm` instead.
+- **Recording without `--all-user` mixes kernel accesses into the report,** and the hottest lines can then be kernel data structures rather than anything in the profiled program.
+- **The offset column is meaningless without the symbol.** A hot line at two offsets in an anonymous mapping identifies contention but not which fields are involved; the binary must retain symbols, and `-NN` must be passed for the full names to be printed.
+- **`ldlat=30` filters out contention that resolves quickly.** Loads completing in fewer than 30 cycles are never sampled, so a workload whose sharing is cheap on a given machine can register as clean.
+- **Padding a structure whose HITM concentrates on one offset changes nothing.** That signature is true sharing, where the threads genuinely write the same variable, and the remedy is algorithmic — sharding the counter or removing the shared write — not alignment.
+- **`perf c2c record` needs `CAP_PERFMON` or root and a permissive `perf_event_paranoid`;** without them the memory events fail to arm, and the run produces an empty or truncated report rather than an explicit diagnosis of the sharing.
+- **Alignment applies to the type, not to every allocation path.** A structure whose fields are declared `alignas(64)` still requires an allocator that honours over-aligned types, or the fields can land at offsets other than the intended boundaries.
