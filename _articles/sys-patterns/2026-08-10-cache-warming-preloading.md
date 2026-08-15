@@ -1,16 +1,16 @@
 ---
-title: "Cache Warming and Preloading: Surviving the Cold Start Before Traffic Finds You"
+title: "Cache Warming and Preloading: Surviving the Cold Start"
 date: 2026-08-10
 track: sys-patterns
-summary: "A fresh, flushed, or failed-over cache serves everything as a miss, and that flood of misses can knock over the very origin the cache was meant to protect. This article covers the cold-cache avalanche, then five warming strategies — deploy/startup warm-up, refresh-ahead, staged traffic ramp, shadow/dual-cache warming, and working-set capture — with concrete code for seeding top-N keys and a Caffeine refresh-ahead loader. Ties warming to failover and autoscaling, where every new node starts cold."
-reading_time: 6
+summary: "A fresh, flushed, or failed-over cache serves everything as a miss, and that flood of misses can knock over the origin the cache was meant to protect. This article covers the cold-cache avalanche, then five warming strategies — deploy/startup warm-up, refresh-ahead, staged traffic ramp, shadow/dual-cache warming, and working-set capture — with code for seeding top-N keys and a Caffeine refresh-ahead loader. Ties warming to failover and autoscaling, where every new node starts cold."
+reading_time: 7
 tags: [caching, cache-warming, preloading, cold-start, refresh-ahead, failover, autoscaling, interview-prep]
 sources:
   - title: "Caffeine Wiki — Refresh (refreshAfterWrite, CacheLoader.reload)"
     url: "https://github.com/ben-manes/caffeine/wiki/Refresh"
   - title: "Netflix TechBlog — Cache Warming: Agility for a Stateful Service (EVCache)"
     url: "https://netflixtechblog.com/cache-warming-agility-for-a-stateful-service-2d3b1da82642"
-  - title: "Amazon ElastiCache — Caching Strategies (Lazy Loading vs Write-Through)"
+  - title: "Amazon ElastiCache — Caching strategies for Memcached (lazy loading, write-through, TTL)"
     url: "https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/Strategies.html"
   - title: "Amazon ElastiCache — Managing Reserved Memory for Valkey and Redis OSS"
     url: "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/redis-memory-management.html"
@@ -18,57 +18,79 @@ sources:
     url: "https://aerospike.com/blog/cache-warming-explained/"
 ---
 
-A cache earns its keep by absorbing reads the origin would otherwise serve. But a cache is only useful once it's *full of the right things*. In the moment right after it comes up — a fresh deploy, a `FLUSHALL`, a Multi-AZ failover, a new autoscaled node — the cache is empty, and empty means every request is a **miss**. Each miss falls through to the origin. If your steady-state hit ratio is 95%, going cold means the database instantaneously sees roughly **20× its normal read load**. That surge is a self-inflicted [cache avalanche](/articles/distributed-systems/2026-08-10-cache-penetration-breakdown-avalanche): the cache layer, the thing meant to shield the database, becomes the reason the database falls over.
+**Gist.** A cache absorbs reads the origin would otherwise serve, but only while it holds the working set; immediately after a deploy, a flush, a failover, or a scale-out, every request is a miss and the full read load lands on the origin. Warming and preloading populate the cache before or alongside the traffic that would otherwise miss, using pre-seeded hot keys, background refresh, metered traffic ramps, or a copy of another node's contents. The cost is a second load path that must itself be rate-limited, plus the memory, complexity, and staleness the warm data introduces.
 
-This is the **cold-cache problem**, and it's dangerous because the failure correlates with your worst moments: caches go cold precisely when something already went wrong — a node died, a region flipped, you scaled out under a spike. AWS's lazy-loading guidance describes it plainly: "When a node fails and is replaced by a new, empty node, your application continues to function, though with increased latency. As requests are made to the new node, each cache miss results in a query of the database." That "increased latency" is the optimistic framing. Under load, the honest framing is: the new node points a firehose at your origin.
+## The arithmetic of a cold cache
 
-## Warm-up vs. lazy fill: when is it worth it?
+Let *h* be the steady-state hit ratio. In steady state the origin sees a fraction 1 − *h* of read traffic; with an empty cache it sees all of it. The multiplier on origin read load during the cold window is therefore **1/(1 − h)**: at *h* = 0.95 the origin instantaneously absorbs roughly **20× its normal read rate**. That surge is a self-inflicted [cache avalanche](/articles/distributed-systems/2026-08-10-cache-penetration-breakdown-avalanche) — the layer meant to shield the database becomes the reason it fails.
 
-The default is **lazy loading** (a.k.a. cache-aside): populate on miss, organically. It's simple, and it only ever caches data someone actually asked for. For most services, most of the time, lazy fill is correct — you don't need to warm a cache that comes up during a quiet window and fills gently.
+The hazard is that the multiplier applies at correlated moments. Caches go cold when something else has already gone wrong: a node died, a region flipped, a scale-out fired under a spike. AWS's lazy-loading guidance states the mechanism directly: when a node fails and is replaced by a new, empty node, the application keeps functioning with increased latency, and "each cache miss results in a query of the database". The latency increase is the visible symptom; the load multiplier is the cause.
 
-Warming earns its complexity when **the cold window overlaps with real load** and the origin can't absorb the miss flood. Concretely, warm when:
+## When warming is worth its complexity
 
-- The origin is expensive or fragile relative to peak QPS (a single primary DB, a slow downstream, an ML model).
-- The working set is **skewed** — a small hot set serves most traffic — so a little warming buys most of the benefit.
-- Cold events are *scheduled or predictable*: deploys, blue/green cutovers, autoscaling, planned failover drills.
+The default is **lazy loading** (cache-aside): entries are populated on miss. It caches only data that was requested, and for a cache that comes up during a quiet window and fills gradually, no further mechanism is needed.
+
+Warming earns its complexity when **the cold window overlaps real load** and the origin cannot absorb the miss flood. The conditions that make it pay:
+
+- The origin is expensive or fragile relative to peak queries per second (QPS) — a single primary database, a slow downstream, a machine-learning model.
+- The working set is **skewed**, so a small hot set serves most traffic and a small warm buys most of the benefit.
+- Cold events are scheduled or predictable: deploys, blue/green cutovers, autoscaling, failover drills.
 - Recompute cost per entry is high (rendered pages, aggregations, embeddings).
 
-Skip warming when the keyspace is huge and flat (no hot set to prioritize), when misses are cheap, or when the cache fills faster than traffic ramps anyway.
+Warming does not pay when the keyspace is large and flat — there is no hot set to prioritise — when misses are cheap, or when the cache fills faster than traffic ramps.
 
-## Strategy 1: Proactive warm-up on deploy/startup
+## Strategy 1: proactive warm-up on deploy or startup
 
-The most direct fix: before a node accepts traffic, push the **top-N hot keys** into it. You get the hot set from somewhere you already have — yesterday's access logs, an analytics rollup, a `hotkeys` sample, or a dump of the currently-hot keys from a sibling node. Then, crucially, gate readiness on the warm-up so the load balancer doesn't route to a cold instance.
+Before a node accepts traffic, the **top-N hot keys** are pushed into it. The key list comes from an existing source: access logs, an analytics rollup, a hot-key sample, or a dump of currently hot keys from a sibling node. **Readiness is then gated on warm-up completion**, so the load balancer does not route to a node that is still cold. Without that gate the warm-up and the live traffic contend for the same origin, and the node reports healthy while its hit ratio is near zero.
 
-```java
-// Warm the top-N hot keys before this node reports "ready".
-// hotKeys comes from log/analytics rollup, ordered by request count desc.
-public void warmUp(List<String> hotKeys, int n) {
-    var top = hotKeys.stream().limit(n).toList();
-    var pool = Executors.newFixedThreadPool(16); // bounded: don't DDoS your own DB
-    var rate = RateLimiter.create(2_000);          // cap origin QPS during warm-up
-    var inflight = new ArrayList<Future<?>>();
+Two details separate a working warm-up from an outage. First, **the warm-up must throttle itself**: a loop that issues N thousand parallel loads is the avalanche it was written to prevent, so both the concurrency and the origin request rate must be bounded. Second, **candidates are prioritised by value rather than recency** — ordering by request frequency multiplied by recompute cost, warming the leading slice, and stopping when the marginal hit-ratio gain flattens. Where the distribution is skewed, warming a small leading percentage of keys recovers the bulk of the hit ratio.
 
-    for (String key : top) {
-        inflight.add(pool.submit(() -> {
-            if (cache.get(key) != null) return;   // already present, skip
-            rate.acquire();                         // throttle the origin
-            Value v = origin.load(key);             // the expensive read we're pre-paying
-            if (v != null) cache.put(key, v);
-        }));
+### Implementation sketch (Scala)
+
+```scala
+// Seed the top-N hot keys, bounding both concurrency and origin request rate,
+// and only then flip readiness. hotKeys is ordered by request count descending.
+trait Cache[K, V]:
+  def getIfPresent(key: K): Option[V]
+  def put(key: K, value: V): Unit
+
+final class Warmer[K, V](
+    cache: Cache[K, V],
+    origin: K => Option[V],
+    maxConcurrent: Int,
+    minGapNanos: Long        // 1e9 / target origin QPS
+):
+  private val slots = Semaphore(maxConcurrent)
+  private val nextSlot = AtomicLong(System.nanoTime())
+
+  private def pace(): Unit =
+    // Each caller reserves a distinct departure instant, so successive origin
+    // reads are separated by at least minGapNanos regardless of thread count.
+    val due = nextSlot.getAndAdd(minGapNanos)
+    val wait = due - System.nanoTime()
+    if wait > 0 then LockSupport.parkNanos(wait)
+
+  def warm(hotKeys: Seq[K], n: Int)(using ExecutionContext): Future[Unit] =
+    val work = hotKeys.take(n).map { key =>
+      Future {
+        slots.acquire()
+        try
+          if cache.getIfPresent(key).isEmpty then
+            pace()
+            origin(key).foreach(cache.put(key, _))   // pre-pay the expensive read
+        finally slots.release()
+      }.recover { case _: Exception => () }          // one failed key must not abort the warm
     }
-    for (var f : inflight) { try { f.get(); } catch (Exception e) { /* log, continue */ } }
-    pool.shutdown();
-    readiness.markWarm();                            // only now: accept traffic
-}
+    Future.sequence(work).map(_ => ())
 ```
 
-Two details separate a working warm-up from an outage. First, **throttle the warm-up itself** — a warm-up loop that fires N thousand parallel loads *is* the avalanche you're trying to prevent; bound the pool and rate-limit the origin. Second, **prioritize by value, not just recency**: sort candidate keys by (request frequency × recompute cost), warm the top slice, and stop when marginal hit-ratio gain flattens. Warming the top 1–5% of keys typically recovers the bulk of your hit ratio.
+The `recover` is load-bearing: a warm-up that propagates the first failure leaves the node cold and, if readiness is gated on it, permanently out of rotation.
 
-## Strategy 2: Refresh-ahead so hot entries never expire under load
+## Strategy 2: refresh-ahead, so hot entries do not expire under load
 
-Warming fixes the *initial* cold cache. Refresh-ahead fixes a subtler cold spot: a hot key whose TTL expires at peak, forcing a synchronous miss (and, if many keys share an expiry, a [stampede](/articles/microservices/2026-08-10-cache-stampede-request-coalescing)). The idea is to **refresh popular entries in the background before they go stale**, so readers always hit a warm value.
+Warming addresses the initial cold cache. Refresh-ahead addresses a narrower cold spot: a hot key whose time-to-live (TTL) expires at peak, forcing a synchronous miss and, where many keys share an expiry instant, a [stampede](/articles/microservices/2026-08-10-cache-stampede-request-coalescing). The mechanism refreshes popular entries in the background before they become stale.
 
-Caffeine implements this directly with `refreshAfterWrite`. Per the Caffeine docs, it "will make a key eligible for refresh after the specified duration, but a refresh will only be actually initiated when the entry is queried" — and the refresh is **asynchronous**: the old cached value keeps being served to callers while the new value loads in the background. That's the whole trick — no reader ever blocks on a reload.
+Caffeine implements this with `refreshAfterWrite`. Per the Caffeine documentation, it makes a key eligible for refresh after the specified duration, but a refresh is initiated only when the entry is queried — and the refresh is **asynchronous**: the previous cached value continues to be served while the new value loads. **No reader blocks on a reload.**
 
 ```java
 LoadingCache<Key, Graph> graphs = Caffeine.newBuilder()
@@ -78,24 +100,33 @@ LoadingCache<Key, Graph> graphs = Caffeine.newBuilder()
     .build(key -> loadExpensiveGraph(key));      // CacheLoader for load AND async refresh
 ```
 
-Combining `refreshAfterWrite` (short) with `expireAfterWrite` (longer) gives the best of both: hot keys, which get queried, are refreshed silently and never expire under load; cold keys, which aren't queried, eventually hard-expire and free memory. Override `CacheLoader.reload(key, oldValue)` if you want refresh to reuse the previous value (e.g. batch reloads, or serve-stale-on-error — Caffeine keeps the old value if the reload throws). This is the pattern the [caching strategies overview](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/) recommends whenever recompute is expensive and staleness of a few seconds is acceptable.
+Pairing a short `refreshAfterWrite` with a longer `expireAfterWrite` separates the two populations: hot keys, being queried, are refreshed silently and never expire under load; cold keys, never queried, are never refreshed and hard-expire, releasing memory. Overriding `CacheLoader.reload(key, oldValue)` lets the refresh reuse the previous value — for batched reloads, or to serve the stale value on error, since Caffeine retains the old value if the reload throws. The pattern applies where recompute is expensive and a few seconds of staleness is acceptable; see also the [admission-control discussion](/articles/sys-patterns/2026-08-10-tinylfu-cache-admission-control/).
 
-## Strategy 3: Staged traffic ramp after failover
+## Strategy 3: staged traffic ramp after failover
 
-When a fresh node comes up cold, don't hand it 100% of its share instantly. **Ramp traffic gradually** — send it 5%, then 20%, then 50%, over tens of seconds — so it fills its working set from real reads while the origin sees only a fraction of the miss load at any instant. This is the load-shedding dual of warm-up: instead of pre-filling before traffic, you meter the traffic to match the fill rate. Load balancers with "slow start" (e.g. weighted ramp on newly-healthy targets) implement exactly this, and it composes well with autoscaling, where scale-out events add cold nodes mid-spike.
+A freshly started node need not receive its full share immediately. **Traffic is ramped** — a small percentage, then a larger one, over tens of seconds — so the node fills its working set from real reads while the origin sees only a fraction of the miss load at any instant. This is the dual of pre-filling: instead of loading before traffic arrives, the traffic is metered to the fill rate. Load balancers offering slow start, which weight newly healthy targets upward over an interval, implement this, and it composes with autoscaling, where scale-out adds cold nodes mid-spike.
 
-## Strategy 4: Shadow / dual-cache warming before cutover
+## Strategy 4: shadow or dual-cache warming before cutover
 
-For blue/green cache migrations or version upgrades, run the **new cache in shadow**: mirror production reads into it (and writes, if applicable) so it fills with the live working set *before* you cut over. Only flip traffic once its hit ratio matches the incumbent's. This avoids the classic migration outage where you promote a brand-new, empty cluster into the request path at full load. It costs you two caches running in parallel for a window — the price of a safe cutover.
+For cache migrations and version upgrades, the **new cache runs in shadow**: production reads (and writes, where applicable) are mirrored into it so it fills with the live working set before cutover. Traffic is flipped only once its hit ratio matches the incumbent's. This avoids promoting an empty cluster into the request path at full load. The cost is two caches running in parallel for the duration of the shadow window.
 
-## Strategy 5: Capturing the working set (mirror/replay)
+## Strategy 5: capturing the working set
 
-The most robust warm is to copy the *actual* working set rather than guess it. Netflix's EVCache does this at petabyte scale: instead of replaying traffic, they enumerate keys on source nodes (via the memcached LRU-crawler), dump values to S3 in chunks, and repopulate the target through an SQS-decoupled pipeline. Their numbers are a useful reality check on how big "warm" can get — a replaced instance "warmed up in less than 15 minutes with about 2.2 GB," a 12 TB / 500-million-item replica in ~2 hours, and their largest run warmed 700 TB across 380 nodes. The general technique — **mirror production reads into the new cache**, or dump-and-restore the hot set — gives you a warm cache without touching the origin at all, which is exactly what you want when the origin is the fragile part.
+Copying the actual working set is more reliable than predicting it. Netflix's EVCache enumerates keys on source nodes via the memcached LRU crawler, dumps values to S3 in chunks, and repopulates the target through a pipeline decoupled by SQS rather than replaying traffic. The reported figures bound what the technique handles: a replaced instance "warmed up in less than 15 minutes with about 2.2 GB"; a 12 TB, 500-million-item replica in roughly 2 hours; a largest run of 700 TB across 380 nodes. The general form — mirror production reads into the new cache, or dump and restore the hot set — **produces a warm cache without touching the origin**, which matters precisely when the origin is the fragile component.
 
 ## Failover and autoscaling: every new node starts cold
 
-Tie it together: the two most common sources of cold caches in production are **failover** and **autoscaling**, and both are automatic, so the warming must be automatic too. A Multi-AZ failover promotes a replica — warm if it was replicating, cold if it's a freshly built node. An autoscaling scale-out adds nodes *because* load is high, meaning cold nodes join at the worst possible moment. Bake warming into the lifecycle: gate the readiness/health check on warm-up completion (Strategy 1), keep hot entries fresh with refresh-ahead (Strategy 2), and use load-balancer slow-start (Strategy 3) as the safety net for the keys you didn't pre-seed. And leave headroom: AWS ElastiCache's `reserved-memory-percent` exists partly so a node can absorb this kind of burst activity without hitting swap during the exact window it's under stress.
+The two most common sources of cold caches are failover and autoscaling. Both are automatic, so the warming must be automatic as well. A Multi-AZ failover promotes a replica, which is warm if it was replicating and cold if it was freshly built. A scale-out adds nodes because load is already high, so cold nodes join under peak. The lifecycle hooks are the three preceding strategies: gate the readiness or health check on warm-up completion, keep hot entries fresh with refresh-ahead, and rely on load-balancer slow start for keys that were not pre-seeded. Memory headroom belongs in the same budget: ElastiCache's `reserved-memory-percent` sets aside part of a node's advertised memory for non-data uses — client output buffers on replicas, fragmentation loss, and the copy-on-write memory of a forked `bgsave` — so `maxmemory` is the advertised memory minus that reserve. It defaults to 25%, and the documentation states plainly that it should not be reduced.
 
-Predictive/read-replica warming is the advanced move: promote a **read replica that's already warm** instead of building a cold node, or pre-load keys you expect to be hot (time-of-day, launch schedules) before traffic arrives. The cheapest miss is the one that hits a value you loaded a minute early.
+Promoting a read replica that is already warm avoids building a cold node at all. Preloading keys expected to be hot — from time-of-day patterns or a launch schedule — moves the load off the moment of the spike.
 
-**Try next:** measure your real cold-cache blast radius — take your steady-state hit ratio, invert it to get the origin QPS multiplier during a cold start, and check whether your database can survive that number. If it can't, wire warm-up into your readiness probe and add `refreshAfterWrite` to your hottest loader.
+## Pitfalls
+
+- **An unthrottled warm-up loop reproduces the avalanche.** Issuing one origin load per hot key with unbounded parallelism sends the same burst the warming was meant to prevent, arriving earlier.
+- **Readiness that ignores warm-up state routes traffic to a cold node.** The health check passes on process start, the load balancer adds the node, and its hit ratio is zero under full share.
+- **A warm-up that aborts on the first failed key leaves the node cold.** If readiness is gated on warm-up completion, the node never enters rotation and the failure presents as reduced capacity, not as a cache error.
+- **`refreshAfterWrite` without a query never fires.** Refresh is triggered by a read of an eligible entry, so an entry that stops being queried is not refreshed; it expires under `expireAfterWrite` instead.
+- **`refreshAfterWrite` longer than `expireAfterWrite` is inert.** The entry is evicted before it becomes refresh-eligible, and every access is a synchronous load.
+- **Warming a flat keyspace consumes origin capacity for no hit-ratio gain.** Without skew there is no leading slice whose warm covers most requests, so the pre-paid loads are spent on keys that may never be read.
+- **Shadow cutover on wall-clock schedule rather than hit ratio promotes a half-filled cache.** The new cluster reports healthy while its miss rate still projects the full multiplier onto the origin.
+- **A cache filled to capacity during warm-up evicts warm entries as live traffic arrives.** Seeding more keys than the eviction policy will retain converts pre-paid loads into evictions, and origin load returns.

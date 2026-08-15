@@ -2,8 +2,8 @@
 title: "Event-based batch processing: single-purpose stages wired by queues"
 date: 2026-07-30
 track: sys-patterns
-summary: "Brendan Burns' event-driven batch pattern — chaining small stages (copier, filter, splitter, sharder, merger) where each stage's output topic is the next stage's input. Why the message wiring makes stages scale and reconfigure independently, plus back-pressure and at-least-once semantics, with a Python filter-and-republish consumer."
-reading_time: 5
+summary: "Brendan Burns' event-driven batch pattern — chaining small stages (copier, filter, splitter, sharder, merger) where each stage's output topic is the next stage's input. How the message wiring lets stages scale and be reconfigured independently, plus back-pressure and at-least-once semantics, with a filter-and-republish consumer."
+reading_time: 6
 tags: [event-driven, batch, pipeline, kafka, pubsub, backpressure, at-least-once, burns]
 sources:
   - title: "Designing Distributed Systems, 2nd Edition — Ch. 12 Event-Driven Batch Processing (Brendan Burns, O'Reilly)"
@@ -18,77 +18,81 @@ sources:
     url: "https://cloud.google.com/pubsub/docs/building-pubsub-messaging-system"
 ---
 
-A [work queue](/articles/sys-patterns/2026-07-26-work-queue-pattern) is one queue drained by interchangeable workers: every item gets the same treatment. But most real batch jobs aren't one step. You ingest raw events, drop the junk, enrich the survivors, partition by customer, and roll up per region. The naive move is to cram all of that into one program that loops over the input and does each step inline — a **monolithic batch job**.
+**Gist.** Most batch jobs are a chain of distinct transforms — ingest, discard non-matching records, enrich, partition by key, roll up — and a monolithic job joins those steps with function calls, so every step runs at the same multiplicity and any reordering means editing and redeploying the whole program. Brendan Burns' **event-driven batch processing** pattern (Chapter 12 of *Designing Distributed Systems*, 2nd ed.) instead builds each step as a single-purpose long-lived consumer and wires the steps with message topics, where **the output topic of one stage is the input topic of the next**, so each stage is scaled and rewired independently. The cost is that the pipeline no longer has a single consistent point of failure recovery: each hop is an at-least-once delivery, so every stage must be idempotent, and every inter-stage buffer needs a deliberate bound.
 
-Brendan Burns' **event-driven batch processing** pattern (Chapter 12 of *Designing Distributed Systems*, 2nd ed.) is the alternative: build each step as its own single-purpose stage, and wire the stages together with message queues, where *the output of one stage's queue is the input to the next*. The wiring — not the code inside any stage — is where the leverage is.
+## The stages, and the work the queue between them does
 
-## The stages, and why the queue between them matters
+The reusable stages are the vocabulary the [coordinated-batch article](/articles/sys-patterns/2026-07-27-coordinated-batch-workflow) enumerated — **copier** (duplicate a stream to N consumers), **filter** (drop non-matching events), **splitter** (fan one event into several), **sharder** (route by key), **merger** (recombine streams). That article covered the *coordinated* case: a barrier and a reduce, where the final answer requires every shard to have finished, mapped onto a directed acyclic graph (DAG) runtime.
 
-The reusable stages are the same vocabulary the [coordinated-batch article](/articles/sys-patterns/2026-07-27-coordinated-batch-workflow) enumerated — **copier** (duplicate a stream to N consumers), **filter** (drop non-matching events), **splitter** (fan one event into several), **sharder** (route by key), **merger** (recombine streams). That article was about the *coordinated* case: a barrier and a reduce, where the final answer needs every shard done, mapped onto a DAG runtime.
+The event-driven case is the other one. It has **no orchestrator and no barrier**. Each stage reads from an input topic, applies one transform, and publishes to an output topic. No component holds a plan of the pipeline — the topology *is* the set of topic subscriptions. Burns' framing is that chaining these queues together composes complicated event-driven workflows out of simple reusable components.
 
-This is the other case. Event-driven means there is **no orchestrator and no barrier**. Each stage is a long-lived consumer that reads from an input topic, does one transform, and publishes to an output topic. There is no central plan of the pipeline — the topology *is* the set of topic subscriptions. Burns' framing: chaining these queues together "allows for the construction of complicated event-driven workflows out of simple reusable components."
+The queue between two stages carries three distinct responsibilities:
 
-The queue between two stages is doing three jobs at once:
+- **Decoupling.** The filter stage does not call the enrich stage; it publishes to a topic. Neither stage holds the other's address, instance count, or health state.
+- **Buffering.** When enrich is momentarily slow, events accumulate in its input topic rather than blocking the filter.
+- **Reconfiguration point.** Inserting a deduplication stage between filter and enrich requires pointing filter at a new topic, subscribing dedup to it, and having dedup publish to enrich's existing input topic. No stage's code changes. In a monolith the steps are joined by function calls, so the same insertion is a source edit and a redeploy of the entire job.
 
-- **Decoupling.** The filter stage doesn't call the enrich stage; it publishes to a topic. Neither knows the other's address, count, or health.
-- **Buffering.** If enrich is momentarily slow, events pile up in its input topic instead of blocking the filter.
-- **Reconfiguration point.** Want to add a dedup stage between filter and enrich? Point filter at a new topic, subscribe dedup to it, and have dedup publish to enrich's old input. No stage's code changes. That is the payoff over a monolith: the monolith's steps are joined by *function calls*, so reordering or inserting one means editing and redeploying the whole thing.
+## Independent scaling
 
-## Independent scaling — the concrete win
+In a monolith every step runs at the same multiplicity: N copies of the process means N copies of *each* step, whether or not that step is the constraint. Where parsing is cheap and enrichment calls a slow external API, parsing is over-provisioned to keep enrichment fed.
 
-In a monolith, every step runs at the same multiplicity: N copies of the process means N copies of *each* step, whether that step needs it or not. If parsing is cheap and enrichment calls a slow external API, you over-provision parsing to feed enrichment.
+With stages wired by queues, each stage is scaled by its own consumer count against its own topic: 20 enrich consumers alongside 2 filter consumers is an ordinary configuration. Mainstream buses support this directly — Kafka through consumer groups over a partitioned topic, RabbitMQ through [multiple consumers on a queue](https://www.rabbitmq.com/tutorials/tutorial-five-python) behind a topic exchange, [Cloud Pub/Sub](https://cloud.google.com/pubsub/docs/building-pubsub-messaging-system) through multiple subscribers on a subscription. **Queue depth is the scaling signal**: a backlog growing on one topic identifies the stage that lacks capacity, without any instrumentation inside the stages.
 
-With stages wired by queues, each stage is scaled by its own consumer count against its own topic. Enrichment is the bottleneck? Run 20 enrich consumers and 2 filter consumers. Every mainstream bus supports this directly: Kafka via consumer groups on a partitioned topic, RabbitMQ via [multiple consumers on a queue](https://www.rabbitmq.com/tutorials/tutorial-five-python) behind a topic exchange, [Cloud Pub/Sub](https://cloud.google.com/pubsub/docs/building-pubsub-messaging-system) via multiple subscribers on a subscription. The queue depth is your scaling signal — a growing backlog on one topic tells you exactly which stage to add capacity to.
+One bound follows from the Kafka mechanism specifically. **Within a consumer group, a partition is assigned to at most one member**, so the useful parallelism of a stage is capped by the partition count of its input topic; adding a twenty-first consumer to a twenty-partition topic leaves that consumer idle.
 
-## A filter stage: consume, transform, republish
+## The filter stage: consume, transform, republish
 
-Here is the whole shape of an event-driven stage — a filter that reads raw events, keeps only paid orders, and republishes them to the next stage's topic. It is deliberately unremarkable; that's the point. (Kafka Streams expresses the same thing declaratively as `stream.filter(...).to("orders.paid")` — see the [DSL stateless operations](https://docs.confluent.io/platform/current/streams/developer-guide/dsl-api.html).)
+A stage is a poll loop with two ordering rules. Kafka Streams expresses the same stateless transform declaratively as `stream.filter(...).to("orders.paid")` — see the [DSL stateless operations](https://docs.confluent.io/platform/current/streams/developer-guide/dsl-api.html).
 
-```python
-import json
-from kafka import KafkaConsumer, KafkaProducer
+### Implementation sketch (Scala)
 
-IN_TOPIC  = "orders.raw"
-OUT_TOPIC = "orders.paid"
+Scala 3 over the Kafka Java client. Imports, serde configuration and error handling are omitted.
 
-consumer = KafkaConsumer(
-    IN_TOPIC,
-    group_id="filter-paid",          # scale by adding members to this group
-    enable_auto_commit=False,        # we commit only after the send is durable
-    max_poll_records=100,
-    value_deserializer=lambda b: json.loads(b),
-)
-producer = KafkaProducer(
-    value_serializer=lambda v: json.dumps(v).encode(),
-    acks="all",                      # wait for replicas before considering it sent
-)
+```scala
+val consumer = KafkaConsumer[String, String](consumerProps)  // enable.auto.commit=false
+val producer = KafkaProducer[String, String](producerProps)  // acks=all
+consumer.subscribe(java.util.List.of("orders.raw"))
 
-def keep(order: dict) -> bool:
-    return order.get("status") == "paid"
+def keep(order: String): Boolean = order.contains("\"status\":\"paid\"")
 
-for batch in iter(lambda: consumer.poll(timeout_ms=1000), None):
-    for tp, records in batch.items():
-        for rec in records:
-            order = rec.value
-            if keep(order):
-                producer.send(OUT_TOPIC, order)   # this stage's output = next stage's input
-    producer.flush()                 # make the republished events durable...
-    consumer.commit()                # ...THEN advance our input offset
+while true do
+  val records = consumer.poll(java.time.Duration.ofSeconds(1))
+  records.forEach { rec =>
+    if keep(rec.value()) then
+      // this stage's output topic is the next stage's input topic; the input
+      // key is carried through so downstream partitioning stays stable
+      producer.send(ProducerRecord("orders.paid", rec.key(), rec.value()))
+  }
+  producer.flush()      // republished events durable on the brokers first
+  consumer.commitSync() // only then advance this stage's input offset
 ```
 
-Two ordering rules carry all the correctness:
+Two ordering rules carry the correctness of the whole hop:
 
-1. **Flush the output before committing the input.** Send-then-commit means a crash between the two only ever *re-processes* input, never *loses* output. Commit-then-send would drop events on a crash.
-2. **`acks="all"` on the producer.** The republished event isn't "done" until the broker has replicated it, or a stage crash could acknowledge input for output that never survived.
+1. **Flush the output before committing the input.** Send-then-commit means a crash between the two re-processes input; it never loses output. Commit-then-send loses events whenever the process dies in the window.
+2. **`acks=all` on the producer.** Without it the send is acknowledged before the record is replicated, so a broker failure can lose an output record whose input offset has already been committed — the exact loss the first rule was written to prevent.
 
-## Back-pressure and at-least-once are not optional
+## Back-pressure and at-least-once
 
-Because stages run at different speeds, a fast upstream stage can outrun a slow downstream one. The queue absorbs the difference — until it can't. **Back-pressure** is what stops the buffer from growing without bound: a pull-based consumer (Kafka, Pub/Sub) naturally applies it, because a saturated stage simply polls slower, its lag grows, and the upstream stage's writes eventually block or get throttled on a bounded topic. A push-based fan-out with no bound will instead exhaust memory or start dropping. Design the buffer bound on purpose; don't discover it in production.
+Stages run at different speeds, so a fast upstream stage can outrun a slow downstream one. The queue absorbs the difference until the queue's bound is reached. **Back-pressure** is what keeps the buffer from growing without bound. A pull-based consumer (Kafka, Pub/Sub) bounds the *in-process* work directly: a saturated stage fetches its next batch only when it is ready for one, so the backlog accumulates in the broker rather than in the consumer's heap. A push-based fan-out with no bound has no such mechanism and instead exhausts memory or drops events.
 
-The send-then-commit ordering above buys correctness at a price: **at-least-once delivery.** A crash after `flush()` but before `commit()` replays that batch, so the next stage sees some events twice. This is the same tax the work-queue pattern pays, and the same fix applies — **every stage must be idempotent.** Key downstream writes by a stable event ID (upsert, dedup set, or an idempotent producer) so a replayed event is a no-op rather than a double count. Exactly-once across an arbitrary chain of independently-deployed stages is expensive and usually unnecessary; at-least-once plus idempotent stages is the pattern's normal operating point.
+That is where the honest limit of the pattern sits: moving the backlog to the broker bounds the consumer, not the pipeline. **The buffer bound is a design parameter, and on the usual buses reaching it discards data rather than slowing the producer.** A Kafka topic's retention limit deletes the oldest records once the size or time bound is passed, whether or not a stage has read them; a RabbitMQ queue with a `max-length` limit drops messages at the head by default, and only rejects new publishes when configured with the `reject-publish` overflow behaviour; Pub/Sub drops unacknowledged messages past the subscription's message-retention duration. Genuine upstream throttling has to be built — by rate-limiting the producing stage against observed lag — and is not a property the bus supplies.
 
-## When to reach for it
+The send-then-commit ordering buys durability at a stated price: **at-least-once delivery**. A crash after the flush and before the commit replays the batch, and the next stage observes those events twice. This is the same tax the [work queue](/articles/sys-patterns/2026-07-26-work-queue-pattern) pattern pays, and the same remedy applies — **every stage must be idempotent**. Keying downstream writes by a stable event identifier (an upsert, a deduplication set, or Kafka's idempotent producer) makes a replayed event a no-op rather than a double count. Note that the duplicates compound along the chain: a replay at stage 1 produces duplicate input for stages 2 and 3 as well, so idempotence is required at every stage, not only at the sink.
 
-Use event-driven batch when the job is a *chain of transforms* on a stream: multiple distinct steps, steps that scale at different rates, or a topology you expect to reshape. Use a plain work queue when there's really one step and any worker can do it. Reach for the coordinated variant only when a final result must wait on every shard — that barrier is exactly what the event-driven pattern deliberately omits, and omitting it is what lets each stage run and scale on its own clock.
+## When the pattern applies
 
-**Try next:** Stand up a two-stage pipeline locally with a single `docker-compose.yml` — one Kafka (or RabbitMQ) broker, a `filter` service, and an `enrich` service subscribed to `orders.paid`. Give `enrich` a `time.sleep(0.5)` per event, then flood `orders.raw` and watch the consumer lag on `orders.paid` climb. Scale only `enrich` with `docker compose up --scale enrich=5` and watch the lag drain — back-pressure and independent scaling, both visible in one terminal.
+Event-driven batch fits a *chain of transforms* over a stream: several distinct steps, steps whose throughput requirements differ, or a topology expected to be reshaped. A plain work queue fits when there is one step and any worker can perform it. The coordinated variant is required only when a final result must wait on every shard — that barrier is precisely what the event-driven pattern omits, and its omission is what allows each stage to run and scale on its own clock.
+
+A two-stage pipeline demonstrates both properties locally: one broker, a `filter` service, and an `enrich` service subscribed to `orders.paid` with an artificial half-second delay per event. Flooding `orders.raw` makes consumer lag on `orders.paid` climb; scaling only `enrich` drains it, with the filter stage untouched.
+
+## Pitfalls
+
+- **Committing the input offset before flushing the output** loses every event in the in-flight batch when the process dies in that window, and the loss is silent — the input offset has already advanced past the records.
+- **`acks=1` or `acks=0` on an inter-stage producer** reintroduces that same loss at the broker layer even with correct commit ordering, because the input offset advances on a record that was never replicated.
+- **A non-idempotent sink** turns an ordinary consumer-group rebalance into double counting: the rebalance replays uncommitted records, and the sink applies them a second time.
+- **Adding consumers beyond the input topic's partition count** produces idle members rather than throughput, because a partition is assigned to at most one member of a group.
+- **An unbounded push-based fan-out between stages** removes back-pressure entirely; the slow stage's backlog is held in memory and the failure surfaces as an out-of-memory kill rather than as growing lag.
+- **Assuming the broker's size or time bound throttles the upstream stage** inverts what the bound does: Kafka retention and a default RabbitMQ `max-length` limit discard messages when the bound is reached, so a backlog that outlives the retention window is lost silently rather than pushing back.
+- **Treating queue depth as a health metric rather than a capacity signal** hides which stage is the constraint: depth grows on the topic *upstream* of the saturated stage, not inside it.
+- **Rewiring a topology by repointing a producer while consumers are mid-batch** leaves the old topic with records no stage will read; the events are not lost, but nothing consumes them until a subscription is restored.

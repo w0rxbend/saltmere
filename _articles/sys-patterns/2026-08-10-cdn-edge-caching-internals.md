@@ -2,8 +2,8 @@
 title: 'CDN & Edge Caching Internals: The Request Path from PoP to Origin'
 date: 2026-08-10
 track: sys-patterns
-summary: How a CDN actually caches at the edge — the request path through PoPs, mid-tier shields, and origin; cache keys and header normalization; Surrogate-Control vs Cache-Control precedence; HIT/MISS/EXPIRED and the Age header; tiered caching and origin shielding as a stampede defense at CDN scale; request collapsing; surrogate-key/cache-tag purge; and the dynamic-content escape hatches (ESI, stale-while-revalidate, compute@edge). With concrete Fastly, Cloudflare, Akamai, and Varnish/VCL examples.
-reading_time: 6
+summary: The request path a content delivery network takes through edge points of presence, mid-tier shields, and origin; cache-key construction and header normalization; Surrogate-Control versus Cache-Control precedence; HIT/MISS/EXPIRED status and the Age header; tiered caching and origin shielding as a stampede defence at CDN scale; request collapsing and hit-for-pass; surrogate-key and cache-tag purge; and the dynamic-content escape hatches (ESI, stale-while-revalidate, compute at the edge). With Fastly, Cloudflare, Akamai, and Varnish/VCL examples.
+reading_time: 8
 tags:
 - cdn
 - edge-caching
@@ -44,74 +44,109 @@ sources:
   url: https://datatracker.ietf.org/doc/html/rfc5861
 ---
 
-A CDN is a cache with a map of the world stapled to it. The protocol-level rules — `Cache-Control`, `ETag`, freshness, revalidation — are covered in [HTTP caching semantics](/articles/microservices/2026-08-10-http-caching-cache-control-etag). This article is about what a content delivery network adds on top: a physical topology of caches, a key that decides what counts as "the same object," and controls that let you override the origin's opinion about caching entirely. The load-shedding math behind coalescing lives in [cache stampede & request coalescing](/articles/microservices/2026-08-10-cache-stampede-request-coalescing); here we look at how it plays out across PoPs.
+**Gist.** A single origin cannot answer every request in the world at acceptable latency, and a flat fleet of independent edge caches converts one cold object into one origin fetch per cache. A content delivery network (CDN) addresses both with a layered topology — edge point of presence (PoP), mid-tier shield, origin — plus a cache key that decides object identity and a purge mechanism that invalidates by logical tag rather than by URL. The cost is that correctness now depends on key construction and invalidation reach: an over-broad key fragments the cache into near-unique entries, and a tag that fails to cover an object leaves stale content served for the full time-to-live (TTL).
+
+The protocol-level rules — `Cache-Control`, `ETag`, freshness, revalidation — are covered in [HTTP caching semantics](/articles/microservices/2026-08-10-http-caching-cache-control-etag), and the load-shedding arithmetic behind coalescing in [cache stampede & request coalescing](/articles/microservices/2026-08-10-cache-stampede-request-coalescing).
 
 ## The request path
 
-Follow a single request. A client resolves your hostname via anycast DNS and lands on the nearest **edge PoP** (point of presence) — Cloudflare and Fastly each run hundreds. The edge checks its local cache. On a **HIT**, the object is served immediately and the story ends in a few milliseconds.
+A client resolves the hostname to an anycast address — one Internet Protocol (IP) address announced from many locations, with Border Gateway Protocol (BGP) routing each client to a topologically near announcement — and reaches a nearby **edge PoP**. On a **HIT** in the local cache, the object is returned from that PoP and no further hop occurs.
 
-On a **MISS**, the edge does *not* necessarily go to origin. In a tiered topology it forwards to a **mid-tier / shield PoP** — a cache chosen for its proximity to your origin. Only if the shield also misses does a request cross the open internet to your **origin**:
+On a **MISS**, the edge does not necessarily contact origin. In a tiered topology it forwards to a **mid-tier or shield PoP**, chosen for proximity to the origin. Only when the shield also misses does a request traverse the public internet to the origin:
 
 ```
 client → edge PoP → (shield / upper-tier PoP) → origin
 ```
 
-Each hop is a cache; each layer that answers is a layer origin never hears about. The whole game is maximizing the fraction of traffic that terminates as far left in that chain as possible.
+**Every hop is itself a cache, so each layer that answers is a layer the origin never observes.** The design objective is to maximize the fraction of traffic terminating as early in that chain as possible.
 
 ## Cache keys and normalization
 
-The edge decides "have I seen this before?" by computing a **cache key**. By default the key is the request's identity: scheme, host, and path plus query string. Cloudflare's default key is the full URL (scheme + host + URI-with-query), plus a few CORS/method/forwarding headers. Query strings matter — `?foo=bar` and `?foo=baz` are two different objects by default.
+The edge determines object identity by computing a **cache key**. Cloudflare's default key is the full uniform resource locator (URL) — scheme, host, and uniform resource identifier (URI) including query string — together with a small set of cross-origin resource sharing (CORS), method, and forwarding headers. **Because the query string participates by default, `?foo=bar` and `?foo=baz` are distinct objects.**
 
-That default is often wrong for real traffic, and normalization is where hit ratios are won or lost. Marketing UTM parameters (`?utm_source=...`) don't change the response but fragment the cache: a hundred campaign variants of one article become a hundred cold entries. So CDNs let you rewrite the key:
+Urchin Tracking Module (UTM) marketing parameters such as `?utm_source=...` do not alter the response body but do alter the key, so *n* campaign variants of one document occupy *n* cold entries. CDNs therefore expose key rewriting:
 
-- **Query string include/exclude.** Cloudflare lets you `include` only meaningful params or `exclude: "*"` to drop the query string from the key entirely.
-- **Selected headers.** Fold specific request headers into the key (e.g. `Accept-Encoding`, device type). Cloudflare restricts which headers are eligible and forbids `Cookie` in the key directly.
-- **Host / cookie / device.** Normalize the host, key on a specific cookie, or split `mobile`/`desktop`/`tablet` variants.
+- **Query-string include/exclude.** Cloudflare supports listing only the parameters that affect the response with `include`, or `exclude: "*"` to remove the query string from the key entirely.
+- **Selected headers.** Specific request headers (for example `Accept-Encoding`, or a device-type header) may be folded into the key. Cloudflare restricts which headers are eligible and **forbids `Cookie` as a key header directly**.
+- **Host, cookie, and device.** The host may be normalized, a named cookie keyed on, and `mobile`/`desktop`/`tablet` variants separated.
 
-The origin's own tool for this is the `Vary` response header — `Vary: Accept-Encoding` tells the cache to keep separate gzip and brotli copies. Over-broad `Vary` (e.g. `Vary: User-Agent`) shatters the cache into near-unique entries and is a classic self-inflicted MISS storm.
+The origin's own instrument is the `Vary` response header: `Vary: Accept-Encoding` instructs caches to retain separate gzip and Brotli representations. **`Vary: User-Agent` partitions the cache along a near-unique axis**, since user-agent strings vary per browser build, and produces a sustained MISS rate.
 
 ## Edge TTLs: overriding the origin
 
-Origins frequently send caching headers meant for *browsers* (`Cache-Control: max-age=0, private`) while still wanting the CDN to cache aggressively. The mechanism that separates the two audiences is **`Surrogate-Control`**, a header aimed specifically at proxies and CDNs.
+Origins commonly emit caching headers intended for browsers (`Cache-Control: max-age=0, private`) while still requiring aggressive CDN caching. **`Surrogate-Control` is the header addressed to proxies and CDNs rather than to user agents**, which separates the two audiences.
 
-Fastly computes the edge TTL from `Surrogate-Control` in the same way it would from `Cache-Control`, but **prefers `Surrogate-Control` when both are present**, and strips it before the response reaches the client. So this response tells the browser not to cache while telling the edge to cache for a day and serve stale for a minute during revalidation:
+Fastly computes the edge TTL from `Surrogate-Control` using the same rules it applies to `Cache-Control`, **prefers `Surrogate-Control` when both headers are present, and strips it from the response before it reaches the client**. The following pair instructs the browser not to cache while granting the edge a one-day object with a one-minute stale-while-revalidate window:
 
 ```http
 Cache-Control: max-age=0, private
 Surrogate-Control: max-age=86400, stale-while-revalidate=60, stale-if-error=86400
 ```
 
-The browser sees `Cache-Control: max-age=0`. The edge sees a 24-hour object. When these are absent, CDNs fall back to their own default TTL (Cloudflare's Edge Cache TTL, set via Cache Rules) — a CDN-specific TTL that has nothing to do with what the origin said.
+`stale-while-revalidate` and `stale-if-error` are defined in RFC 5861. When neither caching header is present, the CDN applies its own default TTL — Cloudflare's Edge Cache TTL, configured through Cache Rules — unrelated to anything the origin stated.
 
 ## HIT, MISS, EXPIRED, and the Age header
 
-CDNs expose their decision so you can debug it. Fastly returns `X-Cache: HIT`/`MISS` (and `HIT, MISS` across the edge/shield pair); Cloudflare returns `CF-Cache-Status: HIT | MISS | EXPIRED | REVALIDATED | DYNAMIC | BYPASS`. `EXPIRED` means the object was present but stale, so the edge revalidated with origin.
+Fastly returns `X-Cache: HIT` or `MISS`, and `HIT, MISS` for the edge/shield pair, recording the outcome at each tier. Cloudflare returns `CF-Cache-Status` with values including `HIT`, `MISS`, `EXPIRED`, `REVALIDATED`, `DYNAMIC`, and `BYPASS`. **`EXPIRED` denotes an object that was present but stale, prompting revalidation against origin** — distinct from `MISS`, where no copy existed.
 
-The `Age` header is the honest clock: how many seconds the object has sat in caches since it was fetched from origin. `Age: 3600` on a `max-age=86400` object means 23 hours of freshness remain. A response that keeps returning `Age: 0` is never actually caching — a MISS wearing a HIT's clothes.
+The `Age` header reports how many seconds the object has resided in caches since it was fetched from origin. `Age: 3600` on a `max-age=86400` object leaves 23 hours of freshness. **A response whose `Age` is persistently 0 is not being cached**, whatever the status header claims.
 
 ## Tiered caching and origin shielding
 
-Here is the CDN-scale stampede defense. Without shielding, every edge PoP that misses talks to origin independently — hundreds of PoPs, each a separate cold-cache client hammering your servers for the same object. **Shielding** designates one PoP as the funnel: as Fastly puts it, "visitor requests from across the global network funnel through a single, designated shield PoP" before reaching origin. The edge caches for users; the shield caches for edges. An edge MISS becomes a shield HIT far more often than an origin request.
+Without a shield tier, every edge PoP that misses contacts origin independently, so fan-out scales with the number of PoPs. **Shielding designates one PoP as a funnel**: Fastly documents that "visitor requests from across the global network funnel through a single, designated shield PoP" before reaching origin. The edge caches for users; the shield caches for edges.
 
-Cloudflare's **Tiered Cache** is the same idea: lower-tier data centers (closest to visitors) query an upper tier, and "only the upper-tier can ask the origin for content." **Smart Tiered Cache** picks that upper tier automatically using latency data to find the data center best-connected to your origin. Akamai's equivalent is **Tiered Distribution** / cache parents; Varnish deployments build the shape by hand with an edge tier pointing at an origin-side Varnish tier.
+Cloudflare's **Tiered Cache** implements the same shape: lower-tier data centres query an upper tier, and "only the upper-tier can ask the origin for content." **Smart Tiered Cache** selects that upper tier automatically using latency data to identify the data centre best connected to the origin. Akamai's counterpart is Tiered Distribution with cache parents; Varnish deployments construct the topology explicitly, with an edge tier using an origin-side Varnish tier as its backend.
 
-The payoff: a viral object experiences at most one origin fetch per shield, not one per edge PoP. Origin load is bounded by the number of shields, not the number of PoPs or users.
+The invariant that follows: **for a given object, origin fetches are bounded by the number of shields rather than the number of edge PoPs or clients.**
 
 ## Request collapsing (coalescing)
 
-Within a single PoP, the second defense is **request collapsing**. When many requests for the same key arrive during a MISS, only the first goes to the backend; the rest join a waiting list and are all served from the single fetched response. Fastly enables this by default for cacheable misses in both VCL and Compute services. Combined with clustering inside a PoP and the shield tier, Fastly notes there are "up to four opportunities" to collapse a request before it reaches origin.
+Within a single PoP the second defence is **request collapsing**. When several requests for the same key arrive while a MISS is outstanding, only the first is forwarded to the backend; the remainder wait and are served from that one fetched response. **Fastly enables collapsing by default for cacheable misses in both Varnish Configuration Language (VCL) and Compute services.** Combined with clustering inside a PoP and the shield tier, a request can meet collapsing at more than one point before it reaches origin: at the edge PoP and again at the shield.
 
-The dangerous corner is uncacheable content: if the response turns out to be `private`, waiting requests can't share it and must proceed one at a time — turning a queue into serialized multi-second latency. The fix is a **hit-for-pass** object: cache the *decision* "don't cache this" for a short window so subsequent requests skip the queue and fetch concurrently. In Varnish/VCL this is `beresp.uncacheable` in `vcl_backend_response`; the concept exists precisely so coalescing doesn't backfire on dynamic responses.
+The failure mode is uncacheable content. **If the fetched response is `private` or otherwise uncacheable, the waiting requests cannot share it and must be issued serially**, so a queue of *n* waiters becomes *n* sequential backend round trips. The remedy is a **hit-for-pass** object: cache the decision "this key is not cacheable" for a short interval so subsequent requests bypass the queue and fetch concurrently. VCL expresses it by marking the backend response uncacheable — `set beresp.uncacheable = true;` in Varnish's `vcl_backend_response` — which stores a short-lived hit-for-pass entry instead of the object.
+
+### Implementation sketch (Scala)
+
+A single-flight map is the load-bearing part of collapsing: one in-flight fetch per key, with a short-lived negative decision recorded when the result proves uncacheable.
+
+```scala
+import java.util.concurrent.ConcurrentHashMap
+import scala.concurrent.{Future, ExecutionContext}
+
+final case class Fetched(body: Array[Byte], cacheable: Boolean)
+
+final class Collapser(fetch: String => Future[Fetched], hitForPassMillis: Long)(using ec: ExecutionContext):
+  private val inFlight = ConcurrentHashMap[String, Future[Fetched]]()
+  private val hitForPass = ConcurrentHashMap[String, Long]()
+
+  def get(key: String): Future[Fetched] =
+    if hitForPass.getOrDefault(key, 0L) > System.currentTimeMillis() then
+      fetch(key) // known uncacheable: bypass the queue, fetch concurrently
+    else
+      var started = false
+      // computeIfAbsent runs the mapping function under the bin lock, so exactly
+      // one caller starts the backend request for this key; later callers join it.
+      val f = inFlight.computeIfAbsent(key, k => { started = true; fetch(k) })
+      if started then
+        f.onComplete { result =>
+          inFlight.remove(key, f)
+          if result.toOption.exists(!_.cacheable) then
+            hitForPass.put(key, System.currentTimeMillis() + hitForPassMillis)
+        }
+      f
+```
+
+The mapping function must not block: `ConcurrentHashMap.computeIfAbsent` holds a bin lock for its duration, so `fetch` returns a `Future` rather than a value.
 
 ## Purge and invalidation
 
-Caching is easy; invalidating is the hard half. CDNs offer three granularities:
+CDNs offer three granularities of invalidation:
 
-1. **Single-URL purge** — evict exactly `https://ex.com/article/42`. Precise, but you must know every URL.
-2. **Wildcard / path purge** — evict `https://ex.com/blog/*`. Coarse and often slower.
-3. **Surrogate-key / cache-tag purge** — the powerful one. The origin tags each response with a `Surrogate-Key` header (Cloudflare calls it `Cache-Tag`), listing logical groups the object belongs to. Purging a key evicts every object carrying it, everywhere, at once.
+1. **Single-URL purge** — evicts exactly `https://ex.com/article/42`. Precise, but requires enumerating every affected URL.
+2. **Wildcard or path purge** — evicts `https://ex.com/blog/*`. Coarse, and typically slower.
+3. **Surrogate-key or cache-tag purge** — the origin tags each response with a `Surrogate-Key` header (Cloudflare's equivalent is `Cache-Tag`) listing the logical groups the object belongs to. Purging a key evicts every object carrying it.
 
-Concretely: a product page and a category page both embed product 812. Origin tags each response:
+A product page and a category page may both embed product 812:
 
 ```http
 # response for /product/812
@@ -121,27 +156,32 @@ Surrogate-Key: product-812 category-shoes brand-acme
 Surrogate-Key: category-shoes
 ```
 
-Keys are space-separated and many-to-many — one object carries several keys, one key spans many objects. When product 812's price changes, one API call purges everything referencing it, without you enumerating URLs:
+**Keys are space-separated and the relation is many-to-many**: one object carries several keys, one key spans many objects. When product 812 changes, a single call purges every object referencing it:
 
 ```bash
 curl -X POST https://api.fastly.com/service/$SERVICE/purge/product-812 \
   -H "Fastly-Key: $TOKEN"
 ```
 
-Both `/product/812` and any other page tagged `product-812` go stale instantly; the category page tagged only `category-shoes` stays cached. This is how large sites keep TTLs high (great hit ratios) while still reflecting edits in seconds.
+`/product/812` and any other object tagged `product-812` are invalidated; the category page, tagged only `category-shoes`, remains cached. **This decouples TTL length from edit latency**: long TTLs sustain the hit ratio while tag purges propagate edits without waiting for expiry. Fastly also documents *soft* purge, which marks objects stale rather than evicting them, so `stale-while-revalidate` and `stale-if-error` behaviour still applies.
 
-## Dynamic vs static content
+## Dynamic content
 
-Not everything is a cacheable blob. The edge has escape hatches for the rest:
+Three mechanisms cover content that is not a static blob:
 
-- **ESI (Edge Side Includes).** Cache the page shell for hours, mark a fragment `<esi:include src="/cart-summary"/>`, and let the edge assemble personalized bits per request. Supported in Fastly VCL and Varnish (`esi` in `vcl_backend_response`).
-- **stale-while-revalidate at the edge.** Serve the stale copy instantly and revalidate in the background so no user waits on origin; pair with `stale-if-error` to ride out origin outages.
-- **Compute@edge.** Fastly Compute (WebAssembly) and Cloudflare Workers run code in the PoP — computing cache keys, doing auth, synthesizing responses — turning the CDN into a programmable layer in front of your cache.
+- **Edge Side Includes (ESI).** The page shell is cached with a long TTL and a fragment is marked `<esi:include src="/cart-summary"/>`; the edge assembles the per-request portion. Supported in Varnish and Fastly VCL; Varnish enables parsing with `set beresp.do_esi = true;` on the backend response.
+- **stale-while-revalidate at the edge.** The stale copy is returned immediately and revalidation proceeds in the background. `stale-if-error` extends the same tolerance across origin failures.
+- **Compute at the edge.** Fastly Compute (WebAssembly) and Cloudflare Workers execute code inside the PoP — computing cache keys, performing authorization, synthesizing responses.
 
-The through-line: a modern CDN is not a dumb mirror. It is a distributed, programmable cache designed to answer as far from your origin as possible — and to invalidate precisely enough that you can afford to.
+## Hit ratio arithmetic
 
-**Try next:** Add `Surrogate-Key` headers to two related endpoints in a test service, cache them with a long `Surrogate-Control: max-age`, then watch `Age` climb on repeated requests and drop to zero after a single-key purge — and compare `CF-Cache-Status` / `X-Cache` before and after enabling shielding or Tiered Cache.
+Hit ratio is hits / (hits + misses); the operationally relevant quantity is its complement. **Origin load = (1 − hit ratio) × request rate.** At 10,000 requests per second, a 90% ratio yields 1,000 rps at origin and a 99% ratio yields 100 rps. **Moving from 98% to 99% halves origin traffic** — the same arithmetic that makes a purge-all severe, since it drives the ratio to 0% against an origin provisioned for 1% of request volume.
 
-## Hit ratio math
+## Pitfalls
 
-Cache hit ratio = hits / (hits + misses). The number that matters is its complement: **origin load = (1 − hit ratio) × request rate**. At 10,000 rps, 90% → 1,000 rps to origin; 99% → 100 rps. Moving from 98% to 99% *halves* origin traffic — which is why origin shield exists, why you normalize cache keys (strip marketing query params, limit `Vary`), and why a purge-all is so violent: it takes you to 0% instantly against an origin provisioned for 1%.
+- **`Vary: User-Agent` on a cacheable page.** Symptom: near-zero hit ratio despite correct TTLs. Cause: the cache stores one entry per user-agent string, and user-agent strings differ per browser build.
+- **`Age: 0` on every response.** Symptom: origin traffic matches client traffic. Cause: the object is not being stored — commonly `Cache-Control: private`, a `Set-Cookie` on the response, or a non-cacheable method — regardless of the status header.
+- **Request collapsing on uncacheable responses.** Symptom: latency grows linearly with concurrency on a dynamic endpoint. Cause: waiters cannot share a `private` response and are served serially; a hit-for-pass object is required to release them.
+- **`Surrogate-Control` expected to reach the client.** Symptom: the header is absent in browser developer tools. Cause: Fastly strips `Surrogate-Control` before delivering the response.
+- **Surrogate keys that omit an embedding page.** Symptom: a product edit appears on `/product/812` but not on the category listing that embeds it. Cause: the listing response was never tagged `product-812`, so the key purge does not reach it.
+- **Purge-all as a routine deployment step.** Symptom: origin saturates immediately after release. Cause: the hit ratio drops to zero at once, and origin capacity is sized for the miss fraction, not the full request rate.

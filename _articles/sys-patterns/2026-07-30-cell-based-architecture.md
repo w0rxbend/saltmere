@@ -1,9 +1,9 @@
 ---
-title: "Cell-Based Architecture: Sharding Failures, Not Just Load"
+title: "Cell-Based Architecture: Sharding Failures, Not Only Load"
 date: 2026-07-30
 track: sys-patterns
-summary: "A cell is a complete, isolated copy of your stack; a thin router maps each partition key to exactly one cell. The payoff isn't spreading load — it's capping blast radius so one bad deploy, poison request, or gray AZ failure takes down 1/N of users instead of all of them."
-reading_time: 5
+summary: "A cell is a complete, isolated copy of a stack; a thin router maps each partition key to exactly one cell. The payoff is not spreading load but capping blast radius, so one bad deploy, poison request, or gray availability-zone failure affects 1/N of users rather than all of them."
+reading_time: 6
 tags: [cell-based, blast-radius, shuffle-sharding, fault-isolation, partitioning, bulkheads, aws]
 sources:
   - title: "Reducing the Scope of Impact with Cell-Based Architecture (AWS Well-Architected)"
@@ -18,47 +18,70 @@ sources:
     url: "https://about.roblox.com/newsroom/2023/12/making-robloxs-infrastructure-efficient-resilient"
 ---
 
-The [sharded service](/articles/sys-patterns/2026-07-26-sharded-service-pattern) splits *state* across nodes so you can hold more of it. Cell-based architecture splits the *entire stack* — load balancer, compute, database, queues, caches — into complete, self-sufficient copies so that when something breaks, it breaks in only one of them. The two look similar on a whiteboard (a router in front, a partition key, N buckets behind), but they optimize for opposite things. Sharding chases capacity. Cells chase a bounded, predictable failure.
+**Gist.** A failure in a shared stack — a bad deploy, a request that crashes its handler, a degraded availability zone (AZ) — propagates to every user of that stack. Cell-based architecture replicates the *whole* stack into N independent copies and routes each partition key to exactly one of them, so the failure domain of any single fault is one cell. The cost is duplicated infrastructure, a hard prohibition on cross-cell coupling, and the need to migrate tenants between cells without losing writes.
 
-AWS states the goal plainly: a cell is "an instance of your complete workload, with everything needed to operate independently." The design rule that follows is the whole pattern in one line — cells "should have no dependency on each other at all (that is, no cross-cell API calls, no shared resources like databases or S3 buckets)." A shard that loses its node darkens a slice of the keyspace but still shares a control plane, a deploy pipeline, and a database engine with every other shard. A cell shares none of that. That is what turns "a slice went dark" into "a slice went dark *and nothing else could*."
+## Cells are not shards
 
-## The router is the one shared thing, so keep it dumb
+The [sharded service](/articles/sys-patterns/2026-07-26-sharded-service-pattern) splits *state* across nodes so more of it fits. Cell-based architecture splits the *entire stack* — load balancer, compute, database, queues, caches — into complete, self-sufficient copies. Both diagrams show a router, a partition key and N buckets behind, but the optimisation targets differ: sharding pursues capacity, cells pursue a bounded failure.
 
-Every cell architecture has exactly one component that spans cells: the router that maps a partition key to a cell. It is also the one component whose failure isn't contained — so its blast radius is the whole system. AWS's guidance is therefore almost aggressively minimalist: keep the router "as simple and horizontally scalable as possible," "avoid complex business logic within this layer," and prefer a "computationally efficient" mapping such as "combining cryptographic hash functions and modular arithmetic."
+AWS defines a cell as an instance of the complete workload, with everything needed to operate independently, and the isolation rule follows directly: cells "should have no dependency on each other at all (that is, no cross-cell API calls, no shared resources like databases or S3 buckets)". **The invariant is the absence of shared state and shared control paths, not the presence of a partition key.** A shard that loses its node darkens a slice of the keyspace while still sharing a control plane, a deployment pipeline and a database engine with every other shard; a correlated fault in any of those affects all shards at once. A cell shares none of them.
 
-A hash-mod router is stateless and trivially testable, but it makes migration painful (change `N` and most keys move). Most large deployments instead keep an explicit lookup table, so any key can be reassigned without moving its neighbors:
+## The router is the single shared component
 
-```python
-CELLS = ["cell-a", "cell-b", "cell-c", "cell-d"]
+Every cell architecture contains exactly one component that spans cells: the router mapping a partition key to a cell identifier. Its failure is by construction not contained, so its blast radius is the whole system. AWS's guidance is correspondingly minimal — keep the router "as simple and horizontally scalable as possible", "avoid complex business logic within this layer", and prefer a "computationally efficient" mapping such as "combining cryptographic hash functions and modular arithmetic".
 
-# Explicit overrides win; everything else falls to a stable hash.
-PLACEMENT = {}  # partition_key -> cell_id, e.g. after a migration
+A hash-and-modulus router is stateless and cheap to test, but changing N moves most keys, which makes tenant migration a global event. The common alternative keeps an **explicit placement table consulted before the hash**, so an individual key can be reassigned without disturbing its neighbours. The hash then serves only as the default for keys with no explicit entry.
 
-def cell_for(partition_key: str) -> str:
-    if partition_key in PLACEMENT:
-        return PLACEMENT[partition_key]          # pinned / migrated keys
-    digest = hashlib.sha256(partition_key.encode()).digest()
-    return CELLS[int.from_bytes(digest[:8], "big") % len(CELLS)]
+The router's contract is one function: key in, cell identifier out. No feature flags, no per-tenant business rules, no synchronous call to a downstream service that can itself fail. A router that cannot be read and tested in isolation becomes the correlated failure the cells were built to prevent.
+
+### Implementation sketch (Scala)
+
+```scala
+final case class CellId(value: String)
+
+trait CellRouter:
+  def cellFor(partitionKey: String): CellId
+
+/** Explicit placements win; unplaced keys fall back to a stable hash.
+  * `placement` is a snapshot: the router never blocks on a lookup service. */
+final class TableThenHashRouter(
+    cells: IndexedSeq[CellId],
+    placement: Map[String, CellId]
+) extends CellRouter:
+
+  require(cells.nonEmpty, "at least one cell")
+
+  def cellFor(partitionKey: String): CellId =
+    placement.getOrElse(partitionKey, hashed(partitionKey))
+
+  private def hashed(key: String): CellId =
+    val digest = java.security.MessageDigest
+      .getInstance("SHA-256")
+      .digest(key.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    // Top 63 bits, sign cleared, so the modulus stays non-negative.
+    val bits = java.nio.ByteBuffer.wrap(digest, 0, 8).getLong & Long.MaxValue
+    cells((bits % cells.length).toInt)
 ```
 
-The router does one thing: key in, cell id out. No feature flags, no per-tenant business rules, no calls to a downstream service that could itself fail. If you cannot understand and test the router in an afternoon, it will eventually become the correlated failure that cells were supposed to prevent.
+A migration is then a two-phase change: add the tenant's key to `placement` pointing at the new cell only after its data is present there, and keep the old cell readable until reconciliation completes.
 
-## Sizing cells, and why more of them is better
+## Sizing, and the arithmetic of N
 
-A cell has a **maximum size** — a deliberate cap on how much of the workload one cell may hold, expressed in whatever dominates your scaling (tenants, requests/sec, storage). The cap exists because the cell is your unit of blast radius: with `N` equal cells, a single-cell failure affects at most `1/N` of the workload. Ten cells cap impact at 10%; forty cells cap it at 2.5%. The cap also bounds risk during operations — you deploy, patch, or run load tests one cell at a time and watch it before touching the next.
+A cell has a **maximum size** — a deliberate cap on how much of the workload one cell may hold, expressed in whatever dimension dominates scaling (tenants, requests per second, stored bytes). The cap exists because the cell is the unit of blast radius: with N equal cells, a single-cell failure affects at most **1/N** of the workload. Ten cells cap impact at 10%, forty cells at 2.5%. The cap also bounds operational risk, since deployments, patches and load tests proceed one cell at a time with observation between steps.
 
-The tension is cost and operational overhead: every cell needs its own database, its own capacity headroom, its own monitoring. Too few large cells and a failure is expensive; too many tiny cells and you drown in fixed per-cell cost and coordination. Real systems land at very different points. Slack maps cells to **availability zones** — after a 2021 gray failure where one AZ's degraded network link cascaded across their monolith, they built "N virtual services, one per AZ" so a sick AZ can be drained. Roblox runs coarser cells of roughly **1,400 machines each**, describing them as "strong blast walls" and had ~21 cells live across a fraction of their fleet at the time of writing.
+The counter-pressure is cost. Each cell carries its own database, its own capacity headroom and its own monitoring, so fixed per-cell overhead scales with N while the reduction in blast radius scales only as 1/N — the marginal benefit of each additional cell shrinks while its marginal cost does not. Published deployments sit at very different points. Slack maps cells to **availability zones**, following an incident in which one AZ's degraded network cascaded beyond that AZ; the resulting design treats each service as a set of per-AZ siloed copies, so a sick AZ can be drained. Roblox runs coarser cells of roughly **1,400 machines each** and reported tens of cells live at the time of writing, with the fleet migration still in progress.
 
-## Shuffle sharding: overlap is the enemy
+## Shuffle sharding reduces overlap between tenants
 
-Plain cells give every tenant a `1/N` blast radius, but a *specific* tenant sending poison traffic still takes down its whole cell — and everyone sharing it. **Shuffle sharding** shrinks the collateral by assigning each tenant not to one cell but to a random *subset* of nodes, and leaning on combinatorics. With 8 workers and 2 assigned per tenant there are C(8,2) = 28 distinct pairs. Assign tenants to random pairs and a single noisy tenant degrades just "1/28th" of the fleet — the Builders' Library calls this "7 times better than regular sharding." The math compounds fast: Route 53 fronts each customer domain with 4 of 2,048 virtual name servers, giving C(2048,4) ≈ **730 billion** possible shards, so "no customer domain will ever share more than two virtual name servers with any other." Two tenants almost never fully overlap, so one tenant's bad day is invisible to nearly everyone else — provided your clients retry across their assigned subset.
+Plain cells give every tenant a 1/N blast radius, but a tenant emitting poison traffic still degrades its entire cell, and therefore every tenant assigned to that cell. **Shuffle sharding** assigns each tenant not to one cell but to a random *subset* of nodes, and relies on the number of distinct subsets. With 8 workers and 2 assigned per tenant there are C(8,2) = 28 distinct pairs; a noisy tenant still degrades both of its own workers, but only the tenants drawn onto that exact pair — roughly 1 in 28 — lose every worker they have. Regular sharding of the same 8 workers into 4 fixed pairs would take out a quarter of the tenants instead.
 
-## The parts that hurt
+The combinatorics grow steeply with subset size. Route 53 fronts each customer domain with 4 of 2,048 virtual name servers, giving C(2048,4) ≈ **730 billion** possible shards, so two customer domains are overwhelmingly unlikely to be assigned the same four name servers. **The isolation is only realised if clients retry across the other members of their assigned subset**: without that retry, a request that lands on the affected node fails regardless of how little the subsets overlap.
 
-- **Data placement.** A partition key must resolve to exactly one cell's datastore, and that mapping has to survive as authoritative. Cross-cell joins and "just this one shared table" are how a cell architecture quietly decays back into a monolith with extra latency.
-- **Cross-cell operations.** Anything spanning tenants in different cells — global search, org-wide reports, a tenant merge — needs a scatter-gather layer *above* the cells, which reintroduces a shared failure domain. Push these to asynchronous, best-effort paths; keep them off the request hot path.
-- **Migration.** Moving a tenant between cells (rebalancing, or evacuating a failing cell) means relocating its data and flipping the router entry without dropping writes. Budget for double-writes, a cutover, and reconciliation from day one — retrofitting live migration onto cells that assumed keys never move is brutal.
+## Pitfalls
 
-Cells are not a scaling trick you reach for when a table gets big — that's [sharding](/articles/sys-patterns/2026-07-26-sharded-service-pattern), and it lives one layer down inside each cell. Cells are an availability decision: you accept duplicated infrastructure and a hard rule against cross-cell coupling, and in return every failure you haven't imagined yet is capped at `1/N` before it starts.
-
-**Try next:** Pick one service and compute its real blast radius today — what fraction of users does a single bad deploy or poison request take down? Then sketch the cell count that would cap it at 5%, and identify the one shared dependency (usually the database) that makes true cell isolation hard.
+- **A shared table reintroduces the correlated failure.** One "temporary" cross-cell datastore means a single lock, migration or outage in it stalls every cell at once, and the 1/N bound no longer holds even though the topology still looks cellular.
+- **Cross-tenant operations sit above the cells.** Global search, organisation-wide reports and tenant merges require a scatter-gather layer that touches every cell, so its availability is the product of the cells' availabilities; placing it on the synchronous request path makes the system less available than a monolith.
+- **Retrofitting migration is expensive.** A design that assumed keys never move has no double-write path and no reconciliation, so evacuating a failing cell has to be built during the incident.
+- **Business logic in the router.** Per-tenant rules or a synchronous lookup call inside the routing layer put a whole-system dependency into the one component whose failure is uncontained.
+- **Modulus-based placement makes rescaling a global event.** Changing N in a hash-and-modulus router relocates most keys simultaneously, which is the opposite of the one-cell-at-a-time operating model the pattern is built around.
+- **Deployments that skip the per-cell gate.** Rolling a change to all cells in one pipeline stage restores the original blast radius; the cap on impact comes from the staging discipline, not from the topology alone.

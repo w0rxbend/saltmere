@@ -2,7 +2,7 @@
 title: "Serving ML models: the same replication and sharding patterns, new constraints"
 date: 2026-07-30
 track: sys-patterns
-summary: "Burns' serving patterns — replicated stateless services, sharded services — apply directly to model inference, but the constraints flip: models are huge, GPUs are scarce and expensive, and the biggest models no longer fit on one machine. Here's how replicas, sharding, and multi-node inference map onto AI serving, with a KServe example."
+summary: "Burns' serving patterns — replicated stateless services, sharded services — apply directly to model inference, but the constraints flip: models are large, GPUs are scarce and expensive, and the largest models no longer fit on one machine. How replicas, sharding, and multi-node inference map onto AI serving, with a KServe example."
 reading_time: 6
 tags: [ai-infrastructure, model-serving, sharding, replication, kserve, gpu]
 sources:
@@ -16,31 +16,77 @@ sources:
     url: "https://blog.vllm.ai/2023/06/20/vllm.html"
 ---
 
-Brendan Burns' *Designing Distributed Systems* teaches serving as a small set of patterns: replicate a stateless service behind a load balancer to scale throughput; shard it when the state is too big for one replica to hold. Model inference is "just" a serving workload, so the same patterns apply — but the constraints are inverted enough that applying them naïvely is expensive. Let's map the patterns onto AI serving and see where the constraints bite.
+**Gist.** Model inference is a serving workload, so Brendan Burns' two serving patterns in *Designing Distributed Systems* — replicate a stateless service behind a load balancer, shard it when the state exceeds one replica — carry over unchanged in form. What changes is the unit being replicated: a replica pins model weights into graphics processing unit (GPU) memory, a resource that is scarce, expensive per hour, and slow to warm. The cost imposed is that the replicate-versus-shard decision is no longer cheap to get wrong: sharding a model adds interconnect traffic to **every** inference, and replicating a model that does not fit does not schedule at all.
 
 ## Replication: the base case, gated by GPUs
 
-An inference server that loads a model into memory and answers requests is stateless in Burns' sense — each request is independent, so you scale by running N identical replicas behind a load balancer. Nothing new there.
+An inference server that loads a model into memory and answers requests is stateless in Burns' sense: each request is independent of every other, so throughput scales by running *N* identical replicas behind a load balancer. The routing layer needs no knowledge of request content, and any replica can serve any request. That is the whole invariant, and it holds for model inference exactly as it holds for a stateless web tier.
 
-What's new is the *unit* you're replicating. A web replica is a few hundred MB of RAM on a CPU you can rent by the hundred. A model replica pins a multi-gigabyte weight file into **GPU** memory, and GPUs are scarce, expensive, and slow to start (pulling a 30 GB image and loading weights can take minutes). Two consequences:
+The unit of replication is where the arithmetic diverges. A web replica occupies a few hundred megabytes of host RAM on a central processing unit (CPU) that can be rented in bulk. A model replica pins a multi-gigabyte weight file into GPU memory, and admission to the replica set is gated on a whole accelerator being free. Startup is not instantaneous either: pulling a container image of many gigabytes and loading weights into device memory takes minutes rather than the sub-second start of a web pod. Two consequences follow.
 
-- **Scale-to-zero matters more than it does for web services.** An idle web pod wastes cents; an idle GPU pod wastes dollars per hour. KServe supports scaling inference services to zero when idle precisely because the marginal cost of a warm replica is so high.
-- **Autoscaling on RPS is wrong.** Inference latency is dominated by batch size and sequence length, not request count. You scale on GPU utilization or queue depth, and you *batch* requests within a replica (dynamic/continuous batching) before you add another replica.
+- **Scale-to-zero carries more weight than it does for web services.** An idle web pod wastes a negligible amount; an idle GPU pod holds an expensive accelerator out of the schedulable pool for as long as it runs. KServe supports scaling an inference service to zero replicas when idle.
+- **Autoscaling on requests per second (RPS) mismodels the load.** Inference latency is dominated by batch size and sequence length rather than by request count, so a fixed RPS threshold does not correspond to a fixed level of saturation. GPU utilisation or queue depth tracks the real constraint. Within a replica, batching requests together — dynamic or continuous batching, the scheduling technique vLLM applies alongside its paged key-value (KV) cache — raises throughput before an additional replica is warranted.
 
-## Sharding: when the model doesn't fit on one machine
+## Sharding: when the model does not fit on one machine
 
-Burns' sharded-service pattern is for when your state is too large for a single replica — you partition it and route each request to the shard that owns its data. The classic example is a cache too big for one node's RAM.
+Burns' sharded-service pattern applies when the state exceeds a single replica's capacity: the state is partitioned, and each request is routed to the shard that owns the relevant data. The canonical example is a cache larger than one node's RAM. The defining property is that **a request touches exactly one shard**, which is what keeps the pattern horizontally scalable — adding shards adds capacity without adding per-request work.
 
-Frontier LLMs hit the identical wall for a different reason: the weights don't fit in one GPU, or even one *machine*. A 400B-parameter model in half precision is ~800 GB — no single GPU holds that. The response is **model-parallel sharding**:
+Large language models (LLMs) reach the same wall for a different reason: the weights exceed one GPU's memory, or one machine's aggregate GPU memory. The parameter count multiplied by the bytes per parameter gives the floor — a 400-billion-parameter model in half precision is roughly 800 GB of weights alone, before activations and KV cache — and no single accelerator holds that. The response is **model-parallel sharding**, in two forms:
 
-- **Tensor parallelism** splits each layer's matrices across GPUs *within* a node (fast NVLink between them).
-- **Pipeline parallelism** splits the model's layers across *multiple nodes*, so a request flows node→node through the pipeline.
+- **Tensor parallelism** splits the matrices of each layer across GPUs, and is normally kept *within* a node so the splits communicate over the intra-node interconnect (NVLink on NVIDIA hardware) rather than the network.
+- **Pipeline parallelism** splits the model's layers into consecutive stages, which is the axis KServe's multi-node mode extends across *multiple nodes*, so a request traverses node after node through the pipeline.
 
-This is Burns' sharding pattern with a twist: in a normal sharded cache, a request touches *one* shard. In model sharding, a *single inference* touches *every* shard in sequence — the model is partitioned but the computation is not independent. That makes the interconnect (NVLink, InfiniBand) part of the critical path, and it's why "multi-node inference" is a distinct, harder mode than "more replicas."
+Here the analogy to a sharded cache breaks in the load-bearing place. In a sharded cache one request touches one shard; in model sharding **a single inference touches every shard, in sequence**. The state is partitioned but the computation is not independent, so the interconnect sits on the critical path of every token produced, and every shard must be healthy for any request to complete. Losing one shard does not degrade capacity proportionally — it fails the deployment. This is why multi-node inference is a distinct and harder operating mode than adding replicas, not a larger instance of it.
 
-## KServe: the patterns as declarative config
+The two patterns compose rather than compete: a sharded model group is itself the unit that gets replicated once the group's throughput is exhausted.
 
-KServe (a CNCF project; v0.15 landed in June 2025 with a focus on generative/LLM serving) exposes exactly this hierarchy. A single-node, replicated deployment is the default; you opt into multi-node sharding when a model is too big. The replicated case is a few lines:
+### Implementation sketch (Scala)
+
+The decision procedure is arithmetic on device memory, and the two topologies differ in how a request fans out. A router that models both:
+
+```scala
+final case class Model(name: String, params: Long, bytesPerParam: Int):
+  def weightBytes: Long = params * bytesPerParam
+
+final case class Device(id: String, memBytes: Long)
+
+enum Placement:
+  case Replicated(perReplica: Device, count: Int)
+  case Sharded(stages: Vector[Device])   // every request visits all stages
+
+// The execution surface the router assumes: activations enter, traverse
+// devices, and leave as a response.
+trait Runtime:
+  def pick(replicas: Int): Device
+  def encode(r: Request): Activations
+  def stage(d: Device)(a: Activations): Activations
+  def decode(a: Activations): Response
+
+def place(m: Model, pool: Vector[Device], headroom: Double = 0.9): Option[Placement] =
+  val usable = (d: Device) => (d.memBytes * headroom).toLong
+  pool.find(d => usable(d) >= m.weightBytes) match
+    case Some(d) => Some(Placement.Replicated(d, pool.count(_.memBytes >= d.memBytes)))
+    case None    =>
+      // No single device holds the weights: accumulate stages until the sum covers them.
+      val prefixes = pool.scanLeft((0L, Vector.empty[Device])) { case ((acc, ds), d) =>
+        (acc + usable(d), ds :+ d)
+      }
+      prefixes.find(_._1 >= m.weightBytes).map(p => Placement.Sharded(p._2))
+
+def serve(p: Placement, req: Request)(using rt: Runtime): Response = p match
+  case Placement.Replicated(_, n) =>
+    rt.decode(rt.stage(rt.pick(n))(rt.encode(req)))                  // one hop
+  case Placement.Sharded(stages)  =>
+    // Each stage consumes the previous stage's activations, so the transfers
+    // between them sit on the critical path.
+    rt.decode(stages.foldLeft(rt.encode(req))((act, d) => rt.stage(d)(act)))
+```
+
+The shape of `serve` is the argument: the replicated branch is a single dispatch, the sharded branch a fold whose length is the shard count. Adding shards adds latency to every request; adding replicas does not.
+
+## KServe: the patterns as declarative configuration
+
+KServe, a Cloud Native Computing Foundation (CNCF) project whose v0.15 release in June 2025 focused on generative and LLM serving, exposes this hierarchy directly. A single-node replicated deployment is the default; multi-node sharding is opt-in for models that exceed one machine. The replicated case is a short specification:
 
 ```yaml
 apiVersion: serving.kserve.io/v1beta1
@@ -49,9 +95,10 @@ metadata:
   name: sentiment
 spec:
   predictor:
-    minReplicas: 0          # scale to zero when idle — GPUs are expensive
+    minReplicas: 0          # scale to zero when idle
     maxReplicas: 8          # replicate for throughput
-    scaleTarget: 70         # target GPU/concurrency, not raw RPS
+    scaleMetric: concurrency
+    scaleTarget: 70         # in-flight requests per replica, not raw RPS
     model:
       modelFormat: { name: huggingface }
       storageUri: "s3://models/sentiment/"
@@ -59,16 +106,14 @@ spec:
         limits: { nvidia.com/gpu: "1" }
 ```
 
-For a model that needs sharding across machines, KServe's multi-node mode places one InferenceService across a *worker group* of GPU nodes with a tensor/pipeline-parallel runtime (commonly vLLM under the hood). The pattern you chose — replicate vs. shard — becomes a field, not a rewrite.
+For a model requiring sharding across machines, KServe's multi-node mode places one `InferenceService` across a *worker group* of GPU nodes running a tensor- or pipeline-parallel runtime, commonly vLLM. The chosen pattern is therefore a field in the specification rather than a rewrite of the deployment.
 
-## The design errors to avoid
+No new mental model is required for AI infrastructure. Replication scales throughput, sharding accommodates state that does not fit, and the routing and load-balancing layers are the familiar ones. What changed is that the state is model weights and the commodity is an accelerator, so the penalty for a wrong replicate-versus-shard decision is measured in GPU-hours rather than CPU cycles.
 
-Burns closes the book with common failures, and AI serving has its own greatest hits, all of them just the general patterns misapplied:
+## Pitfalls
 
-- **Sharding a model that fits on one GPU.** Model parallelism adds interconnect latency to every token. If the model fits, replicate — sharding is pure overhead you took on for no reason.
-- **Replicating a model that doesn't fit.** The pod won't schedule, or it thrashes to host memory. Check the arithmetic (params × bytes-per-param) before you pick replication.
-- **Treating cold start as free.** With scale-to-zero, the first request after idle eats the model-load time. Keep one warm replica for latency-sensitive paths, or accept the cold-start tail explicitly.
-
-The lesson is the reassuring one: you don't need a new mental model for AI infrastructure. Replication scales throughput; sharding handles state that won't fit; the routing and load-balancing layers are the ones you already know. What changed is that the "state" is model weights and the "commodity" is a GPU, so the cost of getting the replicate-vs-shard decision wrong went up by two orders of magnitude.
-
-**Try next:** Take one open model (say a 7B that fits in a single GPU) and deploy it on KServe with `minReplicas: 0, maxReplicas: 4`; load-test until it scales up, then idle it and watch it scale to zero — then try to force multi-node sharding on that same too-small model and measure the latency you *added* by parallelizing something that never needed it.
+- **Sharding a model that fits on one GPU.** Every token then pays an interconnect hop between stages that a single-device placement would not incur; the symptom is higher per-token latency at unchanged throughput.
+- **Replicating a model that does not fit.** The pod fails to schedule for lack of device memory, or the runtime spills to host memory and inference slows by orders of magnitude. The parameter count multiplied by bytes per parameter is the check that catches this before deployment.
+- **Treating cold start as free under scale-to-zero.** The first request after an idle period absorbs image pull plus weight load — minutes, not milliseconds — and appears as an extreme latency outlier rather than an error.
+- **Autoscaling on RPS.** Two workloads at identical request rates but different sequence lengths saturate a GPU at different points, so an RPS threshold either scales up early or leaves the queue growing unnoticed.
+- **Assuming shard loss degrades capacity gracefully.** A sharded model group serves no request unless every stage is present, so the failure of one worker node is a total outage of that group, not a proportional loss.

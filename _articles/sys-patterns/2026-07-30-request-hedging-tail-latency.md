@@ -2,8 +2,8 @@
 title: "Request Hedging: cutting tail latency in replicated services"
 date: 2026-07-30
 track: sys-patterns
-summary: "In a replicated service, your p99 isn't set by the average replica — it's set by whichever one happens to be slow right now. Hedged requests send a backup to a second replica after a short delay and take the first answer. Here's the math on why it works and a Go implementation with the cancellation that makes it safe."
-reading_time: 5
+summary: "In a replicated service the 99th-percentile latency is set not by the average replica but by whichever replica is transiently slow. Hedged requests issue a backup to a second replica after a short delay and take the first answer. This article derives why that works and shows the cancellation that makes it safe, in Go and in Scala."
+reading_time: 6
 tags: [tail-latency, hedged-requests, replication, serving-pattern, p99, resiliency]
 sources:
   - title: "The Tail at Scale (CACM, Feb 2013) — Jeffrey Dean & Luiz André Barroso"
@@ -16,35 +16,38 @@ sources:
     url: "https://brooker.co.za/blog/2022/08/09/hedging.html"
 ---
 
-You've replicated your read service across five identical nodes for throughput and availability. Load is balanced, every node is healthy, and yet your p99 latency is three times your median. Why? Because a request's latency is the latency of the *one replica it landed on*, and at any instant some replica is briefly slow — a GC pause, a compaction, a noisy neighbor, a cold cache. Across enough requests you keep drawing the slow one. Dean and Barroso's *The Tail at Scale* named this the central problem of large fan-out systems: **the tail is not an edge case, it's the common case**, because a request that touches many replicas is only as fast as the slowest one it waited on.
+**Gist.** In a replicated read service every replica is occasionally slow — a garbage-collection (GC) pause, a storage compaction, a noisy co-tenant, a cold cache — so the latency a client observes is the latency of the single replica its request happened to land on. A **hedged request** sends the same request to a second replica after a short delay and returns whichever response arrives first, converting a per-replica tail into a near-minimum over two draws. The cost is duplicated work: extra requests, extra downstream capacity consumed, and correctness obligations on the operation being duplicated.
 
 ## Why one slow replica dominates
 
-The unintuitive part: transient slowness that's rare *per replica* becomes near-certain *per request* once you fan out. Suppose each replica is slow (say >100 ms) just 1% of the time. Hit one replica and you're slow 1% of the time — a nice p99. But if a single user request must gather results from **100** replicas (a sharded search, a scatter-gather — see the scatter-gather pattern article here) and waits for all of them, the chance that *at least one* is slow is `1 − 0.99^100 ≈ 63%`. Your per-replica p99 became a per-request *median*. Rare local hiccups compound into a fat overall tail.
+Transient slowness that is rare *per replica* becomes likely *per request* once a request fans out. Dean and Barroso's *The Tail at Scale* states the arithmetic: if a replica is slow one per cent of the time, a request served by a single replica is slow one per cent of the time, but a request that must gather results from **100 replicas and wait for all of them** is slow whenever at least one of them is — assuming independence, with probability `1 − 0.99^100 ≈ 63%`. **The rate that was a per-replica 99th percentile dominates the per-request distribution outright.** The fan-out is the amplifier; the per-replica hiccup rate need not change at all.
 
-## Hedged requests
+Two properties of the underlying slowness are load-bearing for everything that follows. It is **transient** — the replica recovers on a timescale shorter than the client's patience — and it is **uncorrelated** across replicas, meaning the event that makes replica A slow does not simultaneously make replica B slow. Both assumptions are empirical, and both can fail (see Pitfalls).
 
-The fix Dean and Barroso propose is disarmingly simple. Send the request to one replica. If it hasn't answered within a short delay — say the **p95** of normal latency — send a **second, identical** request to a *different* replica. Take whichever response comes back first and cancel the other. That's a **hedged request**.
+## The hedging mechanism
 
-It works because slowness is usually *transient and uncorrelated*: the replica that's mid-GC-pause right now is almost certainly not the same one the backup lands on, so the backup routes around the local hiccup. And because you only hedge after the p95 delay, you send a backup for **at most ~5% of requests** — a tiny amount of extra load in exchange for chopping the tail. Dean and Barroso report that in a real Google service, hedging after a 10 ms delay cut the 99.9th-percentile latency roughly in half while adding only single-digit-percent extra requests.
+The procedure is a two-state timer. Issue the request to one replica and start a timer of length `hedgeAfter`. If the response arrives before the timer fires, return it and stop. If the timer fires first, issue a **second, identical** request to a *different* replica; return the first response from either, and cancel the outstanding one.
 
-The delay is the whole design. Hedge too eagerly (delay near zero) and you double your traffic — every request runs twice. Hedge too late and slow requests still wait most of their slow time before help arrives. Setting the delay at the p95 is the sweet spot: normal requests finish before the timer fires and never hedge at all; only the genuinely-slow tail pays for a backup.
+The observed latency is therefore the minimum of the primary's latency and (`hedgeAfter` + the backup's latency). Under the uncorrelated-slowness assumption the backup is drawn from the normal latency distribution rather than the stalled one, so a stall on the primary no longer sets the request's latency.
 
-## In Go, with the cancellation that matters
+**The delay is the entire design.** Setting `hedgeAfter` to the **95th percentile of normal latency** bounds the fraction of requests that hedge at approximately **five per cent**, because by construction 95 per cent of requests complete before the timer fires. A delay near zero duplicates every request and doubles offered load. A delay far above the 95th percentile leaves slow requests waiting out most of their stall before help is dispatched. Dean and Barroso report a BigTable benchmark in which sending the hedge after a **10 ms** delay cut the **99.9th-percentile** latency of a 1,000-key lookup by more than an order of magnitude while issuing about **two per cent** more requests.
 
-The critical part isn't sending the second request — it's **cancelling the loser** so you don't pay double downstream cost. `context` makes this clean:
+## Cancellation and idempotence
+
+Sending the backup is the easy half. **Cancelling the loser is what keeps the added load bounded**: without cancellation the duplicated request runs to completion, consuming downstream capacity long after its result has been discarded, and the "five per cent extra requests" figure becomes five per cent extra *completed* work at the slowest replicas — exactly the ones least able to absorb it.
+
+The second obligation is on the operation itself. Hedging deliberately submits the same operation twice, so it is safe only for **read-only or idempotent** operations. A hedged write without an idempotency key can be applied twice, since the "cancelled" request may already have committed at its replica before the cancellation is observed.
 
 ```go
 func hedgedGet(ctx context.Context, replicas []Client, hedgeAfter time.Duration) (Result, error) {
     ctx, cancel := context.WithCancel(ctx)
-    defer cancel()                       // cancels the loser the instant we return
+    defer cancel()                       // cancels the loser the instant the function returns
 
     results := make(chan Result, len(replicas))
-    errs := make(chan error, len(replicas))
 
     launch := func(c Client) {
         r, err := c.Get(ctx)             // ctx cancellation propagates to the replica
-        if err != nil { errs <- err; return }
+        if err != nil { return }         // ... a failed replica is left to the other attempts
         results <- r
     }
 
@@ -57,12 +60,12 @@ func hedgedGet(ctx context.Context, replicas []Client, hedgeAfter time.Duration)
     for {
         select {
         case r := <-results:
-            return r, nil                // first answer wins; defer cancel() kills the rest
+            return r, nil                // first answer wins; deferred cancel() stops the rest
         case <-timer.C:
             hedged++
             if hedged < len(replicas) {
                 go launch(replicas[hedged])   // fire a backup at another replica
-                timer.Reset(hedgeAfter)       // and be willing to hedge again
+                timer.Reset(hedgeAfter)       // and remain willing to hedge again
             }
         case <-ctx.Done():
             return Result{}, ctx.Err()
@@ -71,12 +74,58 @@ func hedgedGet(ctx context.Context, replicas []Client, hedgeAfter time.Duration)
 }
 ```
 
-Two properties make this safe. The winning branch returns immediately and the deferred `cancel()` propagates through the shared `ctx` to every outstanding replica call, so the losers stop working rather than finishing wasted work. And requests must be **idempotent** or read-only — you're deliberately sending the same operation to two servers, so a hedged *write* without idempotency keys (see that article here) can double-apply. Hedge reads freely; hedge writes only when they're idempotent.
+The winning branch returns immediately and the deferred `cancel()` propagates through the shared context to every outstanding replica call.
 
-gRPC bakes this in as a **hedging policy** in its service config (`maxAttempts`, `hedgingDelay`), so for gRPC services you often get it declaratively without writing the loop above. Dean and Barroso also describe a stronger variant, **tied requests**, where the two replicas are told about each other and the first to *start* executing tells the other to drop it — trimming even the tiny window of duplicated work. Hedging is the 90%-of-the-benefit version you can ship today.
+### Implementation sketch (Scala)
 
-## When not to
+The same state machine expressed with `Promise` as the first-writer-wins arbiter. `Promise.tryComplete` is the single point at which the race is decided: it returns `true` for exactly one caller, so the completion is unambiguous and the losing branches become no-ops.
 
-Hedging spends capacity to buy latency, so it's for services with **headroom** and **transient, uncorrelated** slowness. If your tail is caused by a *correlated* problem — every replica overloaded, a shared-dependency brownout — hedging pours fuel on the fire by adding load exactly when you're least able to serve it. Cap the hedge rate, and consider disabling it under high utilization. It's a scalpel for jitter, not a fix for saturation.
+```scala
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.FiniteDuration
+import java.util.concurrent.atomic.AtomicBoolean
 
-**Try next:** Wrap a service that sleeps a random 5–150 ms (with a 2% chance of a 500 ms stall) behind `hedgedGet` across three replicas. Measure p50/p99 with `hedgeAfter` set to `0`, to the p95 (~120 ms), and to `1s`, and plot the three. You'll see the p95 setting collapse the p99 while the extra request count stays near 5% — the entire tail-at-scale argument, reproduced on your laptop.
+trait Replica[A]:
+  /** `cancelled` is polled by the call so a decided race stops work in flight. */
+  def get(cancelled: AtomicBoolean): Future[A]
+
+def hedged[A](replicas: Vector[Replica[A]], hedgeAfter: FiniteDuration)
+             (using ec: ExecutionContext, sched: java.util.concurrent.ScheduledExecutorService): Future[A] =
+  val winner    = Promise[A]()
+  val cancelled = AtomicBoolean(false)
+
+  def launch(i: Int): Unit =
+    replicas(i).get(cancelled).onComplete: outcome =>
+      if winner.tryComplete(outcome) then cancelled.set(true)  // first outcome decides
+
+  launch(0)
+
+  // one backup per elapsed hedgeAfter, until replicas are exhausted or the race is decided
+  val backups = replicas.indices.drop(1)
+  backups.foreach: i =>
+    sched.schedule(
+      (() => if !winner.isCompleted then launch(i)): Runnable,
+      hedgeAfter.toMillis * i, java.util.concurrent.TimeUnit.MILLISECONDS)
+
+  winner.future
+```
+
+The invariant is that `winner` is completed exactly once and `cancelled` is set only after it is. Note what `tryComplete` treats as a decision: the *first outcome*, success or failure, so a replica that fails quickly ends the race and cancels the slower attempt. Making failures non-deciding — the behaviour gRPC's hedging policy expresses through its non-fatal status codes — requires completing `winner` only on success and falling back to the last failure once every attempt is exhausted.
+
+## Declarative and stronger variants
+
+gRPC exposes hedging as a **hedging policy** in its service configuration, parameterised by `maxAttempts` and `hedgingDelay`, so a gRPC client obtains the behaviour above without an explicit loop. Dean and Barroso also describe **tied requests**: the two replicas are informed of each other, and whichever begins executing first instructs the other to drop the request, shrinking the window of duplicated work relative to delay-based hedging.
+
+## When hedging is inapplicable
+
+Hedging spends capacity to buy latency. It applies to services with spare **headroom** and **transient, uncorrelated** slowness. Where the tail arises from a *correlated* cause — all replicas overloaded, a shared dependency degraded — hedging adds load precisely when the system is least able to serve it. Capping the hedge rate and disabling hedging above a utilisation threshold bounds that feedback.
+
+## Pitfalls
+
+- **Hedging under saturation deepens the outage.** Symptom: the tail worsens after hedging is enabled. Cause: the slowness is correlated across replicas, so the backup lands on an equally overloaded replica and the duplicate requests raise utilisation further.
+- **Hedging without cancellation multiplies downstream work.** Symptom: request counts at the storage layer rise more than the client-side hedge rate predicts. Cause: the losing request is ignored rather than cancelled and still runs to completion.
+- **A hedge delay near zero duplicates every request.** Symptom: offered load approximately doubles. Cause: the timer fires before typical responses arrive, so the backup is sent on the normal path rather than the tail.
+- **A hedge delay far above the 95th percentile buys little.** Symptom: the 99.9th percentile is unchanged. Cause: the slow request has already waited out most of its stall by the time the backup is dispatched.
+- **Hedging a non-idempotent write can double-apply it.** Symptom: duplicate side effects with no error reported. Cause: the cancelled request may have committed at its replica before the cancellation was observed.
+- **Routing the backup to the same replica removes the benefit.** Symptom: hedged requests are as slow as unhedged ones. Cause: the backup is drawn from the same stalled process, so the minimum is taken over two correlated samples.
+- **A static hedge delay drifts out of calibration.** Symptom: the hedge rate diverges from five per cent. Cause: the delay was fixed at a past 95th percentile while the latency distribution moved.

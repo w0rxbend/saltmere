@@ -1,9 +1,9 @@
 ---
-title: "Shuffle sharding: fault isolation that plain sharding can't buy"
+title: "Shuffle sharding: fault isolation that plain sharding cannot buy"
 date: 2026-07-31
 track: sys-patterns
-summary: "Regular sharding contains a bad tenant to one shard — but everyone in that shard goes down with them. Shuffle sharding gives each tenant a random combination of nodes, so a single poison workload almost never fully overlaps anyone else. The magic is combinatorics."
-reading_time: 5
+summary: "Plain sharding confines a bad tenant to one shard, but every co-tenant of that shard fails with it. Shuffle sharding assigns each tenant a random combination of nodes, so full overlap between two tenants becomes combinatorially rare. The cost is a retrying client and reduced containment as shard size grows."
+reading_time: 6
 tags: [sharding, fault-isolation, blast-radius, multi-tenancy, resilience]
 sources:
   - title: "Workload isolation using shuffle-sharding — Amazon Builders' Library (Colm MacCárthaigh)"
@@ -14,37 +14,79 @@ sources:
     url: "https://cortexmetrics.io/docs/guides/shuffle-sharding/"
 ---
 
-You run a fleet of 8 worker nodes behind a router, serving many tenants. One tenant sends a poison request — an expensive query, a retry storm, a bit of accidental DDoS — that pins whatever node handles it. What's your blast radius?
+**Gist.** In a multi-tenant fleet, one tenant issuing a poison workload — an expensive query, a retry storm, accidental denial of service — degrades whatever nodes it can reach, and plain sharding converts that into a total outage for every tenant sharing its shard. Shuffle sharding instead assigns each tenant a **random combination** of nodes drawn from the whole fleet, so two tenants share their *entire* shard only with probability on the order of 1 / C(n, k) for a fleet of n nodes and shard size k. The mechanism only pays off if the client retries other nodes in its own shard, and containment weakens as k grows.
 
-**No sharding:** the bad tenant can reach any node, so eventually *all 8* are degraded. Everyone is affected. **Plain sharding:** assign each tenant to one shard of, say, 2 nodes. Now the damage is contained to that shard — but every *other* tenant assigned to the same shard shares the tenant's fate. You've traded "everyone a little" for "a fixed group totally". For that group, it's an outage.
+## The blast radius of the alternatives
+
+Consider a fleet of 8 worker nodes behind a router.
+
+**No sharding.** The poison tenant reaches any node, so all 8 eventually degrade. Every tenant is affected, each partially.
+
+**Plain sharding.** Each tenant is assigned to one fixed shard — say 2 of the 8 nodes. Damage is contained to that shard, but every other tenant assigned to the same shard shares the poison tenant's fate completely. The trade is "everyone a little" for "a fixed group entirely". For that group the result is an outage, not a degradation.
+
+The failure mode plain sharding cannot avoid is that **shard membership is an equivalence relation**: tenants are partitioned into disjoint groups, and a group either survives together or fails together. There is no partial overlap to exploit.
 
 ## The shuffle
 
-Shuffle sharding, from the Amazon Builders' Library, changes how the shard is chosen. Instead of picking one of a few fixed shards, you give each tenant a **random combination** of nodes drawn from the whole fleet. With 8 nodes and a shard size of 2, there are C(8,2) = **28** possible pairs. Two tenants collide *completely* only if they were handed the exact same pair — and with a fault-tolerant client that retries the other node in its shard, a tenant is only fully knocked out when *every* node it holds is also held by the noisy tenant.
+Shuffle sharding, described in the Amazon Builders' Library, changes how the shard is chosen. Rather than selecting one of a few fixed shards, each tenant receives an arbitrary k-subset of the n nodes. With n = 8 and k = 2 there are C(8, 2) = **28** distinct pairs rather than 4 disjoint ones.
 
-That "every node overlaps" event gets vanishingly rare as the numbers grow. Scale to 100 nodes with a shard size of 5: there are C(100,5) ≈ **75 million** combinations. Pick two tenants at random and the odds that all 5 of one's nodes fall inside the other's 5 are about 1 in 75 million. A single bad tenant might make one node hot for a handful of others — but almost nobody loses their *whole* shard, so almost everyone still has a healthy node to retry against.
+The invariant that matters is not "no two tenants share a node" — with a small fleet that is unachievable. It is weaker and more useful: **a tenant is fully unavailable only when every node in its shard is also in the poison tenant's shard**, that is, when its shard is a subset of the damaged set. Partial overlap leaves at least one healthy node, and a client that retries within its own shard recovers on that node.
 
-A back-of-envelope way to see it: the chance a second tenant's shard is a subset of the first's is roughly C(k, k) / C(n, k) = 1 / C(n, k). Bigger fleet, or bigger shard, and the denominator explodes.
+The probability of full overlap for a second tenant drawn uniformly at random is roughly **C(k, k) / C(n, k) = 1 / C(n, k)**. At n = 100 and k = 5 there are C(100, 5) ≈ **75 million** combinations, so the odds that all 5 of one tenant's nodes fall inside another's 5 are about 1 in 75 million. Enlarging the fleet at fixed k inflates the denominator; enlarging k does not do so monotonically, since C(n, k) falls again once k passes n / 2 and reaches 1 at k = n.
+
+The consequence is asymmetric and is the point of the pattern: a single bad tenant makes a node hot for a modest number of other tenants, while **almost no tenant loses its whole shard**, so almost every tenant retains a healthy node to retry against.
 
 ## Assigning shards deterministically
 
-You don't store a table; you *derive* each tenant's shard from its ID so any router computes the same set. A simple virtual-node approach:
+No assignment table is stored. Each tenant's shard is **derived from its identifier**, so every router computes the same set without coordination. The derivation must sample **without replacement**, otherwise a shard of nominal size k can contain fewer than k distinct nodes and the redundancy the pattern depends on silently shrinks.
 
-```python
-import hashlib
+### Implementation sketch (Scala)
 
-def shard_for(tenant_id: str, nodes: list[str], shard_size: int) -> list[str]:
-    chosen, pool = [], list(nodes)
-    for i in range(shard_size):
-        # seed the RNG deterministically from tenant + iteration
-        h = hashlib.sha256(f"{tenant_id}:{i}".encode()).digest()
-        idx = int.from_bytes(h[:8], "big") % len(pool)
-        chosen.append(pool.pop(idx))     # sample WITHOUT replacement
-    return chosen
+```scala
+import java.security.MessageDigest
+
+/** Derives a tenant's shard: `size` distinct nodes, chosen deterministically
+  * from `nodes`, with no stored assignment table. */
+def shardFor(tenantId: String, nodes: IndexedSeq[String], size: Int): IndexedSeq[String] =
+  val digest = MessageDigest.getInstance("SHA-256")
+
+  def index(i: Int, poolSize: Int): Int =
+    val h = digest.digest(s"$tenantId:$i".getBytes("UTF-8"))
+    // First 8 digest bytes as a Long; the shift drops the sign bit so `%` stays non-negative.
+    val v = h.take(8).foldLeft(0L)((acc, b) => (acc << 8) | (b & 0xffL)) >>> 1
+    (v % poolSize).toInt
+
+  val (chosen, _) =
+    (0 until size).foldLeft((Vector.empty[String], nodes)):
+      case ((acc, pool), i) =>
+        val j = index(i, pool.size)
+        // Removal is what makes this sampling WITHOUT replacement.
+        (acc :+ pool(j), pool.patch(j, Nil, 1))
+
+  chosen
+
+/** Full overlap — the only case in which the tenant has nothing left to retry. */
+def fullyEclipsed(victim: Set[String], damaged: Set[String]): Boolean =
+  victim.subsetOf(damaged)
 ```
 
-Every router, given the same node list, produces the same shard for a tenant — no coordination — and the sampling-without-replacement guarantees `shard_size` *distinct* nodes. Route the tenant only to those nodes, and make the client retry within the shard on failure. That retry is not optional; it's the second half of the pattern. Overlap gives you partial redundancy, and the client is what cashes it in.
+The routing rule is then: send a tenant's traffic only to `shardFor(tenantId, …)`, and **have the client retry a different node of that same shard on failure**. The retry is not an optimisation but the second half of the pattern — overlap analysis produces partial redundancy, and the retrying client is what converts that redundancy into availability. Without it, one damaged node in a shard is as bad as all of them.
 
-Two caveats. Shuffle sharding isolates *independent* failures — a poison tenant, a bad host. It does **not** save you from a bug that crashes every node the same way; that's a fleet-wide correlated failure, and no shard geometry helps. And shard size is a real dial: bigger shards mean more redundancy per tenant but more overlap between tenants, so you contain less. This is the same idea AWS Route 53 and Mimir/Cortex use in production, and it costs you nothing but a hash function.
+## Limits of the technique
 
-**Try next:** take the function above, simulate 10,000 tenants over 100 nodes with shard size 5, mark one tenant's nodes as "down", and count how many other tenants lost *all* of their nodes versus lost *at least one*. The gap between those two numbers is exactly what shuffle sharding bought you.
+Shuffle sharding isolates **independent** failures: a poison tenant, a bad host. It does not mitigate a defect that crashes every node identically, because that is a fleet-wide correlated failure and no shard geometry contains it.
+
+Shard size is a genuine dial with opposing effects. **Larger k gives each tenant more redundancy but increases pairwise overlap between tenants**, so containment degrades as k approaches n; at k = n the scheme reduces to no sharding at all. Smaller k improves isolation but leaves each tenant fewer nodes to retry against and concentrates its capacity.
+
+The technique is used in production by AWS Route 53 and by Cortex/Mimir, whose documentation gives a worked configuration of the same construction.
+
+A simulation makes the effect concrete: draw shards for 10,000 tenants over 100 nodes at shard size 5, mark one tenant's nodes as damaged, then count the tenants that lost *all* of their nodes against those that lost *at least one*. The gap between those two counts is the availability that shuffle sharding purchases, and it is entirely dependent on the client retrying.
+
+## Pitfalls
+
+- **Sampling with replacement instead of without.** A shard nominally of size k contains duplicate nodes, so the effective redundancy is lower than configured and full-overlap events occur far more often than 1 / C(n, k) predicts.
+- **No client-side retry within the shard.** Every tenant with even one damaged node in its shard sees errors, which removes the entire benefit; partial overlap only helps if something retries.
+- **Treating shuffle sharding as protection against correlated failure.** A deployment of poisoned code or a shared dependency outage takes down all shards simultaneously; the observed blast radius is the whole fleet regardless of shard geometry.
+- **Raising shard size to improve availability.** Larger shards increase per-tenant redundancy but also pairwise overlap, so isolation falls; at the extreme k = n every tenant sees every node and containment is gone.
+- **Recomputing shards on every membership change.** Because the shard is derived from the node list, adding or removing a node reshuffles assignments for tenants that were not otherwise affected, moving traffic and warm state unexpectedly.
+- **Assuming uniform tenant load.** The 1 / C(n, k) estimate treats tenants as uniformly drawn; a few very large tenants concentrated on overlapping nodes make the realised distribution worse than the combinatorial bound suggests.

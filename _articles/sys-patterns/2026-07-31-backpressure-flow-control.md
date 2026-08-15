@@ -2,7 +2,7 @@
 title: "Backpressure: the Flow-Control Pattern That Keeps a Fast Producer From Drowning a Slow Consumer"
 date: 2026-07-31
 track: sys-patterns
-summary: "When a producer outruns a consumer, something has to give: block, buffer, or drop. Backpressure is the feedback signal that makes the producer slow down — the same credit-based idea as TCP's receive window and Reactive Streams' request(n) — and why unbounded buffering only hides the failure."
+summary: "When a producer outruns a consumer, one of three things must happen: the producer blocks, the excess is buffered, or the excess is dropped. Backpressure is the upstream feedback signal that makes the producer match consumer capacity — the same credit model as TCP's receive window and Reactive Streams' request(n) — and unbounded buffering only relocates the failure."
 reading_time: 6
 tags: [backpressure, flow-control, reactive-streams, tcp, streaming, queues]
 sources:
@@ -18,52 +18,71 @@ sources:
     url: "https://www.reactivemanifesto.org/glossary"
 ---
 
-Any time one stage produces faster than the next can consume, you are one design decision away from an outage. The queue between them either fills unboundedly until the process dies of an `OutOfMemoryError`, or you start dropping data, or you make the producer wait. **Backpressure** is the third option done deliberately: a feedback signal that flows *upstream* and tells the producer to match the consumer's real capacity. It's a pattern you'll recognize once you see it, because the network stack under your feet has been doing it the whole time.
+**Gist.** Whenever one pipeline stage produces faster than the next stage consumes, the queue between them grows without bound, the excess is discarded, or the producer is made to wait. Backpressure is the third outcome arranged deliberately: a feedback signal travelling *upstream* that limits the producer to the consumer's measured capacity. The cost is that the slowdown propagates — the whole pipeline runs at the speed of its slowest stage, and the producer must be a party that can be paused at all.
 
 ## The credit model, from TCP to request(n)
 
-TCP flow control is credit-based. The receiver advertises a **receive window** in every ACK — "I can accept this many more bytes" — and the sender may have at most that many unacknowledged bytes in flight. When the application stops draining, the advertised window shrinks toward zero, the sender stalls, and nothing is lost. HTTP/2 does the identical thing one layer up (RFC 9113 §5.2): receivers grant octets with `WINDOW_UPDATE` frames, per-stream *and* per-connection, default window 65,535 bytes. Only `DATA` frames are flow-controlled so control frames can never be blocked. The catch that bites gRPC users: these windows are **per hop**, not end-to-end — every proxy in the path applies its own.
+Transmission Control Protocol (TCP) flow control is credit-based. The receiver advertises a **receive window** in every acknowledgement — a count of further bytes it is willing to accept — and the sender may hold at most that many unacknowledged bytes in flight. The invariant is one-sided: **bytes in flight ≤ the last advertised window**. When the receiving application stops draining the socket buffer, successive advertisements shrink toward zero, the sender stalls, and no segment is lost. Recovery is explicit rather than timed: the receiver sends a window update once space reappears.
 
-**Reactive Streams** lifts the same credit idea to application objects. The consumer drives the pace: nothing is delivered until the `Subscriber` calls `Subscription.request(n)` to grant demand for `n` elements. Demand is **additive** across calls (request 8, then request 8 more, and up to 16 may flow), `request(0)` or a negative is a spec violation, and `Long.MAX_VALUE` means "fire hose — backpressure off". Crucially, the signaling itself must be non-blocking and return promptly, which is what keeps the whole chain non-blocking while still bounded. `request(n)` is just advertising a window in higher-level clothing.
+HTTP/2 applies the identical construction one layer higher (RFC 9113 §5.2). Receivers grant octets of credit with `WINDOW_UPDATE` frames, maintained **both per stream and per connection**, with a default initial window of **65,535 bytes**. Only `DATA` frames are subject to flow control, so control frames cannot be blocked behind an exhausted window. The property that surprises operators of gRPC and other HTTP/2 transports is that these windows are **per hop, not end-to-end**: every intermediary in the path maintains its own windows, so a stalled origin does not automatically stall the client — it stalls the nearest proxy first, which may itself hold a full window of buffered data.
 
-```java
-class BoundedSubscriber<T> implements Subscriber<T> {
-    private static final int BATCH = 16;
-    private Subscription subscription;
-    private int pending;
+**Reactive Streams** raises the same credit idea from octets to application objects. The consumer sets the pace: no element is delivered until the `Subscriber` calls `Subscription.request(n)`, granting demand for `n` elements. Three rules carry the weight. Demand is **additive** across calls — a request of 8 followed by another 8 permits up to 16 elements. **`request(0)` or a negative value is a specification violation**, signalled to the subscriber as an error rather than silently ignored. **`Long.MAX_VALUE` denotes effectively unbounded demand**, which turns backpressure off for that subscription. The demand signal itself is required to be non-blocking and to return promptly, which is what allows the chain to remain both non-blocking and bounded at the same time; `request(n)` is a window advertisement in higher-level clothing.
 
-    public void onSubscribe(Subscription s) {
-        this.subscription = s;
-        this.pending = BATCH;
-        s.request(BATCH);              // grant initial credit; nothing arrives until we ask
-    }
-    public void onNext(T item) {
-        process(item);                 // slow work here bounds the entire pipeline
-        if (--pending == 0) {          // only ask for more once the batch is drained
-            pending = BATCH;
-            subscription.request(BATCH);
-        }
-    }
-    public void onError(Throwable t) { t.printStackTrace(); }
-    public void onComplete() { }
-    private void process(T item) { /* ... */ }
-}
+The resulting state machine per subscription is small: outstanding demand *d* starts at zero, `request(n)` sets *d := d + n*, each `onNext` sets *d := d − 1*, and **the publisher may not emit while *d* = 0**. Terminal signals (`onError`, `onComplete`) are exempt from demand — they are delivered regardless of outstanding credit, which is why a cancelled or failed stream cannot deadlock waiting for a request that will never come.
+
+### Implementation sketch (Scala)
+
+A subscriber that grants credit in fixed batches, using `java.util.concurrent.Flow` from the standard library. The load-bearing detail is that the next `request` is issued only after the previous batch has been fully processed, so the batch size is the pipeline's queue bound.
+
+```scala
+import java.util.concurrent.Flow.{Subscriber, Subscription}
+import scala.compiletime.uninitialized
+
+final class BatchedSubscriber[T](batch: Int, process: T => Unit)
+    extends Subscriber[T]:
+
+  private var subscription: Subscription = uninitialized
+  private var outstanding: Int = 0        // mirrors publisher-side demand d
+
+  def onSubscribe(s: Subscription): Unit =
+    subscription = s
+    outstanding = batch
+    s.request(batch)                      // nothing is delivered before this call
+
+  def onNext(item: T): Unit =
+    process(item)                         // slow work here bounds the whole chain
+    outstanding -= 1
+    if outstanding == 0 then              // refill only once the batch is drained
+      outstanding = batch
+      subscription.request(batch)
+
+  def onError(t: Throwable): Unit = ()    // terminal signals ignore demand
+  def onComplete(): Unit = ()
 ```
+
+Refilling eagerly — calling `request(1)` at the top of every `onNext` — is also legal and keeps the pipe fuller, at the cost of allowing one further element to be in flight while the current one is still being processed.
 
 ## Block, buffer, or drop
 
-When the producer runs ahead and demand is exhausted, you have exactly three moves, and the pattern is choosing consciously:
+Once demand is exhausted and the producer still has data, exactly three moves exist. The pattern consists of choosing among them explicitly.
 
-**Block** the producer on a bounded queue (`ArrayBlockingQueue.put`). This is the truest backpressure — the slowdown propagates all the way up — but it requires a producer you can actually pause, and a blocked thread ties up a resource. `request(n)` and TCP's zero window achieve the same effect without literally parking a thread.
+**Block** the producer on a bounded queue (`ArrayBlockingQueue.put`). This is the most faithful form of backpressure, because the slowdown propagates the entire way up the chain. It requires a producer that can be paused, and a blocked thread occupies a resource for the duration. `request(n)` and TCP's zero window obtain the same effect without parking a thread.
 
-**Buffer** the overflow (`onBackpressureBuffer`). Fine for absorbing short bursts, provided the buffer is **bounded** and has an overflow policy. An *unbounded* buffer is the trap: it doesn't solve overload, it relocates it. Little's Law is blunt here — bounded throughput plus unbounded arrival means unbounded queue depth, so latency climbs without limit until memory runs out. Unbounded buffering converts a fast producer into a delayed, harder-to-diagnose crash.
+**Buffer** the overflow (`onBackpressureBuffer`). This absorbs bursts whose duration is shorter than the buffer's capacity, provided the buffer is **bounded and carries an overflow policy**. An *unbounded* buffer is the characteristic trap: it does not remove overload, it relocates it. With bounded service throughput and a sustained arrival rate above it, queue depth grows without limit by conservation alone, and Little's Law (L = λW) relates that growing depth to a proportionally growing residence time, until memory is exhausted. Unbounded buffering converts an immediate, legible symptom into a delayed `OutOfMemoryError` far from its cause.
 
-**Drop** the excess (`onBackpressureDrop` discards items with no pending demand; `onBackpressureLatest` keeps only the newest). Bounded memory, low latency, and correct for replaceable data — sensor readings, cursor positions, stock ticks where only the latest matters. Wrong for anything that needs at-least-once delivery.
+**Drop** the excess (`onBackpressureDrop` discards items arriving with no pending demand; `onBackpressureLatest` retains only the most recent). Memory stays bounded and latency stays low, which is correct for **replaceable data** — sensor samples, cursor positions, price ticks where only the newest value carries meaning. It is incorrect for anything requiring at-least-once delivery.
 
-This is also the clean line between three often-confused terms. **Rate limiting** is a static, preset cap that ignores real downstream health. **Load shedding** *drops* work at the edge when you can't push back. **Backpressure** is the feedback loop that makes the producer slow to the consumer's actual speed. They compose: backpressure internally, shed at an ingress that has no upstream to signal.
+The same taxonomy separates three terms that are frequently conflated. **Rate limiting** is a static, preconfigured cap that carries no information about downstream health. **Load shedding** discards work at the edge when there is no upstream party to signal. **Backpressure** is the closed feedback loop that slows the producer to the consumer's actual rate. They compose: backpressure between internal stages, shedding at an ingress whose upstream cannot be signalled.
 
-## Where you already have the knobs
+## Where the controls already exist
 
-Project Reactor and RxJava expose the strategies as operators and propagate `request(n)` for you. Akka/Pekko Streams stages are demand-driven Reactive Streams underneath, with an explicit `OverflowStrategy` (`backpressure`, `dropHead`, `dropTail`, `fail`) on every buffer. A Kafka consumer does it by hand: bound each poll with `max.poll.records`, and when processing lags, call `consumer.pause(partitions)` / `resume(...)` so the fetcher stops — the durable offset log on the broker *is* your bounded buffer.
+Project Reactor and RxJava expose these strategies as operators and propagate `request(n)` through the chain. Akka and Pekko Streams stages are demand-driven Reactive Streams implementations underneath, with an explicit `OverflowStrategy` (`backpressure`, `dropHead`, `dropTail`, `fail`) on every buffer. A Kafka consumer implements the pattern manually: `max.poll.records` bounds the batch returned by each poll, and when processing lags, `consumer.pause(partitions)` stops the fetcher until `resume(...)` is called — the broker's durable offset log serves as the bounded buffer.
 
-**Try next:** Wire a producer emitting 10,000 items/s to a consumer that sleeps 10 ms per item, first through an unbounded `LinkedBlockingQueue` and watch heap and latency climb until it dies. Then swap in a bounded `ArrayBlockingQueue(1000)` with `put()` and confirm the producer blocks and memory flattens — you've just converted a crash into a throttle.
+## Pitfalls
+
+- **`Long.MAX_VALUE` demand silently disables flow control.** A stream that appears backpressured allocates until the heap is exhausted, because an intermediate operator requested unbounded demand on its behalf.
+- **An unbounded queue turns overload into a delayed crash.** The symptom is a heap dump full of queued elements and a stack trace in an unrelated component; the cause is that the arrival rate exceeded service rate for longer than memory allowed.
+- **HTTP/2 windows are per hop.** A client observing healthy flow while the origin is stalled is seeing the nearest proxy's window absorb data that the origin never accepted.
+- **Blocking a producer thread does not always propagate.** If the producer is an event loop or a shared thread pool, `put()` on a full queue stalls unrelated work sharing that thread, converting flow control into a pipeline-wide stall.
+- **Dropping strategies violate delivery guarantees quietly.** `onBackpressureDrop` on a stream whose elements are financial transactions loses records with no error signal, because dropping is a normal outcome for that operator.
+- **Refilling demand inside a batch defeats the bound.** Calling `request(batch)` at the start of each `onNext` instead of after the batch drains lets the publisher keep a full extra batch in flight, doubling the intended queue bound.

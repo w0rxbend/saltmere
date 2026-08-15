@@ -1,12 +1,12 @@
 ---
-title: "The Sharded Service: When Replicas Can't Hold All the State"
+title: "The Sharded Service: When Replicas Cannot Hold All the State"
 date: 2026-07-26
 track: sys-patterns
-summary: "Replicated services scale by cloning; sharded services scale by dividing. A look at Burns' sharded-service pattern — the sharding function, hot shards, rebalancing on growth, and a sharded cache sitting in front of a scatter-gather root."
-reading_time: 5
+summary: "Replicated services scale by cloning; sharded services scale by dividing. An examination of Burns' sharded-service pattern — the sharding function, hot shards, rebalancing on growth, and a sharded cache in front of a scatter-gather root."
+reading_time: 7
 tags: [sharding, hot-shards, caching, scalability, kubernetes, statefulset, burns]
 sources:
-  - title: "Designing Distributed Systems, 2nd ed. — Ch. 6, Sharded Services (Burns, O'Reilly)"
+  - title: "Designing Distributed Systems — Sharded Services (Burns, O'Reilly)"
     url: "https://www.oreilly.com/library/view/designing-distributed-systems/9781491983638/ch06.html"
   - title: "Design Patterns for Container-based Distributed Systems (Burns & Oppenheimer, USENIX HotCloud '16)"
     url: "https://www.usenix.org/conference/hotcloud16/workshop-program/presentation/burns"
@@ -18,11 +18,11 @@ sources:
     url: "https://www.educative.io/courses/introduction-to-distributed-systems-for-dummies/np/sharded-services"
 ---
 
-A replicated service scales the boring way: clone the container, put a load balancer in front, and any replica can answer any request because every replica holds the same thing (or nothing). That trick stops working the moment the *thing being served* is bigger than one machine — a cache with more keys than fit in RAM, a user index too large for one disk, a leaderboard too hot for one CPU. Burns' answer in *Designing Distributed Systems* is the **sharded service**: split the state across replicas that are no longer interchangeable, and put a routing node in front that knows which replica owns which slice.
+**Gist.** A replicated service scales by cloning a container that holds either the same state or none, which fails as soon as the served state exceeds one machine: a cache with more keys than fit in random-access memory (RAM), an index larger than one disk, a leaderboard hotter than one CPU. The **sharded service** described by Burns in *Designing Distributed Systems* divides the state across replicas that are no longer interchangeable and places a **root** node in front that computes, per request, which replica owns the key. The cost is that the "any healthy node will do" invariant is gone: routing becomes a correctness concern, single-node failure darkens a slice of the keyspace, and every change in shard count implies data movement.
 
 ## Root and shards, not load balancer and replicas
 
-In a sharded service, each replica — a **shard** — serves only a subset of requests. A **root** node inspects each incoming request, computes which shard owns it, and forwards accordingly. The root is doing real work, not blind round-robin: get the routing wrong and you either 404 a key that exists or, worse, silently split one shard's writes across two.
+In a sharded service each replica — a **shard** — serves a subset of requests. The root inspects the request, computes the owning shard, and forwards. The root performs real work rather than round-robin selection, and **a routing error is not a load imbalance but a data error**: a request for an existing key is answered as missing, or worse, two roots disagree and one shard's writes are split across two owners, after which neither holds the full history for that key.
 
 | | Replicated service | Sharded service |
 |---|---|---|
@@ -31,78 +31,80 @@ In a sharded service, each replica — a **shard** — serves only a subset of r
 | Scales with | Request rate | Data volume (and request rate) |
 | Failure of one node | Capacity dips | A slice of the keyspace goes dark |
 
-That last row is the tax: sharding buys capacity by trading away the safety net of "any node will do." Each shard typically still needs its own replication underneath to survive a node failure — sharding and replication are orthogonal and usually combined, not either/or.
+The last row is the tax. Sharding buys capacity by trading away the safety net of interchangeability, so **each shard normally carries its own replication underneath** to survive node loss. Sharding and replication are orthogonal axes and are usually combined rather than chosen between: sharding divides the keyspace, replication duplicates a division.
 
 ## The sharding function
 
-The router needs a deterministic, uniform function from request key to shard id. The naive version:
+The root requires a deterministic, uniform mapping from request key to shard identifier. The direct form:
 
-```python
-def shard_for_key(key: str, shard_count: int) -> int:
-    digest = hashlib.sha1(key.encode()).digest()
-    return int.from_bytes(digest[:8], "big") % shard_count
+```scala
+def shardFor(key: String, shardCount: Int): Int =
+  val digest = MessageDigest.getInstance("SHA-1").digest(key.getBytes("UTF-8"))
+  // floorMod, not %: the leading 8 digest bytes read as a signed Long are
+  // negative half the time, and a negative index is not a shard.
+  math.floorMod(ByteBuffer.wrap(digest, 0, 8).getLong, shardCount)
 ```
 
-Two things matter more than the hash algorithm itself:
+Two properties matter more than the choice of hash algorithm:
 
-- **Determinism and uniformity** — same key always lands on the same shard, and keys spread evenly so no shard is structurally overloaded.
-- **Key granularity** — shard on something coarse enough to keep related lookups (and cache locality) together, but fine enough that no single key's traffic can dominate a shard.
+- **Determinism and uniformity.** The same key must always land on the same shard, and keys must spread evenly so that no shard is structurally overloaded by the mapping itself.
+- **Key granularity.** The shard key must be coarse enough that related lookups land together, preserving locality, and fine enough that no single key's traffic can dominate a shard.
 
-The `% shard_count` term is also the function's biggest liability: change `shard_count` and almost every key remaps. That's the problem consistent hashing exists to solve — bounding remaps to roughly `keys / shards` instead of nearly all of them — and it's covered in depth in this journal's dedicated hash-ring article, so I won't re-derive it here. The point for the sharded-service pattern is narrower: whatever hashing scheme you pick, plan for resizing from day one, because you will resize.
+The `% shard_count` term is the function's principal liability: changing `shard_count` remaps nearly every key, because the residue of a fixed digest modulo a new divisor is unrelated to the old residue. Consistent hashing exists to bound that disruption to approximately `keys / shards` rather than the whole keyspace; it is derived in this journal's dedicated hash-ring article and is not re-derived here. The narrower point for this pattern is that **the resizing procedure must be designed before the first shard is deployed**, because the shard count will change.
 
 ## Hot shards
 
-A perfectly uniform hash over keys does not guarantee uniform *load*, because real traffic isn't uniform — one viral post, one celebrity account, one popular SKU can pin a single shard's CPU or network while its siblings idle. This is the **hot shard** problem, and it's structural to sharding in a way replicated services never face, because a replicated service would have just spread that same hot key across every replica.
+A uniform hash over keys does not produce uniform *load*, because request distributions over keys are not uniform. One viral post, one celebrity account, one popular stock-keeping unit can saturate a single shard's CPU or network link while its siblings idle. This is the **hot shard** problem, and it is structural to sharding: a replicated tier would have spread the same hot key across every replica, whereas a sharded tier concentrates it by construction.
 
-Mitigations, roughly in order of how much they change your architecture:
+Mitigations, ordered by how much of the architecture they disturb:
 
-1. **Split the hot key further** — sub-shard by a secondary dimension (time bucket, region) so no single shard absorbs it alone.
-2. **Replicate the hot shard, not the whole tier** — give the hot shard extra read replicas while cold shards stay single-instance. This is sharding and replication composed deliberately, not uniformly.
-3. **Move, don't just add** — relocate a hot shard onto its own dedicated node while colder shards keep sharing hardware, rebalancing physical placement without touching the sharding function at all.
+1. **Split the hot key further.** Sub-shard along a secondary dimension — time bucket, region — so no single shard absorbs the key alone.
+2. **Replicate the hot shard rather than the tier.** Give the hot shard additional read replicas while cold shards remain single-instance. This composes sharding with replication selectively instead of uniformly.
+3. **Relocate rather than add.** Move the hot shard onto dedicated hardware while colder shards continue to share nodes. This changes physical placement and **leaves the sharding function untouched**, so no keys move.
 
-Detecting a hot shard is a monitoring problem before it's an architecture problem: per-shard p99 latency and per-shard QPS, not just tier-wide averages, or the hot shard hides inside a healthy-looking mean.
+Detection precedes architecture: **per-shard p99 latency and per-shard queries per second (QPS)** are the required signals, because a single saturated shard among many is invisible in a tier-wide mean.
 
 ## Adding shards and rebalancing
 
-Growth means changing shard count, which means some keys must move. The operational sequence that keeps this safe:
+Growth changes the shard count, which forces key movement. A sequence that keeps the service answerable throughout:
 
-1. Stand up the new shard(s) empty.
-2. Update the sharding function (or the consistent-hash ring) so newly written keys route correctly immediately.
-3. Migrate existing keys lazily: on a read that misses the new shard, fall back to the old owner, fetch, and backfill the new one.
-4. Once a background sweep confirms a key range fully migrated, stop routing reads to the old shard for that range.
+1. Start the new shards empty.
+2. Update the sharding function, or the consistent-hash ring, so that newly written keys route to their new owner immediately.
+3. Migrate existing keys lazily: on a miss at the new shard, consult the previous owner, return the value, and backfill the new shard.
+4. When a background sweep confirms a key range has fully migrated, stop routing reads for that range to the old shard.
 
-That lazy-migrate-on-miss step is what makes rebalancing survivable in production — it turns a big-bang cutover into a rolling one, at the cost of a temporary double-lookup path in the root.
+Step 3 is what converts a big-bang cutover into a rolling one. **Its cost is a temporary double-lookup path in the root**, so tail latency rises for the duration of the migration and the old shards must remain reachable until step 4 completes for every range. Omitting step 3 in a cache tier does not produce errors that are easy to notice: reads route to an empty new owner, miss, and repopulate from the origin, so the tier stays available while its hit rate collapses and origin load multiplies.
 
 ## A sharded cache in front of a service
 
-The clearest concrete instance of this pattern is a cache tier sharded in front of an origin service, with the root doing double duty as a scatter-gather coordinator for multi-key requests:
+The clearest concrete instance is a cache tier sharded in front of an origin service, with the root also acting as a scatter-gather coordinator for multi-key requests. A multi-key request touches several shards, and **its latency is bounded below by the slowest shard contacted, not the average** — the scatter-gather tax, which grows with the number of shards a single request must fan out to.
 
-```python
-SHARD_CLIENTS = [redis.Redis(host=f"cache-shard-{i}.cache-shard") for i in range(4)]
+### Implementation sketch (Scala)
 
-def get_or_fetch(key: str, origin):
-    shard = SHARD_CLIENTS[shard_for_key(key, len(SHARD_CLIENTS))]
-    cached = shard.get(key)
-    if cached is not None:
-        return cached
-    value = origin.fetch(key)          # cache miss -> hit the origin service
-    shard.set(value, ex=300)
-    return value
+```scala
+final class ShardedCache(shards: IndexedSeq[Shard], origin: Origin)(using
+    ec: ExecutionContext):
 
-def scatter_gather(keys: list[str]) -> dict:
-    """A multi-key request touches several shards; the root fans out
-    and gathers. Latency is bounded by the SLOWEST shard, not the average —
-    the classic scatter-gather tax."""
-    by_shard: dict[int, list[str]] = {}
-    for k in keys:
-        by_shard.setdefault(shard_for_key(k, len(SHARD_CLIENTS)), []).append(k)
-    results = {}
-    for shard_id, shard_keys in by_shard.items():
-        results.update(SHARD_CLIENTS[shard_id].mget(shard_keys))
-    return results
+  // Every root instance must derive the same owner for the same key;
+  // disagreement here is the split-ownership failure, not a hiccup.
+  private def owner(key: String): Int = shardFor(key, shards.size)
+
+  def getOrFetch(key: String): Array[Byte] =
+    val shard = shards(owner(key))
+    shard.get(key).getOrElse:
+      val value = origin.fetch(key)
+      shard.set(key, value, ttlSeconds = 300)
+      value
+
+  def scatterGather(keys: Seq[String]): Map[String, Array[Byte]] =
+    val byShard: Map[Int, Seq[String]] = keys.groupBy(owner)
+    val replies = byShard.toSeq.map: (id, ks) =>
+      Future(shards(id).mget(ks))
+    // The gather completes only when the slowest shard replies.
+    Await.result(Future.sequence(replies), 200.millis).flatten.toMap
 ```
 
-Each shard can be a plain `StatefulSet` so ordinals give stable, addressable identity that the sharding function can map directly to a pod:
+Each shard can be a `StatefulSet`, whose ordinals give stable, addressable identity that the sharding function maps directly onto a pod:
 
 ```yaml
 apiVersion: apps/v1
@@ -122,6 +124,13 @@ spec:
           ports: [{ containerPort: 6379 }]
 ```
 
-`cache-shard-0.cache-shard` through `cache-shard-3.cache-shard` are stable DNS names the root can hash directly into. Growing capacity is `replicas: 4` → `replicas: 6`, then running the rebalance sequence above — the StatefulSet gives you the new pods; it does not migrate a single key for you.
+`cache-shard-0.cache-shard` through `cache-shard-3.cache-shard` are stable DNS names the root can hash into directly. Growing capacity is `replicas: 4` → `replicas: 6` followed by the rebalance sequence above: **the StatefulSet supplies the new pods and migrates no keys.**
 
-**Try next:** stand up the four-pod `StatefulSet` above, populate it through `get_or_fetch`, then bump `replicas` to 6 and update `shard_for_key`'s modulus without a migration step — watch your hit rate collapse as most keys silently point at the wrong shard, and feel why the lazy-migrate-on-miss step isn't optional.
+## Pitfalls
+
+- Two root instances running different shard counts during a rolling deploy send writes for the same key to different shards; both shards then hold a partial, divergent history and neither read path can reconstruct it.
+- Raising the modulus without the lazy-migrate step leaves the tier available but nearly every key resolves to an empty shard, so the symptom is a hit-rate collapse and multiplied origin load rather than an error.
+- A tier-wide mean latency that looks healthy hides a shard pinned at 100% CPU by one hot key; only per-shard p99 and per-shard QPS separate the two.
+- Choosing too coarse a shard key concentrates a single tenant or single popular entity onto one shard, which no rebalancing of shard *count* can relieve, because the unit of movement is the key.
+- Decommissioning old shards before the background sweep confirms every range migrated drops every key not yet copied, since the fallback owner no longer exists; where the shard is a cache the cost is a miss to the origin, where it is the authoritative copy the loss is permanent.
+- A scatter-gather request fanning out to all shards makes the tier's tail latency the maximum over shards, so adding shards to relieve capacity pressure degrades multi-key latency.

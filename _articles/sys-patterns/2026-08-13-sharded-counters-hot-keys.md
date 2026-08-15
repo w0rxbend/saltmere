@@ -1,9 +1,9 @@
 ---
-title: "Sharded counters: what to do when one hot key melts a partition"
+title: "Sharded counters: when one hot key melts a partition"
 date: 2026-08-13
 track: sys-patterns
-summary: "A viral post's like counter is one row that every writer must serialize on — lock queues in SQL, a 1,000-WCU partition ceiling in DynamoDB, one overloaded tablet in Bigtable. The fix is N sub-counters written at random and summed at read time, with probabilistic sketches and stream aggregation for when exact-and-instant isn't required."
-reading_time: 5
+summary: "A viral post's like counter is one row that every writer must serialize on — lock queues in SQL, a 1,000-WCU partition ceiling in DynamoDB, one overloaded tablet in Bigtable. The remedy is N sub-counters written at random and summed at read time, with probabilistic sketches and stream aggregation where exact-and-instant is not required."
+reading_time: 7
 tags: [sharded-counters, hot-keys, dynamodb, redis, write-scaling]
 sources:
   - title: "AWS — Using write sharding to distribute workloads evenly (DynamoDB)"
@@ -16,57 +16,92 @@ sources:
     url: "https://redis.io/docs/latest/commands/incr/"
 ---
 
-A like button, a view counter, a rate limiter: `UPDATE counters SET n = n + 1 WHERE id = ?`. Correct, and fine — until one id goes viral and 50,000 writers per second all want the same row. Hot counters are the canonical **hot key** problem, and "how would you count likes on a viral post" is a system-design interview classic.
+**Gist.** A single logical counter — likes on a post, views on a video — is stored as one row or one item, and every increment must serialize on that one physical location, so throughput is capped by a single lock queue, partition, or tablet no matter how large the cluster is. The remedy is to split the counter into **N sub-counters** that are incremented independently and summed on read, exploiting the fact that addition commutes and therefore needs no coordination between writers. The cost is paid by the reader and by storage: every read touches N keys instead of one, N must be chosen and later resized, and the total is only as fresh as the slowest shard read.
 
-## Why one counter melts
+## Why one counter serializes
 
-The bottleneck is different per store, but it's always *serialization on a single physical location*.
+The bottleneck differs per store, but its shape does not: **all writes to a logical counter land on one physical location, and that location admits one writer at a time.**
 
-**Relational rows:** every `UPDATE` takes a row lock held until commit. Writers to the same row form a lock queue, so throughput is bounded by `1 / (lock hold time)` regardless of how many cores or replicas you add. In MVCC engines like Postgres each increment also writes a new row version, so a hot counter generates dead-tuple bloat and vacuum pressure on top of the queueing.
+**Relational rows.** Each `UPDATE counters SET n = n + 1 WHERE id = ?` acquires a row lock that is held until commit. Concurrent writers to the same row queue behind that lock, so sustained throughput is bounded by **1 / (lock hold time)** — a bound that does not improve with more cores, more connections or more replicas, because the constraint is the serial section, not the parallel capacity around it. In multi-version concurrency control (MVCC) engines such as PostgreSQL, each increment additionally writes a new row version, so a hot counter accumulates dead tuples and vacuum pressure on top of the queueing.
 
-**DynamoDB:** capacity is per *partition*, not per table. [AWS's own numbers](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html): "Every partition in a DynamoDB table is designed to deliver a maximum capacity of 3,000 read units per second and 1,000 write units per second." One counter item lives in one partition, so one hot key caps at ~1,000 writes/s and throttles — no matter what you've provisioned at the table level (adaptive capacity helps a *skewed* workload, not a single-item one).
+**DynamoDB.** Capacity is allocated per *partition*, not per table. [AWS's partition-key guidance](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html) documents a per-partition ceiling of 3,000 read capacity units per second and 1,000 write capacity units per second. A counter item has one partition key and therefore lives in one partition, so **a single-item counter is capped near 1,000 write capacity units per second and throttles beyond it**, whatever the table-level provisioning says. Adaptive capacity redistributes throughput across partitions of a skewed workload; it cannot subdivide one item.
 
-**Bigtable/HBase:** a row lives on exactly one tablet served by one node, so [Google's schema-design guidance](https://docs.cloud.google.com/bigtable/docs/schema-design) is blunt about hotspotting: avoid keys that concentrate traffic (sequential IDs, raw timestamps at the key front) because "reads and writes tend to concentrate on a single node instead of being distributed evenly."
+**Bigtable and HBase.** A row is served by exactly one tablet on one node. [Google's schema-design guidance](https://docs.cloud.google.com/bigtable/docs/schema-design) warns against key shapes that concentrate traffic — sequential identifiers, raw timestamps at the front of the key — because they concentrate reads and writes on a single node rather than spreading them across the cluster.
 
-Scaling *out* doesn't help because the key pins you to one shard. The fix is to scale the *key*.
+Scaling the cluster out does not help, because the key itself pins the traffic to one shard. The quantity that must be scaled is the **key space of the counter**.
 
 ## The sharded counter
 
-Split logical counter `c` into N sub-counters `c:0 … c:N-1`. **Write:** increment one shard chosen uniformly at random (or by hashing the writer id). **Read:** fetch all N shards and sum. Increments commute, so no coordination is needed — you've turned one lock queue into N parallel ones, multiplying write throughput by ~N at the cost of an N-key read.
+Split the logical counter `c` into sub-counters `c:0 … c:N-1`.
 
-```python
-import random, redis
-r = redis.Redis()
-N = 16
+- **Write.** Increment one shard, selected uniformly at random, or by hashing the writer identifier.
+- **Read.** Fetch all N shards and sum them.
 
-def incr(counter_id: str, delta: int = 1) -> None:
-    shard = random.randrange(N)
-    r.incrby(f"cnt:{counter_id}:{shard}", delta)
+The correctness argument is that **increments commute**: the sum over shards is invariant under any interleaving of increments, so writers need no coordination with one another. The single lock queue becomes N independent queues, and write throughput scales by approximately N until some other limit binds.
 
-def read(counter_id: str) -> int:
-    keys = [f"cnt:{counter_id}:{i}" for i in range(N)]
-    return sum(int(v) for v in r.mget(keys) if v is not None)  # one round trip
+The invariant is weak but exact in the limit: **the sum equals the true count once every increment issued before the read has been applied to its shard.** A read that races concurrent increments returns a value between the count at read start and the count at read end — sub-counters are read at different instants, so the result is not a snapshot of any single moment. For a monotonically increasing counter this is a lower bound that is never stale by more than the in-flight writes; for a counter that also decrements, the read can transiently fall outside the true range in either direction.
+
+In DynamoDB the same shape is documented as [write sharding](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-sharding.html): the partition key becomes `counter#<id>#<suffix>` with suffix in `0..N-1`, the write is an `UpdateItem` with an `ADD` expression, and the read queries all suffixes and sums. AWS's worked example distributes a hot date key across suffixes 1–200. A **calculated** suffix — `hash(writer_id) mod N` — keeps a single-item lookup possible for a given writer; a **random** suffix maximizes spread but makes any individual item unaddressable without a scan of all suffixes.
+
+**Choosing N.** The sizing rule is `N ≈ peak_writes_per_second / per_shard_capacity`, with headroom for skew in the random assignment. With the documented DynamoDB ceiling of 1,000 write units per second per partition, a counter sustaining 20,000 writes per second requires N ≥ 20, and doubling to 40 absorbs both burst and the imperfect balance of random placement. Overshooting is not free: **each read consumes read capacity proportional to N**, and every counter carries N items of storage and metadata whether or not it is hot. Growing N is cheap because new shards start at zero and the sum remains correct; shrinking N requires merging shard values under a scheme that cannot lose concurrent increments.
+
+### Implementation sketch (Scala)
+
+```scala
+import java.util.concurrent.ThreadLocalRandom
+
+/** Minimal contract a sharded counter needs from a store: commutative add, batch read. */
+trait CounterStore:
+  def add(key: String, delta: Long): Unit
+  def getAll(keys: Seq[String]): Seq[Long]
+
+final class ShardedCounter(store: CounterStore, shards: Int):
+  require(shards > 0)
+
+  private def key(id: String, shard: Int): String = s"cnt:$id:$shard"
+
+  /** Random placement: no per-writer affinity, so no shard inherits a skewed writer. */
+  def increment(id: String, delta: Long = 1L): Unit =
+    store.add(key(id, ThreadLocalRandom.current().nextInt(shards)), delta)
+
+  /** Sticky placement: the writer's own shard is addressable without reading all N. */
+  def incrementSticky(id: String, writerId: String, delta: Long = 1L): Unit =
+    store.add(key(id, Math.floorMod(writerId.hashCode, shards)), delta)
+
+  /** Not a snapshot: shards are observed at different instants. */
+  def read(id: String): Long =
+    store.getAll((0 until shards).map(key(id, _))).sum
+
+  /** Growing N keeps the sum correct because absent shards read as zero. */
+  def widen(shards2: Int): ShardedCounter =
+    require(shards2 >= shards)
+    ShardedCounter(store, shards2)
 ```
 
-The same shape in DynamoDB is [write sharding](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-sharding.html): partition key `counter#<id>#<suffix>` with suffix `0..N-1`, `UpdateItem` with an `ADD` expression on write, and a read that queries all suffixes and sums (AWS's example uses suffixes 1–200 on a hot date key). A *calculated* suffix — `hash(writer_id) mod N` — keeps single-item lookups possible; a random suffix maximizes spread.
+The same decomposition appears in the JDK: `java.util.concurrent.atomic.LongAdder` maintains a table of cells that threads increment independently and sums in `sum()`, which likewise **is not an atomic snapshot** when increments are concurrent.
 
-**Choosing N:** `N ≈ peak_writes_per_sec / per_shard_capacity`, with 2× headroom. For DynamoDB, per-shard capacity is that 1,000 WCU partition ceiling, so a 20k writes/s counter needs N ≥ 20, say 40. Costs of overshooting: reads touch N keys (one `mget`/`BatchGetItem`, but N units of read capacity), and cold counters carry N-key overhead — so don't shard everything, shard the keys that are actually hot, and note that resizing N up is trivial (new shards start at 0) while shrinking requires merging.
+## When approximation suffices
 
-## When approximate is fine
-
-If the product only needs "3.2M views," stop paying for exact. **Unique** counts (distinct viewers, DAU) don't shard-and-sum at all — you'd double-count — but [HyperLogLog sketches](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation) merge losslessly across shards with ~0.8% error in 12 KB (`PFADD` per shard, `PFMERGE` at read). For heavy-hitter frequency counts, a count-min sketch does the same trick. The interview line: *sharding scales exact counts; sketches scale unique counts, because their merge is a union, not a sum.*
+Where the product requirement is "3.2M views", exactness is not being bought for anything. **Unique** counts — distinct viewers, daily active users — cannot be sharded and summed at all, because the same subject may appear in more than one shard and would be counted twice. [HyperLogLog sketches](/articles/distributed-systems/2026-08-10-hyperloglog-cardinality-estimation) solve this because **their merge is a union rather than a sum**: per-shard sketches (`PFADD`) combine with `PFMERGE` at read, at roughly 0.8% relative error in 12 KB. Count-min sketches provide the analogous merge for heavy-hitter frequency estimates. The distinction is the load-bearing one: sharding scales exact additive counts; sketches scale set-cardinality counts.
 
 ## Write-behind aggregation
 
-The third lever is moving increments off the hot path entirely. Writers emit `+1` events to a stream (Kafka keyed by counter id, or a Redis Stream); a consumer aggregates in memory and flushes `ADD delta` to the durable row every second or so. The visible count lags by the flush interval — fine for view counters, wrong for account balances — and you must make the flush idempotent (store the consumer offset with the delta) or accept small over/under-counts on crash. This is how big view counters actually work: the "counter" your read path sees is a periodically-updated aggregate, often cached, with the true event log in the stream. It composes with sharding: aggregate per partition, sum at read.
+The third lever removes increments from the hot path. Writers emit `+1` events to a log — Kafka partitioned by counter identifier, or a Redis Stream — and a consumer aggregates them in memory, flushing an `ADD delta` to the durable record on an interval. Two consequences follow directly. First, **the visible count lags by one flush interval**, which is acceptable for view counters and incorrect for account balances. Second, **the flush must be idempotent**, since a consumer crash between flush and offset commit otherwise replays a delta; storing the consumer offset transactionally alongside the aggregate closes this, and omitting it accepts bounded over- or under-counting proportional to the unflushed window. The pattern composes with sharding: aggregate per stream partition, sum at read.
 
 ## Choosing an approach
 
-| Need | Reach for |
+| Requirement | Mechanism |
 |---|---|
-| Exact, real-time, high write rate | Sharded counter, read = sum |
-| Unique counts (viewers, DAU) | HyperLogLog, merge at read |
-| Exact eventually, massive rate | Stream + write-behind aggregation |
-| Rate limiting per key | Plain `INCR` + `EXPIRE` (rarely hot enough to shard) |
+| Exact, real-time, high write rate | Sharded counter, read = sum of N |
+| Unique counts (viewers, daily actives) | HyperLogLog, merge at read |
+| Exact eventually, very high rate | Stream plus write-behind aggregation |
+| Rate limiting per key | Plain `INCR` with `EXPIRE`; seldom hot enough to shard |
 
-**Try next:** benchmark a single Redis `INCR` key vs the 16-shard version above with `redis-benchmark` and 50 parallel clients — then check how the gap changes at N=4 and N=64 to see the read-cost/write-throughput trade directly.
+## Pitfalls
+
+- **Sharding a unique count.** Summing per-shard distinct counts double-counts every subject that appears on more than one shard; the correct primitive is a mergeable sketch whose combine operation is union.
+- **Reading N shards on a cold counter.** Sharding every counter, rather than the measured hot ones, multiplies read capacity and storage by N across the entire key space for no write-throughput gain.
+- **Shrinking N in place.** Reducing the shard count strands the values in the removed shards, and merging them while writers are still active loses increments that land on a shard between its final read and its deletion.
+- **Treating the read as a snapshot.** Shards are sampled at different instants, so a monotonic counter can appear to move backwards across two reads issued from different clients, and any invariant of the form "count equals number of rows" fails under concurrency.
+- **Sticky placement with skewed writers.** `hash(writer_id) mod N` concentrates traffic on one shard when a small number of writers produce most increments — a bot or a replay loop reproduces the original hot-key problem inside the sharded scheme.
+- **Non-idempotent write-behind flush.** A consumer that flushes the aggregate and then commits its offset double-counts the window on crash; one that commits first loses it.

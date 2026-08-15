@@ -2,8 +2,8 @@
 title: "Karpenter: Just-in-Time Nodes Instead of Node Groups"
 date: 2026-08-15
 track: sys-patterns
-summary: "Cluster-autoscaler resizes pre-defined node groups; Karpenter throws the groups away and bin-packs pending pods straight onto freshly chosen instance types. Here's how the v1 NodePool and NodeClass CRDs work, what WhenEmptyOrUnderutilized consolidation actually does, how spot interruptions are handled natively, and how disruption budgets keep the optimizer from eating your capacity mid-day. Current as of the AWS provider v1.14 LTS, with Azure's NAP now GA."
-reading_time: 5
+summary: "Cluster-autoscaler resizes pre-defined node groups; Karpenter discards the groups and bin-packs pending pods onto freshly chosen instance types. This article covers the v1 NodePool and NodeClass custom resources, what WhenEmptyOrUnderutilized consolidation does, how spot interruptions are handled natively, and how disruption budgets bound the optimizer's effect on capacity, using the AWS provider and Azure's Node Auto-Provisioning as the two reference implementations."
+reading_time: 6
 tags: [karpenter, kubernetes, autoscaling, spot, eks, aks]
 sources:
   - title: "Karpenter — NodePools (concepts)"
@@ -14,22 +14,22 @@ sources:
     url: "https://docs.aws.amazon.com/eks/latest/best-practices/karpenter.html"
   - title: "Azure — Node Auto-Provisioning (NAP) in AKS"
     url: "https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning"
-  - title: "aws/karpenter-provider-aws — releases (v1.14 LTS)"
+  - title: "aws/karpenter-provider-aws — releases"
     url: "https://github.com/aws/karpenter-provider-aws/releases"
 ---
 
-Cluster-autoscaler asks a constrained question: "which of my pre-defined node groups should grow by one?" Every group is a fixed instance type (or lookalike family), so you end up curating a zoo of ASGs and still waking up to pods stuck `Pending` because the one group they fit in hit quota. **Karpenter** inverts the model: it watches unschedulable pods, computes the cheapest set of instances that would fit them — choosing type, size, zone, and capacity type *per launch* from hundreds of options — and calls the cloud API directly. No node groups, no ASGs, nodes in roughly a minute.
+**Gist.** The Kubernetes cluster-autoscaler can only answer a constrained question — which of a set of pre-defined node groups should grow by one — so each workload shape requires its own curated group, and a pod remains `Pending` when the single group it fits is at quota. Karpenter replaces the groups with a solver: it observes unschedulable pods, simulates the scheduler to compute a set of instances that would accommodate them, selects instance type, size, zone and capacity type per launch, and calls the cloud provider application programming interface (API) directly. The cost is that the cluster's node inventory becomes a continuously re-optimised, mutable population rather than a set of stable groups, so node churn must be bounded explicitly by disruption budgets, pod disruption budgets and annotations.
 
-Quick scope note: this is the node-level half of the story. The earlier KEDA article covered the pod-level half — KEDA/HPA decide *how many pods*, and Karpenter's job is making the nodes those pods need exist (and stop existing).
+This article covers the node-level half of autoscaling. The pod-level half — Kubernetes Event-Driven Autoscaling (KEDA) and the Horizontal Pod Autoscaler (HPA) deciding pod counts — is covered separately; Karpenter's responsibility is making the nodes those pods require exist, and cease to exist.
 
-## Two CRDs: NodePool and NodeClass
+## Two custom resources: NodePool and NodeClass
 
-The API graduated to **`karpenter.sh/v1`** with Karpenter 1.0 back in 2024 and has been stable since; the AWS provider is on the **v1.14 LTS** line as of mid-2026. Azure caught up: AKS ships Karpenter as **Node Auto-Provisioning (NAP)**, now generally available and the default posture in AKS Automatic, using the same `NodePool` CRD with an `AKSNodeClass`. (A community GCP provider exists but isn't at parity.)
+The API graduated to **`karpenter.sh/v1`** with Karpenter 1.0 in 2024, and the AWS provider has released on the `v1.x` line since. Azure Kubernetes Service (AKS) ships Karpenter as **Node Auto-Provisioning (NAP)**, the node-provisioning mode used by AKS Automatic, with the same cloud-neutral `NodePool` custom resource paired with an `AKSNodeClass`. A community Google Cloud Platform provider also exists.
 
-The split is deliberate:
+The two resources separate two different kinds of statement:
 
-- **NodePool** (cloud-neutral): *constraints* — which architectures, capacity types, instance categories a node may be; plus limits, weights, taints, expiry, and disruption policy.
-- **NodeClass** (cloud-specific: `EC2NodeClass` / `AKSNodeClass`): *how to build the machine* — AMI/image selection, subnets, security groups, block devices, user data.
+- **NodePool** (cloud-neutral) declares *constraints*: which architectures, capacity types and instance categories a node may have, plus limits, weights, taints, expiry and disruption policy.
+- **NodeClass** (cloud-specific: `EC2NodeClass` or `AKSNodeClass`) declares *how the machine is built*: machine image selection, subnets, security groups, block devices, user data.
 
 ```yaml
 apiVersion: karpenter.sh/v1
@@ -51,7 +51,7 @@ spec:
         duration: 9h
   template:
     spec:
-      expireAfter: 720h           # recycle nodes monthly (patched AMIs)
+      expireAfter: 720h           # recycle nodes monthly (patched images)
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
@@ -71,26 +71,39 @@ spec:
           values: ["4"]
 ```
 
-The philosophy: constrain *loosely*. Every extra requirement shrinks the set of instance types Karpenter can price-shop across, which costs you both money and spot availability. Pods add their own scheduling constraints (nodeSelectors, topology spread, affinities) and Karpenter honors them at provisioning time — it simulates the scheduler before it buys anything.
+The requirements list is a filter, and it is the load-bearing knob: **every additional requirement narrows the set of instance types the solver may price-shop across**, reducing both the achievable price and the pool of spot capacity from which a launch can be satisfied. Constraining loosely at the NodePool level therefore has a direct effect on availability. Pod-level constraints — node selectors, topology spread constraints, affinities — are added by the workloads themselves, and **Karpenter simulates scheduling against those constraints before it launches anything**, so a node is not created unless the pending pods would in fact bind to it.
 
-## Consolidation: the part cluster-autoscaler never had
+## Consolidation
 
-Provisioning is half the job; **consolidation** is the other half. With `consolidationPolicy: WhenEmptyOrUnderutilized`, Karpenter continuously looks for nodes it can delete (workloads fit elsewhere) or **replace with a cheaper node** (a half-empty `m6i.2xlarge` becomes an `m6i.large`). `WhenEmpty` is the conservative alternative: only reap nodes with no daemonset-exempt pods. `consolidateAfter` sets how long a node must be idle/underutilized before it's a candidate — raise it for bursty workloads that would otherwise thrash.
+Provisioning is one half of the controller; **consolidation** is the other. Under `consolidationPolicy: WhenEmptyOrUnderutilized`, Karpenter continuously searches for two kinds of move: deleting a node whose workloads fit on remaining nodes, and **replacing a node with a cheaper one** — a half-empty `m6i.2xlarge` becoming an `m6i.large`. The conservative alternative, `WhenEmpty`, only reclaims nodes that hold no pods other than daemonset pods.
 
-This is also where Karpenter fixes drift: change the AMI in your `EC2NodeClass` and nodes are progressively replaced (**Drifted**), no eksctl rolling update required.
+`consolidateAfter` sets how long a node must remain empty or underutilised before it becomes a candidate. It is the damping term: **with a short value and a bursty workload, the controller removes capacity that the next burst immediately re-provisions**, so the setting trades cost efficiency against churn.
+
+The same disruption machinery reconciles configuration changes. Changing the machine image reference in the `EC2NodeClass` marks existing nodes **Drifted**, and they are progressively replaced without an external rolling-update procedure.
 
 | Disruption reason | Trigger |
 |-------------------|---------|
-| Empty / Underutilized | Consolidation math says delete or downsize |
-| Drifted | Node no longer matches NodePool/NodeClass spec |
-| Expired | `expireAfter` elapsed |
+| Empty / Underutilized | Consolidation determines the node can be deleted or downsized |
+| Drifted | Node no longer matches the NodePool or NodeClass spec |
+| Expired | `expireAfter` has elapsed |
 
-All *voluntary* disruption respects **budgets** (the `disruption.budgets` block above): rate limits by node count or percentage, optionally on a cron schedule, optionally scoped to specific reasons. Pod-level `PodDisruptionBudgets` and the `karpenter.sh/do-not-disrupt` annotation are honored too — budgets are how you let the optimizer run at 3 a.m. and sit still during peak.
+Consolidation and drift are **voluntary** disruption, rate-limited by the `disruption.budgets` block: a bound expressed as a node count or a percentage, optionally attached to a cron schedule with a duration, optionally scoped to specific reasons (`Empty`, `Underutilized`, `Drifted`). Expiration is not one of those reasons — in `v1` an expired node begins draining rather than waiting for a replacement to be launched first. A budget of `nodes: "0"` over a scheduled window suspends voluntary disruption entirely for that window. Pod-level `PodDisruptionBudget` objects and the `karpenter.sh/do-not-disrupt` annotation are also honoured, so three independent mechanisms can each block a candidate node.
 
-## Spot without the sidecar
+## Spot interruption handling
 
-Karpenter handles **spot interruptions natively**: pointed at an SQS queue fed by EventBridge (spot interruption warnings, rebalance recommendations, scheduled maintenance), it reacts to the 2-minute notice by cordoning, draining, and pre-spinning a replacement — no `aws-node-termination-handler` DaemonSet needed. Interruption handling is *involuntary* disruption, so it deliberately ignores budgets: the node is dying either way. Combined with a wide instance-type allowlist, this makes "spot-first with on-demand fallback" a one-line policy (`capacity-type: ["spot", "on-demand"]`) instead of a fleet of weighted ASGs.
+Karpenter handles **spot interruptions natively**. Pointed at an Amazon Simple Queue Service (SQS) queue fed by EventBridge — spot interruption warnings, rebalance recommendations, scheduled maintenance events — it reacts to the two-minute interruption notice by cordoning and draining the node and provisioning a replacement, without a separate `aws-node-termination-handler` DaemonSet.
 
-**Limits and weights** round out multi-pool setups: `limits` caps how much a pool may provision (a GPU pool that can't exceed 16 cards), and `weight` orders pools so workloads land on the reserved-instance pool before the spot pool, or on `general` before the tainted `system` pool.
+The invariant worth stating explicitly: **interruption handling is involuntary disruption, and therefore ignores disruption budgets**. The node is being reclaimed by the provider regardless of what the budget says; honouring the budget would only delay the drain, not save the node. A budget of zero during business hours consequently stops consolidation and drift replacement, but does not stop spot reclamation.
 
-Try next: create a second NodePool with `weight: 100`, spot-only, capped by `limits`, and watch `kubectl get nodeclaims -w` during a deploy — seeing Karpenter price-shop instance types in real time is the fastest way to build trust before you turn consolidation loose in prod.
+Combined with a wide instance-type allowlist, this reduces a spot-first, on-demand-fallback posture to a single requirement (`capacity-type: ["spot", "on-demand"]`) rather than a set of weighted autoscaling groups. The width of the allowlist matters here for the same reason as above: a narrow list concentrates the cluster in fewer spot pools.
+
+**Limits and weights** govern multi-pool clusters. `limits` caps the total resources a pool may provision — a graphics processing unit (GPU) pool bounded to a fixed number of cards — and provisioning from that pool stops at the cap. `weight` orders pools during scheduling simulation, so workloads land on a reserved-instance pool before a spot pool, or on a general pool before a tainted system pool.
+
+## Pitfalls
+
+- **Over-constrained requirements produce `Pending` pods that look like a Karpenter failure.** Narrowing instance category, generation, architecture and zone simultaneously can leave a set of instance types that is empty or has no spot capacity; the solver has nothing to launch.
+- **A short `consolidateAfter` on a bursty workload causes node thrash.** Nodes are removed during the trough and re-provisioned during the next peak, paying launch latency and image-pull cost repeatedly.
+- **A zero-node disruption budget during business hours does not stop spot reclamation.** Budgets bound voluntary disruption only; involuntary interruption proceeds, so workloads must still tolerate node loss during the protected window.
+- **`karpenter.sh/do-not-disrupt` on a long-lived pod blocks voluntary disruption of the whole node.** Consolidation and drift replacement skip that node, so an annotated pod can retain an outdated machine image until something else removes the node.
+- **Changing the NodeClass machine image marks every node in scope as Drifted at once.** The replacement rate is governed solely by the disruption budget; without one, the cluster replaces nodes as fast as pod disruption budgets permit.
+- **A pool `limits` cap is a provisioning stop, not a scheduling error.** Once the cap is reached the pool silently stops creating nodes and pods stay `Pending`, which presents identically to a capacity shortage.

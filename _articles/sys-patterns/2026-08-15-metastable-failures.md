@@ -3,7 +3,7 @@ title: "Metastable Failures: When the Outage Survives Its Trigger"
 date: 2026-08-15
 track: sys-patterns
 summary: "Bronson et al. (HotOS '21) named the failure class where a trigger pushes a vulnerable system into a bad state that a sustaining feedback loop — retry storms, cache-miss storms, GC spirals — keeps alive after the trigger is gone. The OSDI '22 follow-up found 22 such failures across 11 organizations and metastability behind at least 4 of AWS's 15 major outages in a decade. Recovery means breaking the loop: shed load, cap retries, adaptive LIFO — not adding capacity."
-reading_time: 6
+reading_time: 7
 tags: [metastable-failures, retry-storms, feedback-loops, load-shedding, reliability, incident-response]
 sources:
   - title: "Bronson, Aghayev, Charapko & Zhu — Metastable Failures in Distributed Systems (HotOS '21)"
@@ -16,59 +16,85 @@ sources:
     url: "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
 ---
 
-The database blips for ninety seconds. The blip ends — and the site stays down for six hours anyway, throughput pinned near zero while every dashboard shows servers busy doing... something. Rebooting fleets doesn't help. Doubling capacity doesn't help. This isn't cascading failure or gray failure; it's what Bronson, Aghayev, Charapko and Zhu named a **metastable failure** (HotOS '21): the outage has decoupled from its cause, and the system is now feeding on itself.
+**Gist.** A short disturbance — a database slowdown, a deploy, a cache wipe — can leave a distributed system pinned at near-zero goodput long after the disturbance ends, because the system's own response to overload generates more overload. Bronson, Aghayev, Charapko and Zhu (HotOS '21) call this a **metastable failure**: the outage has decoupled from its cause and is sustained by a feedback loop. Recovery requires driving the loop's amplification factor below one, which means deliberately serving less work — shedding load, capping retries, discarding expired queue entries — rather than adding capacity.
 
 ## Vulnerable, metastable, and the sustaining effect
 
-The model has three states. A **stable** system returns to goodput after any bounded disturbance. A **vulnerable** system runs fine — often *more* efficiently than a stable one — but sits within reach of a cliff. A **trigger** (load spike, deploy, brief dependency outage, cache wipe) tips it into the **metastable** state, where a **sustaining effect** — a feedback loop in which the *response to overload creates more overload* — holds the system down even after the trigger fully resolves. That last clause is the defining test: remove the trigger, and the failure persists.
+The model has three states. A **stable** system returns to goodput after any bounded disturbance. A **vulnerable** system operates correctly — often at higher efficiency than a stable one — but sits within reach of a cliff. A **trigger** (load spike, deploy, brief dependency outage, cache wipe) moves it into the **metastable** state, where a **sustaining effect** — a feedback loop in which the response to overload creates further overload — holds the system down after the trigger has resolved. **That last clause is the defining test: remove the trigger, and the failure persists.** This distinguishes metastability from cascading failure, where removing the cause restores service, and from gray failure, where the fault itself is still present but partially observable.
 
-The canonical loops:
+The canonical sustaining loops:
 
-- **Retry storms.** Clients time out and retry; retries multiply offered load exactly when capacity is scarcest; extra load causes more timeouts. With one retry, work amplification is 2x — the HotOS paper's motivating example shows a web tier whose retries sustain overload indefinitely after a 10-minute database slowdown. We covered the arithmetic in [exponential backoff, jitter, and retry storms](/articles/microservices/2026-08-15-exponential-backoff-jitter-retry-storms); metastability is what happens when that arithmetic crosses 1.0.
-- **Cache-miss storms.** A look-aside cache at 90%+ hit rate means the database is sized for 10% of true demand. Wipe the cache (or restart it) and the database sees 10x load, slows, requests time out, *entries never get repopulated because the fills are timing out too* — hit rate stays at zero. The cache stopped being an optimization years ago; it became load-bearing capacity. (Related mechanics: [cache stampede and request coalescing](/articles/microservices/2026-08-10-cache-stampede-request-coalescing).)
-- **GC spirals.** Slow responses grow in-flight request queues; bigger heaps mean longer GC pauses; longer pauses mean slower responses. Same shape with thread-pool exhaustion and lock convoys.
+- **Retry storms.** Clients time out and retry; retries multiply offered load precisely when capacity is scarcest; the extra load causes further timeouts. With a single retry per request, work amplification is 2x. The HotOS motivating example is a web tier whose retries sustain overload indefinitely after a **temporary database slowdown**. The arithmetic appears in [exponential backoff, jitter, and retry storms](/articles/microservices/2026-08-15-exponential-backoff-jitter-retry-storms); metastability is what that arithmetic produces once amplification crosses 1.0.
+- **Cache-miss storms.** A look-aside cache sustaining a 90% hit rate implies the database is provisioned for 10% of true demand. Wiping or restarting the cache exposes the database to **10x its usual load**; it slows, requests time out, and **entries are never repopulated because the fill requests time out as well** — the hit rate stays at zero. The cache is no longer an optimization; it is load-bearing capacity. Related mechanics appear in [cache stampede and request coalescing](/articles/microservices/2026-08-10-cache-stampede-request-coalescing).
+- **Garbage-collection (GC) spirals.** Slow responses grow the in-flight request queue; larger live heaps lengthen GC pauses; longer pauses slow responses further. Thread-pool exhaustion and lock convoys have the same shape.
 
-Huang et al.'s OSDI '22 follow-up, **"Metastable Failures in the Wild,"** showed this is a pattern, not an anecdote: **22 metastable failures across 11 organizations**, from hyperscalers down, and **at least 4 of the 15 major AWS outages in the preceding decade** — including the December 2021 us-east-1 event, where retries sustained congestion on an internal network long after the triggering surge. They refine the model usefully: triggers come as *load-spike* or *capacity-drop*, and sustaining loops amplify either **workload** (retries, re-subscriptions, health-check floods) or **capacity degradation** (GC, cache hit-rate collapse, queue-induced timeout misses).
+Huang et al.'s OSDI '22 follow-up, **"Metastable Failures in the Wild,"** establishes the pattern empirically: **22 metastable failures across 11 organizations**, and **at least 4 of the 15 major AWS outages in the preceding decade**. The paper refines the model along two axes: triggers are either *load spikes* or *capacity drops*, and sustaining loops amplify either **workload** (retries, re-subscriptions, health-check floods) or **capacity degradation** (GC, cache hit-rate collapse, queue-induced timeout misses).
 
-## Why adding capacity doesn't save you
+## Why additional capacity does not break the loop
 
-Here's the tipping point as a loop you can run:
+The tipping point is visible in a fixed-point argument. Let `C` be served capacity, `d` steady demand, and `r` the number of retries per failed request. In-flight load at each step is `L = d + r·max(0, L − C)`. While `L ≤ C`, the system rests at the fixed point `L = d`. Above `C` the recurrence is linear with slope `r`, so for `r > 1` it has a second, **unstable** fixed point at `L* = (r·C − d)/(r − 1)`: a trigger that pushes `L` past `L*` makes the retry term grow faster than capacity absorbs it, and `L` runs away and stays away even after `d` returns to its pre-trigger value. **The feedback loop, not the raw demand, sets the load.** Adding servers raises `C`, and with it `L*` — it widens the trigger the system can absorb — but does nothing to `r`, so a large enough trigger crosses the new threshold as well, and capacity added *after* the crossing is consumed by retries rather than by demand.
 
-```python
-capacity   = 1000        # req/s the backend can serve
-offered    = 800         # steady client demand, req/s
-timeout_ok = lambda inflight: inflight < capacity   # served within deadline
+Marc Brooker states the operational consequence directly: **the efficient system is the vulnerable one.** Caches, batching and high utilization all widen the gap between capacity assuming the optimization holds and capacity when it does not. Over-provisioning buys stability only up to the amplification factor the loop can reach.
 
-inflight = offered
-for t in range(120):
-    served  = min(inflight, capacity)
-    failed  = inflight - served          # timed out this tick
-    retries = failed * 1.0               # each failure retried once
-    inflight = offered + retries
-    print(t, inflight, served)
+### Implementation sketch (Scala)
 
-# trigger: set offered = 1100 for 5 ticks, then back to 800.
-# inflight jumps the cliff: failed>0 -> retries -> inflight stays >capacity
-# forever, though demand returned to 80% utilization. Goodput never recovers.
+The simulation below reproduces the fixed point: a five-step trigger, then demand returning to its original level.
+
+```scala
+final case class Step(inflight: Double, served: Double)
+
+def simulate(
+    capacity: Double,          // requests per tick the backend can serve
+    demand: Double,            // steady client demand
+    retries: Double,           // retries issued per failed request
+    trigger: Double,           // elevated demand during the trigger
+    triggerTicks: Int,
+    ticks: Int
+): LazyList[Step] =
+  LazyList.iterate(Step(demand, demand) -> 0)((step, t) =>
+    val offered = if t < triggerTicks then trigger else demand
+    val served  = math.min(step.inflight, capacity)
+    val failed  = step.inflight - served          // exceeded their deadline
+    Step(offered + failed * retries, served) -> (t + 1)
+  ).take(ticks).map(_._1)
+
+// Retries per failure below one: no runaway fixed point exists, so inflight
+// drains back to 800 once the trigger is withdrawn.
+val recovers =
+  simulate(capacity = 1000, demand = 800, retries = 0.5,
+           trigger = 1400, triggerTicks = 5, ticks = 120)
+
+// Above one: L* = (2*1000 - 800)/(2 - 1) = 1200, the trigger crosses it, and
+// inflight grows without bound while served work is entirely retries.
+val stuck =
+  simulate(capacity = 1000, demand = 800, retries = 2.0,
+           trigger = 1400, triggerTicks = 5, ticks = 120)
 ```
 
-Once `offered + retries > capacity`, failures beget retries beget failures — a fixed point above capacity. Now note what adding 25% more servers does: nothing, because the amplified load is `2 × offered` and still exceeds it. The feedback loop, not the raw demand, sets the load. Marc Brooker's framing is the operational headline: **the efficient system is the vulnerable one.** Caches, batching, and high utilization all widen the gap between "capacity assuming the optimization holds" and "capacity when it doesn't" — you can buy stability with over-provisioning, but you're paying for capacity the sustaining loop will still outrun if the amplification factor is high enough.
+A retry budget is the same model with `retries` replaced by a per-client token bucket, so the term `failed * retries` is bounded by a fraction of total request volume rather than by the failure count.
 
 ## Breaking the loop
 
-Recovery and prevention are the same move: make the amplification factor less than one.
+Recovery and prevention are the same move: reduce the amplification factor below one.
 
 | Mechanism | Loop it breaks | Notes |
 |---|---|---|
-| Load shedding / admission control | queue growth → timeout → waste | reject early at the front door; serve fewer, successfully |
-| Retry budgets (e.g. 10% of requests) | retry storm | per-client token bucket beats per-request retry counts |
-| Exponential backoff + jitter | synchronized retry waves | necessary, not sufficient — budgets cap the integral |
+| Load shedding / admission control | queue growth → timeout → waste | reject at the front door; serve fewer requests, successfully |
+| Retry budgets (a token-bucket fraction of request volume) | retry storm | a per-client token bucket bounds the integral; per-request retry counts do not |
+| Exponential backoff + jitter | synchronized retry waves | necessary, not sufficient — budgets cap the total |
 | Circuit breakers | repeated calls into a dead dependency | see [circuit breakers](/articles/microservices/2026-07-24-circuit-breakers-resilience4j) |
-| Adaptive LIFO + timeout-aware dequeue | serving already-expired requests | FIFO under overload does 100% wasted work at the back |
-| Deadline propagation | downstream work for abandoned requests | drop work whose caller already gave up |
+| Adaptive LIFO + timeout-aware dequeue | serving already-expired requests | first-in-first-out under overload wastes work at the back of the queue |
+| Deadline propagation | downstream work for abandoned requests | drop work whose caller has already given up |
 
-Two deserve emphasis. **LIFO under overload** (Facebook's "adaptive LIFO," paired with controlled-delay queue limits): when a queue is long, the oldest request is the one most likely past its client's deadline, so FIFO turns the whole backlog into dead work that still consumes capacity — serving newest-first converts some of that into goodput and starves the loop. And **admission control as recovery tool**: the OSDI paper observes operators escape metastability by *throttling below normal demand* — deliberately serving, say, 50% of traffic until caches refill and queues drain, then ratcheting up. Counterintuitive in an incident ("we're down and you want to reject more?"), which is exactly why the runbook should be written before 3 a.m. The [rate limiting and load shedding](/articles/microservices/2026-07-31-rate-limiting-load-shedding-token-bucket) piece covers the mechanisms; metastability is the argument for wiring them to a big red switch.
+Two entries warrant expansion. **Last-in-first-out (LIFO) service under overload** — Facebook's "adaptive LIFO", paired with controlled-delay queue limits — rests on the observation that when a queue is long, the oldest entry is the one most likely to be past its client's deadline. First-in-first-out ordering therefore converts the backlog into work that consumes capacity and produces nothing; serving newest-first converts part of it back into goodput. **Admission control as a recovery tool** follows from the OSDI observations: operators escape metastability by throttling *below* normal demand, serving a reduced fraction of traffic until caches refill and queues drain, then increasing the limit incrementally. The mechanisms are covered in [rate limiting and load shedding](/articles/microservices/2026-07-31-rate-limiting-load-shedding-token-bucket); metastability is the argument for exposing them as an operator-controlled switch rather than an automatic-only policy.
 
-The design-review question this framework hands you: for each optimization the system leans on (cache hit rate, connection reuse, batching), what happens the day it delivers zero — and is there any response to overload anywhere in the stack that *increases* load? Every "yes" is a stored outage waiting for its trigger.
+The design-review question the framework yields: for every optimization the system leans on — cache hit rate, connection reuse, batching — what is the load profile on the day it delivers zero benefit, and does any response to overload anywhere in the stack increase load? Each affirmative answer is a stored outage awaiting its trigger.
 
-**Try next:** extend the simulation above into a two-parameter sweep — retry count r in {0,1,2,3} and utilization u in {0.5..0.95} — and plot the region where goodput fails to recover after a 5-tick trigger. Then add a 10% retry budget and watch the metastable region collapse to nearly nothing.
+## Pitfalls
+
+- **Capacity added during the incident is absorbed by the loop.** Goodput stays near zero after a fleet doubles because the new capacity is spent on the retry backlog it inherits; the amplification factor is unchanged by server count.
+- **Rebooting the fleet re-arms the trigger.** Restarts empty caches and connection pools, so the recovering system faces the cache-miss storm again from a cold start.
+- **Backoff and jitter alone do not bound the retry integral.** They de-synchronize retry waves but leave the retries-per-failure ratio unchanged, so amplification above one still holds the system down.
+- **A high steady-state cache hit rate hides the true database sizing.** A backend provisioned against a 90% hit rate has no headroom for the 10x demand it sees when the cache is empty.
+- **First-in-first-out queues under overload spend capacity on expired requests.** Every dequeued entry whose client deadline has passed is served into a closed connection, so measured server work stays high while goodput stays at zero.
+- **Health checks and re-subscriptions are workload amplifiers.** Failing probes that trigger additional probing or mass client re-registration form a sustaining loop with no user request behind it.

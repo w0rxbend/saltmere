@@ -2,8 +2,8 @@
 title: "Replicated Load-Balanced Services: The Base Case of Scaling"
 date: 2026-07-26
 track: sys-patterns
-summary: "Before sharding, leader election, or work queues, there's the pattern everything else deviates from: N identical stateless replicas behind a load balancer. A close read of Burns' replicated load-balanced service pattern, why readiness and liveness are different questions, and a full Deployment/Service/HPA to run it."
-reading_time: 5
+summary: "Before sharding, leader election, or work queues comes the pattern the others deviate from: N identical stateless replicas behind a load balancer. A close read of Burns' replicated load-balanced service pattern, the separation of readiness from liveness, and a Deployment/Service/HorizontalPodAutoscaler manifest that runs it."
+reading_time: 7
 tags: [kubernetes, statelessness, load-balancing, autoscaling, health-checks, burns]
 sources:
   - title: "Designing Distributed Systems, 2nd ed. — Ch. 6, Replicated Load-Balanced Services (Burns, O'Reilly)"
@@ -18,51 +18,84 @@ sources:
     url: "https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough"
 ---
 
-Every other pattern in this journal is a deviation from one base case. Sidecars attach helpers to a pod. Ambassadors proxy out. Sharded services split state across replicas that stop being interchangeable. Work queues hand out tasks instead of requests. But underneath all of them sits the pattern Burns opens *Designing Distributed Systems* with: the **replicated load-balanced service** — N identical copies of a stateless process behind a load balancer, scaled by adding or removing copies. It's the least interesting pattern in the book and the most load-bearing.
+**Gist.** Request volume grows faster than any single process can absorb it. The replicated load-balanced service answers with **N identical copies of a stateless process behind a load balancer**, so capacity becomes a replica count rather than an architectural decision. The cost is the constraint that buys the indifference: **no replica may own state that a later request depends on**, which pushes session data, caches of record, and anything durable into a shared store reachable identically from every replica.
 
-## The pattern: clone it, balance it, forget which one answered
+Every other serving pattern in this track is a deviation from this base case. Sidecars attach helpers to a pod; ambassadors proxy outbound; sharded services split state across replicas that stop being interchangeable; work queues hand out tasks rather than requests. Burns presents the replicated load-balanced service as the first of the serving patterns in *Designing Distributed Systems*, and describes it as the simplest of them.
 
-The shape is almost embarrassingly simple. A load balancer sits in front of a pool of replicas. Every replica runs the same code, holds no client-specific state, and can answer any request from any client. The load balancer's only job is to pick a replica — round-robin, least-connections, whatever — and it never needs to remember which replica handled the last request from a given client, because it wouldn't matter if it did.
+## The invariant: any ready replica can answer any request
 
-That indifference is the entire value proposition. Because any replica can serve any request:
+A load balancer sits in front of a pool of replicas. Every replica runs the same code, holds no client-specific state, and can answer any request from any client. The balancer's only responsibility is selecting a replica — round-robin, least-connections, or another policy — and it need not record which replica served a given client previously, because that record would carry no information.
 
-- You scale by changing a replica count, not by re-architecting anything.
-- A replica crashing is a capacity dip, not a data-loss event or an outage for a subset of users.
-- Rolling deploys work: replace replicas one at a time, and clients never notice which version answered.
+The invariant is **request-to-replica affinity is unnecessary for correctness**. Three consequences follow directly, and each fails if the invariant fails:
 
-Burns frames this as the foundational serving pattern precisely because it requires no coordination protocol between replicas — no consensus, no leader, no gossip. The load balancer is the only component that needs to know the pool exists.
+- Capacity scales by changing a replica count; no rebalancing, handoff, or migration accompanies the change.
+- A replica crash is a capacity reduction, not data loss and not an outage confined to a subset of clients.
+- Rolling deployment is a matter of replacing replicas one at a time, since a client cannot observe which version answered.
 
-## Statelessness is the enabling constraint
+The pattern requires **no coordination protocol between replicas** — no consensus, no leader election, no gossip. The load balancer is the sole component that must know the pool's membership.
 
-None of the above holds if a replica remembers something a later request depends on. If replica B doesn't have the shopping cart replica A built up, routing request 2 to B breaks the illusion of one service. So statelessness isn't a nice property this pattern happens to have — it's the constraint that makes the pattern legal at all. Everything else (readiness gating, autoscaling, indifferent load balancing) is a consequence of having satisfied it first.
+## Statelessness is the enabling constraint, not a side effect
 
-In practice "stateless" means: no data that must survive past the response is kept in process memory or on local disk. State that must persist goes somewhere shared and addressable — a database, an object store, a distributed cache — that every replica can reach identically. The replica itself becomes disposable: kill it, restart it, replace its image, and nothing downstream notices except a momentary capacity dip.
+If replica B lacks a shopping cart accumulated on replica A, routing the second request to B breaks the illusion of a single service. Statelessness is therefore the precondition that makes the pattern legal, and readiness gating, autoscaling, and affinity-free balancing are consequences of having satisfied it.
 
-## Readiness vs. liveness: why the load balancer must not route blindly
+Operationally, stateless means **no data that must survive past the response is held in process memory or on local disk**. State that must persist moves to a shared, addressable store — a database, an object store, a distributed cache — that every replica reaches identically. The replica becomes disposable: it may be killed, restarted, or replaced with a new image, and the only downstream effect is a capacity reduction until the replacement becomes ready.
 
-A pool of identical replicas is only safe to load-balance across if the load balancer actually knows which ones are fit to receive traffic *right now* — not just which ones are running. Kubernetes splits this into two separate questions, and conflating them is the most common way to break this pattern in production:
+Two flavours of state recur in this pattern and are worth separating:
 
-| Probe | Question it answers | Failure action | Wrong answer costs you |
+- **Session state.** Sticky sessions pin a client to one replica and reintroduce exactly the coupling the pattern exists to remove. The alternative is a shared store such as Redis keyed by a session token the client presents on each request, so that any replica can read it.
+- **Caching.** A per-replica in-process cache remains admissible **as a pure performance optimisation, provided a miss is harmless and costs only the slower path to the shared source of truth**. Once correctness depends on which replica's cache was hit, state ownership has re-entered the replica and the invariant no longer holds.
+
+## Readiness and liveness answer different questions
+
+Balancing across identical replicas is safe only when the balancer knows which replicas are fit to receive traffic *at that moment*, which is not the same set as those that are running. Kubernetes separates the two questions, and conflating them is a common way to break the pattern in production.
+
+| Probe | Question answered | Failure action | Cost of a wrong answer |
 |---|---|---|---|
-| **Liveness** | Is the process alive, or wedged in a way only a restart fixes? | kubelet kills and restarts the container | A stuck-but-not-crashed process serves errors forever |
-| **Readiness** | Can this replica handle traffic *right now*? | Pod is removed from Service endpoints — no restart | A cold-starting or overloaded replica gets requests it can't serve |
+| **Liveness** | Is the process alive, or wedged such that only a restart recovers it? | The kubelet kills and restarts the container | A stuck-but-not-crashed process serves errors indefinitely |
+| **Readiness** | Can this replica handle traffic right now? | The pod is removed from the Service's endpoints; no restart | A cold-starting or saturated replica receives requests it cannot serve |
 
-A replica that's warming a cache, waiting on a downstream dependency, or momentarily saturated is *alive* — restarting it would be pointless, even harmful — but it isn't *ready*. The Kubernetes docs are explicit that failing a readiness probe only pulls the pod's IP from the Service's endpoint list; it doesn't touch the container. Failing a liveness probe does the opposite: the kubelet restarts the container regardless of load-balancer membership. Point the load balancer at readiness, not liveness, and a pod stuck initializing never receives a request it would fail; point restarts at liveness, and a genuinely wedged process gets recycled instead of silently eating traffic.
+A replica warming a cache, waiting on a downstream dependency, or momentarily saturated is alive but not ready; restarting it would discard the warm-up work already done. The Kubernetes documentation states that **failing a readiness probe removes the pod's address from the Service's endpoint list and leaves the container untouched**, whereas **failing a liveness probe causes the kubelet to restart the container**, independent of load-balancer membership. Pointing the balancer at readiness keeps an initialising pod from receiving a request it would fail; pointing restarts at liveness recycles a genuinely wedged process rather than leaving it to absorb traffic.
 
-## Where session and caching state actually live
+### Implementation sketch (Scala)
 
-Statelessness doesn't mean the system has no state — it means the *replica* doesn't own it. Two flavors show up constantly in this pattern:
+The load-bearing idea is that the two endpoints read **different** variables: liveness reflects only whether the serving loop is still progressing, while readiness additionally requires warm-up completion and a drain flag that shutdown sets before the process stops accepting work.
 
-- **Session state** — instead of sticky sessions pinning a client to one replica (which quietly reintroduces the coupling this pattern exists to avoid), session data goes into a shared store like Redis, keyed by a session token the client presents on every request. Any replica reads it, so any replica can serve that client.
-- **Caching** — a per-replica in-process cache is fine as a pure performance optimization *as long as a cache miss is harmless and just costs a slower path to the shared source of truth*. The moment correctness depends on which replica's cache you hit, you've smuggled state ownership back into the replica.
+```scala
+final class HealthState:
+  private val warmedUp   = java.util.concurrent.atomic.AtomicBoolean(false)
+  private val draining   = java.util.concurrent.atomic.AtomicBoolean(false)
+  private val lastLoopAt = java.util.concurrent.atomic.AtomicLong(System.nanoTime())
 
-Both patterns keep the load balancer's job trivial: pick any ready replica, because "any" really does mean any.
+  def markWarm(): Unit  = warmedUp.set(true)
+  def beginDrain(): Unit = draining.set(true)          // called from the SIGTERM handler
+  def heartbeat(): Unit = lastLoopAt.set(System.nanoTime())
 
-## Horizontal autoscaling: replica count as a dial
+  /** Liveness: only a restart can fix a serving loop that has stopped advancing. */
+  def live(stallLimit: java.time.Duration): Boolean =
+    System.nanoTime() - lastLoopAt.get() < stallLimit.toNanos
 
-Because replicas are identical and disposable, capacity becomes a single tunable number instead of an architecture decision. A `HorizontalPodAutoscaler` watches a metric — typically CPU or memory utilization averaged across the pool — against a target, and adjusts `replicas` up or down within bounds. This only works cleanly because statelessness already guaranteed that adding replica N+1 requires no handoff, migration, or rebalancing: the new pod becomes ready, the load balancer includes it, done.
+  /** Readiness: alive, warm, and not draining. Failing this removes the pod
+    * from Service endpoints without restarting the container. */
+  def ready(stallLimit: java.time.Duration): Boolean =
+    live(stallLimit) && warmedUp.get() && !draining.get()
 
-## Concrete: Deployment, Service, and HPA together
+// Handler wiring, framework-agnostic:
+val health = HealthState()
+val stall  = java.time.Duration.ofSeconds(30)
+
+def handle(path: String): Int = path match
+  case "/healthz/live"  => if health.live(stall) then 200 else 500
+  case "/healthz/ready" => if health.ready(stall) then 200 else 503
+  case _                => 404
+```
+
+`beginDrain` is the piece that makes rolling deployment lossless: the pod reports not-ready one probe interval before it stops serving, so the endpoint controller withdraws it while in-flight requests finish.
+
+## Horizontal autoscaling turns the replica count into a dial
+
+Because replicas are identical and disposable, capacity reduces to a single tunable number. A `HorizontalPodAutoscaler` compares a metric — commonly CPU or memory utilisation averaged across the pool — against a target and adjusts `replicas` within configured bounds. This is only sound because statelessness already guarantees that adding replica N+1 requires no handoff, migration, or rebalancing: the new pod becomes ready and the load balancer includes it.
+
+## Deployment, Service, and HorizontalPodAutoscaler together
 
 ```yaml
 apiVersion: apps/v1
@@ -124,10 +157,20 @@ spec:
         target: { type: Utilization, averageUtilization: 70 }
 ```
 
-The `Service` is the load balancer: it only ever forwards to pods currently listed as ready endpoints. The two separate probe paths — `/healthz/ready` versus `/healthz/live` — exist because they answer different questions, per the table above. The HPA turns `replicas` into a live variable driven by observed CPU load, with `minReplicas: 3` as a floor for baseline availability and `maxReplicas: 20` as a ceiling against runaway scale-out.
+The `Service` is the load balancer: it forwards only to pods currently listed as ready endpoints. The two probe paths differ because they answer the two questions tabulated above. The autoscaler makes `replicas` a variable driven by observed CPU utilisation, with `minReplicas: 3` as a floor and `maxReplicas: 20` as a ceiling on scale-out.
 
-## When replicas aren't enough
+## The axis this pattern does not scale
 
-This pattern scales exactly one axis: how many identical copies of the same small unit of state-free work you're willing to run. It stops working the moment the thing being served is itself too large for any one replica to hold or compute alone — a cache with more keys than fit in memory, an index too big for one disk. That's the sharded-service pattern's territory, covered separately in this track: same load-balancer instinct, but the router picks the *one correct* shard instead of *any* ready replica. Reach for sharding only after you've confirmed the bottleneck is data volume, not request volume — replicated services solve request volume for free.
+The pattern scales one axis: the number of identical copies of a state-free unit of work. It stops applying when the served thing is itself too large for one replica to hold or compute — a cache with more keys than fit in memory, an index larger than one disk. That is the sharded-service pattern's territory, covered separately in this track: the same balancing instinct, but the router selects the *one correct* shard rather than *any* ready replica. Sharding is warranted once the bottleneck is confirmed to be data volume rather than request volume, since replication already addresses request volume without a routing protocol.
 
-**Try next:** deploy the manifest above, then `kubectl exec` into a pod and make `/healthz/ready` return 500 without touching `/healthz/live` — watch the pod stay running but drop out of `kubectl get endpoints catalog-api` within one probe interval, and confirm no in-flight liveness restart happens because the process itself never stopped answering.
+An instructive experiment on the manifest above: make `/healthz/ready` return 503 while `/healthz/live` continues to return 200, then observe the pod remain `Running` while disappearing from `kubectl get endpoints catalog-api`, with no restart, because the process never stopped answering the liveness path.
+
+## Pitfalls
+
+- **A readiness probe that reports a downstream dependency's health takes the whole pool out of rotation at once.** When the shared database is briefly unreachable, every replica fails readiness simultaneously, the Service has zero endpoints, and requests fail at the balancer rather than degrading per-replica.
+- **A liveness probe on the same handler as readiness converts overload into a restart storm.** A saturated process that cannot answer within the probe timeout is killed, its load shifts to the remaining replicas, and they saturate in turn.
+- **Sticky sessions added to work around per-replica state make crashes user-visible again.** Losing a replica now loses the sessions pinned to it, which is the failure mode the pattern was adopted to remove.
+- **An in-process cache treated as authoritative produces responses that depend on which replica answered.** The symptom is a client failing to observe its own recent write, appearing only under multi-replica deployment and vanishing at `replicas: 1`.
+- **`initialDelaySeconds` shorter than actual start-up causes restart loops before readiness ever succeeds.** The liveness probe fires during warm-up, the container restarts, and warm-up begins again.
+- **Terminating pods that do not report not-ready before exiting drop in-flight requests.** The endpoint controller withdraws the address only after the pod's state changes, so a process exiting immediately on SIGTERM leaves the balancer forwarding to a closed socket.
+- **An autoscaler targeting CPU on a latency-bound workload does not scale under load.** Replicas blocked on a downstream call show low CPU utilisation while queueing, so the target is never exceeded and the replica count stays at the floor.

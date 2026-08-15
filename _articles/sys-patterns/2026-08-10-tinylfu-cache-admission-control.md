@@ -2,8 +2,8 @@
 title: "Cache Admission Control with TinyLFU: Deciding What to Let In"
 date: 2026-08-10
 track: sys-patterns
-summary: "Eviction alone answers only half the question. LRU admits every new item unconditionally, throwing out something that may be more valuable. TinyLFU adds an admission filter: a Count-Min frequency sketch with 4-bit counters, a doorkeeper bloom filter for one-hit-wonders, and an aging reset that halves all counters to track recent popularity. We cover the admit() decision, the aging step, and why Window-TinyLFU (Caffeine) bolts a small LRU window in front to survive bursts and scans."
-reading_time: 6
+summary: "Eviction answers only half the question. Least-recently-used (LRU) eviction admits every new item unconditionally, discarding a resident that may be more valuable. TinyLFU adds an admission filter: a Count-Min frequency sketch with 4-bit counters, a doorkeeper bloom filter for one-hit-wonders, and an aging reset that halves all counters to track recent popularity. This article covers the admit() decision, the aging step, and why Window-TinyLFU (Caffeine) places a small LRU window in front to survive bursts and scans."
+reading_time: 7
 tags:
   - caching
   - admission-control
@@ -25,45 +25,41 @@ sources:
     url: "https://github.com/ben-manes/caffeine/wiki/Efficiency"
 ---
 
-Most caching discussions stop at eviction: given a full cache, which resident do we throw out? That is only half the decision. There is a second, quieter question — *should the incoming item be let in at all?* Classic LRU never asks it. On every miss it admits the new key unconditionally and evicts the least-recently-used resident to make room. That is a fine reflex until the newcomer is garbage: a scan touching a million cold keys once each will march straight through an LRU cache, evicting genuinely hot data to cache items that will never be requested again. The eviction policy did its job; the *admission* policy — which LRU lacks — was the missing guard.
+**Gist.** Least-recently-used (LRU) caching decides only which resident leaves, never whether the arrival deserves a seat, so a single pass over cold keys evicts the entire working set. TinyLFU adds an **admission filter**: an approximate frequency estimate for the candidate is compared against the estimate for the victim the eviction policy has already nominated, and the candidate is admitted only if it wins. The cost is a frequency sketch that must be maintained on every access and periodically aged, plus the risk that an item with genuine future value is rejected before it has accumulated enough observed frequency to win the comparison.
 
-**Admission control** flips the burden of proof onto the newcomer. When the cache is full, before we admit a candidate we compare its estimated long-term frequency against the frequency of the eviction victim the resident policy has already nominated. Admit only if the candidate looks *more useful* than what we would sacrifice. TinyLFU is the canonical, memory-cheap way to make that comparison.
+## The admission decision
 
-## The core idea: admit() compares frequencies
-
-The eviction policy (LRU, SLRU, whatever) still chooses a victim. TinyLFU sits in front as a filter:
+Eviction policy and admission policy are separable. The eviction policy — LRU, segmented LRU (SLRU), or another — still nominates a victim. TinyLFU sits in front of it as a filter:
 
 ```
 function admit(candidate):
     victim = evictionPolicy.chooseVictim()
     if estimate(candidate) > estimate(victim):
-        return ADMIT      # newcomer is worth more; evict victim
+        return ADMIT      # newcomer estimated more valuable; evict victim
     else:
         return REJECT     # keep victim; do not cache candidate
 ```
 
-Notice what this buys you: a one-hit scan key has `estimate(candidate) == 1` (or 0), while a hot resident has a high estimate. The comparison fails, the scan key is rejected, and the hot resident survives. Frequency-based *admission* gives you scan resistance for free, without paying LFU's usual costs of unbounded counters and poor recency handling.
+The consequence for scans is structural rather than heuristic. A key touched once during a sequential pass has `estimate(candidate)` of 1 or 0, while a resident of the working set has a materially higher estimate; the comparison fails and the resident survives. **Scan resistance therefore falls out of frequency-based admission without adopting least-frequently-used (LFU) eviction**, and so without LFU's unbounded per-key counters or its inability to forget.
 
-The whole design hinges on `estimate()` being both accurate and tiny. A precise per-key frequency table would cost more memory than the cache it protects. TinyLFU instead approximates.
+The design depends entirely on `estimate()` being simultaneously accurate enough to order two keys and small enough to be worth keeping. An exact per-key frequency table would cost more memory than the cache it protects, so TinyLFU approximates.
 
 ## The frequency sketch: Count-Min with 4-bit counters
 
-TinyLFU's `estimate()` is backed by a **Count-Min sketch** (see the [Count-Min sketch article](/articles/distributed-systems/2026-08-10-count-min-sketch) for the mechanics — a matrix of counters, `d` hash functions, per-key minimum-over-rows read). We build on it here rather than re-derive it.
+`estimate()` is backed by a **Count-Min sketch** (a matrix of counters, `d` hash functions, a per-key read that takes the minimum over rows — see the [Count-Min sketch article](/articles/distributed-systems/2026-08-10-count-min-sketch) for the derivation). Two adaptations distinguish the caching variant.
 
-Two adaptations matter for caching:
+- **4-bit counters.** The policy never needs an absolute access total; it needs an ordering between two keys. A counter that **saturates at 15** suffices. Caffeine's `FrequencySketch` uses a 4-bit Count-Min sketch, packing counters densely so the whole sketch costs **roughly 8 bytes per cache entry**.
+- **Minimal increment.** On access, TinyLFU reads all `d` counters for the key and increments **only the smallest one or ones**. For counters reading `{2, 2, 5}`, the two 2s become 3 and the 5 is left alone. Since a Count-Min sketch reads the minimum, incrementing a counter already above the minimum would only add collision noise; withholding that increment suppresses part of the sketch's systematic over-count and keeps rare-key estimates from inflating toward the popular keys they collide with.
 
-- **4-bit counters.** We are not counting exact access totals; we only need to compare which of two items is *more* popular. A counter that saturates at 15 is plenty — Caffeine's `FrequencySketch` uses a 4-bit Count-Min sketch, packing counters so that the whole sketch costs roughly 8 bytes per cache entry. That is the difference between a sketch that fits in cache-friendly memory and one that does not.
-- **Minimal increment.** On access, TinyLFU reads all `d` counters for the key and increments *only the smallest one(s)*. If the counters read `{2, 2, 5}`, only the two 2s become 3. This suppresses the Count-Min sketch's systematic over-count and keeps rare-key estimates honest.
+`estimate(key)` returns the minimum across the key's `d` counters, as in the unmodified Count-Min sketch.
 
-`estimate(key)` returns the minimum across the key's `d` counters, exactly as in Count-Min.
+## The doorkeeper
 
-## The doorkeeper: a bloom filter for one-hit-wonders
+Skewed workloads have a long tail: most distinct keys are observed **once** inside a measurement window. Allocating a multi-bit sketch counter in every row to a key that never recurs is waste. The paper's remedy is a **doorkeeper** — a plain bloom filter placed in front of the sketch.
 
-Skewed workloads have a long tail: most distinct keys are seen *once* inside any measurement window. Allocating full multi-bit sketch counters to keys that never recur is waste. TinyLFU's fix, from section 3.4 of the paper, is a **doorkeeper** — a plain bloom filter placed *in front of* the sketch.
+The paper describes the doorkeeper as a regular bloom filter placed in front of the approximate counting scheme: on item arrival the doorkeeper is checked first; an item absent from it — the expected case for first timers and tail items — is inserted into the doorkeeper, and otherwise into the main structure.
 
-> "The Doorkeeper is a regular Bloom filter placed in front of the approximate counting scheme. Upon item arrival, we first check if the item is contained in the Doorkeeper. If it is not contained in the Doorkeeper (as is expected with first timers and tail items), the item is inserted to the Doorkeeper and otherwise, it is inserted to the main structure."
-
-So a key's *first* sighting only flips bits in the doorkeeper; it never touches the sketch. Its *second* sighting promotes it to the main sketch. Estimation combines both: if the key is present in the doorkeeper, TinyLFU adds 1 to whatever the main sketch reports.
+A key's **first** sighting therefore flips bits only in the doorkeeper and never touches the sketch; its **second** sighting promotes it to the main structure. Estimation combines the two: **if the key is present in the doorkeeper, 1 is added to whatever the main sketch reports**.
 
 ```
 function estimate(key):
@@ -80,11 +76,11 @@ function record(key):                 # called on every access
     onIncrement()                     # drive the aging clock
 ```
 
-The payoff, in the authors' words: "most tail items are only allocated 1 bit counters (in the Doorkeeper)... in many skewed workloads, this optimization significantly reduces the memory consumption of TinyLFU." One-hit-wonders cost a single bit and, with an estimate of 1, lose the `admit()` comparison to any genuinely warm resident.
+The paper's stated effect is that tail items are allocated a single bit in the doorkeeper rather than a multi-bit counter, which on skewed workloads reduces the memory TinyLFU consumes. A one-hit-wonder costs a single bit per bloom hash and, with an estimate of 1, loses the `admit()` comparison against any warm resident.
 
-## Aging: halve everything so recency wins
+## Aging: periodic halving
 
-An LFU that never forgets is a museum: yesterday's viral key keeps its high count forever and blocks today's rising star. TinyLFU keeps its picture *fresh* with a reset (aging) step. A running counter tracks total increments; when it reaches the **sample size `W`**, every counter in the sketch is divided by two, and the doorkeeper is cleared.
+An LFU estimator that never forgets preserves yesterday's popular key at its peak count indefinitely, and that key then wins every admission comparison against a currently rising key. TinyLFU bounds the memory of the estimator with a reset step. A running counter tracks total increments; on reaching the **sample size `W`**, every counter in the sketch is **divided by two** and the doorkeeper is cleared.
 
 ```
 sampleSize = W               # e.g. ~ 10x cache capacity
@@ -99,27 +95,79 @@ function reset():
     for c in sketch.counters:
         c = c >> 1           # halve (integer divide by 2)
     doorkeeper.clear()       # tail estimates start fresh
-    count = count >> 1       # or recompute from remaining mass
+    count = count >> 1       # the increment tally halves with the counters
 ```
 
-Halving is a decay with a half-life of one window: a key must keep earning hits to stay estimated-popular, but recent popularity is weighted far above ancient popularity. Because the divide preserves *ratios*, the relative ordering that `admit()` cares about is retained while absolute magnitudes shrink — and 4-bit counters never overflow, since they are periodically pulled back down. This is what makes TinyLFU behave like a *windowed* LFU rather than a true all-time LFU.
+Two properties follow. **Halving preserves ratios**, so the relative ordering that `admit()` consumes survives the reset while absolute magnitudes shrink; and **4-bit counters cannot overflow**, because the reset periodically pulls them back below saturation. The estimator consequently behaves as a **windowed** LFU — decay with a half-life of one sample window — rather than an all-time LFU. Integer truncation is the visible imprecision: a counter of 1 halves to 0, so a key observed exactly once before the reset is indistinguishable afterwards from a key never observed at all.
 
-## Window-TinyLFU: surviving bursts and warm-up
+## Window-TinyLFU
 
-Pure TinyLFU admission has a weakness: an item arriving in a *sparse burst* — hit several times in quick succession, then again much later — may not have built up sketch frequency yet, so `admit()` rejects it before it can prove itself. Caffeine's **Window-TinyLFU (W-TinyLFU)** fixes this with a hybrid layout:
+Admission by frequency alone rejects an item that has genuine value but no accumulated history: an item hit several times in quick succession and then again much later may fail `admit()` before the sketch has recorded the burst. Caffeine's **Window-TinyLFU (W-TinyLFU)** addresses this with a two-region layout.
 
-- A small **admission window**, managed as an LRU (historically ~1% of capacity). Every new item enters here first, no questions asked.
-- A large **main region** (~99%), managed as **SLRU** (segmented LRU: a probation segment plus a protected segment capped around 80% of the main space — see [eviction policies](/articles/sys-patterns/2026-08-10-cache-eviction-policies)).
+- A small **admission window**, managed as LRU (historically around 1% of capacity). Every new item enters here first, unfiltered.
+- A large **main region** (around 99%), managed as **SLRU**: a probation segment plus a protected segment capped near 80% of the main space — see [eviction policies](/articles/sys-patterns/2026-08-10-cache-eviction-policies).
 
-When the window evicts its LRU victim, that victim is *not* discarded — it becomes the *candidate* for the main region, and only then does the TinyLFU filter run: `estimate(windowVictim) > estimate(mainVictim)` decides admission into the main region. The window absorbs recency and bursts; the frequency filter guards the durable working set against scans. Caffeine further **adapts** the window/main split at runtime via hill climbing on the observed hit rate — larger windows for recency-heavy workloads, smaller for frequency-biased ones. See the [Caffeine article](/articles/scala-jvm/2026-08-10-caffeine-w-tinylfu-caching) for the JVM-side API.
+When the window evicts its LRU victim, that victim is not discarded; it becomes the **candidate** for the main region, and the TinyLFU filter runs only at that boundary: `estimate(windowVictim) > estimate(mainVictim)` decides admission. **The window absorbs recency and bursts, and the frequency filter guards the durable working set against scans.** Caffeine additionally **adapts the window/main split at runtime by hill climbing on the observed hit rate**, enlarging the window for recency-heavy workloads and shrinking it for frequency-biased ones. The [Caffeine article](/articles/scala-jvm/2026-08-10-caffeine-w-tinylfu-caching) covers the JVM-side application programming interface (API).
 
-## Why it raises hit ratio
+## Where the hit-ratio gain comes from
 
-On uniform-random access, admission control does nothing useful — every key is equally worthless, and the overhead is pure cost. Its value shows on the workloads real caches actually see:
+Under uniform-random access, admission control contributes nothing: all keys are equally unlikely to recur, and the sketch is pure overhead. The gain appears on the two workload shapes real caches encounter.
 
-- **Skewed (Zipfian) popularity.** The sketch cheaply distinguishes the head from the tail; `admit()` protects the head, and the doorkeeper keeps the tail from wasting counters. Caffeine's simulations show W-TinyLFU tracking near-optimal hit rates where LRU trails badly.
-- **Scan / loop workloads.** A one-pass scan of cold keys can never win the frequency comparison against a warm resident, so it is rejected at the door instead of evicting the working set. LRU, lacking admission, is defenceless here.
+- **Skewed (Zipfian) popularity.** The sketch separates head from tail at low cost; `admit()` protects the head and the doorkeeper keeps the tail from consuming counters. Caffeine's published simulations show W-TinyLFU tracking near-optimal hit rates on workloads where LRU trails.
+- **Scan and loop workloads.** A single pass over cold keys cannot win the frequency comparison against a warm resident, so it is rejected at the door rather than evicting the working set. LRU, having no admission stage, has no defence.
 
-The mental model worth keeping for interviews: **eviction picks who leaves; admission decides whether the newcomer has earned the seat.** LRU only does the former and treats every arrival as automatically deserving. TinyLFU makes admission a frequency argument, and does it in about a byte per entry.
+The separation worth retaining: **eviction selects who leaves; admission decides whether the arrival has earned the seat.** LRU implements only the first and treats every arrival as deserving. TinyLFU makes admission a frequency argument at a cost of roughly 8 bytes per entry.
 
-**Try next:** implement the 4-bit Count-Min `FrequencySketch` with minimal increment and the halving reset, feed it a Zipf(1.0) key stream interleaved with a periodic full scan, and plot hit ratio for (a) plain LRU vs (b) LRU + TinyLFU admission vs (c) W-TinyLFU — then watch the scan pass leave the TinyLFU variants' working sets untouched.
+### Implementation sketch (Scala)
+
+A 4-bit Count-Min sketch with minimal increment and the halving reset. Counters are packed 16 to a `Long`; the doorkeeper and the eviction policy are omitted.
+
+```scala
+final class FrequencySketch(capacity: Int, sampleSize: Int):
+  private val tableMask = Integer.highestOneBit(math.max(capacity, 1)) * 2 - 1
+  private val table = Array.fill((tableMask + 1) / 16 + 1)(0L)
+  private val seeds = Array(0x9E3779B9, 0x85EBCA6B, 0xC2B2AE35, 0x27D4EB2F)
+  private var size = 0
+
+  private def indexOf(hash: Int, row: Int): Int =
+    val h = hash * seeds(row)
+    (h ^ (h >>> 16)) & tableMask
+
+  /** Minimum over the d rows: the Count-Min read. */
+  def frequency(hash: Int): Int =
+    (0 until 4).map { row =>
+      val i = indexOf(hash, row)
+      ((table(i >>> 4) >>> ((i & 15) << 2)) & 0xFL).toInt
+    }.min
+
+  /** Increments only the counters currently at the minimum. */
+  def increment(hash: Int): Unit =
+    val slots = (0 until 4).map(indexOf(hash, _))
+    val values = slots.map(i => ((table(i >>> 4) >>> ((i & 15) << 2)) & 0xFL).toInt)
+    val min = values.min
+    if min < 15 then                            // 4-bit counters saturate at 15
+      slots.zip(values).foreach { case (i, v) =>
+        if v == min then
+          val shift = (i & 15) << 2
+          table(i >>> 4) += (1L << shift)
+      }
+      size += 1
+      if size >= sampleSize then reset()
+
+  /** Halving preserves the ordering admit() reads, and bounds the counters. */
+  private def reset(): Unit =
+    var j = 0
+    while j < table.length do
+      table(j) = (table(j) >>> 1) & 0x7777777777777777L  // shift each nibble, mask carries
+      j += 1
+    size = size >>> 1
+```
+
+## Pitfalls
+
+- **Halving loses single observations.** A counter at 1 becomes 0 at the reset, so a key seen exactly once in the previous window is treated as never seen; a periodic workload whose period exceeds the sample window `W` is repeatedly rejected at admission.
+- **`admit()` without a window starves sparse bursts.** An item hit several times in close succession and then again much later has no accumulated sketch frequency at the moment of the comparison and is rejected before it can prove itself — the defect W-TinyLFU's admission window exists to cover.
+- **A sample size that is too large freezes the estimate.** Reset then occurs rarely, old popularity keeps winning comparisons, and hit ratio degrades slowly and without an obvious symptom beyond newly popular keys failing to enter the cache.
+- **Incrementing all `d` counters instead of the minimum inflates rare keys.** Without minimal increment, a cold key colliding with a hot one in one row inherits collision mass, its estimate rises, and it starts winning admissions it should lose.
+- **A doorkeeper that is never cleared saturates.** The bloom filter's false-positive rate grows with insertions; once most lookups return true, every key gains the +1 doorkeeper bonus and the bonus stops carrying information. The clear must happen at each reset.
+- **Admission control is overhead on uniform workloads.** With no popularity skew, estimates are indistinguishable, the filter's decisions are arbitrary, and the sketch's per-access work and roughly 8 bytes per entry buy no hit-ratio improvement.

@@ -2,8 +2,8 @@
 title: "The Priority Queue Pattern: Starvation, Aging, and Multi-Level Feedback in a Worker Pool"
 date: 2026-08-15
 track: sys-patterns
-summary: "Letting urgent work jump the line is the easy half of the Priority Queue pattern. The hard half is that a firehose of high-priority work can leave low-priority tasks waiting forever. The fixes — aging, multi-level feedback queues, weighted fair queueing — were solved decades ago by OS CPU schedulers, and they port cleanly to a worker pool draining SQS or RabbitMQ."
-reading_time: 6
+summary: "Letting urgent work jump the line is the easy half of the Priority Queue pattern. The hard half is that a sustained stream of high-priority work can leave low-priority tasks waiting indefinitely. The mitigations — aging, multi-level feedback queues, weighted fair queueing — come from operating-system CPU schedulers and port to a worker pool draining SQS or RabbitMQ."
+reading_time: 7
 tags: [priority-queue, starvation, aging, scheduling, mlfq, workers]
 sources:
   - title: "Priority Queue pattern — Azure Architecture Center"
@@ -16,29 +16,31 @@ sources:
     url: "https://docs.python.org/3/library/heapq.html"
 ---
 
-A plain [work queue](/articles/sys-patterns/2026-07-26-work-queue-pattern) treats every task as equal: FIFO, drained by interchangeable workers. That breaks the moment a payment confirmation and a nightly analytics job land in the same pipe. The **Priority Queue pattern** fixes the ordering: tasks carry a priority, and "requests with a higher priority are received and processed more quickly than those with a lower priority." Guaranteeing that the payment jumps ahead is the easy part. The part that bites you in production is what happens to the analytics job when payments never stop arriving.
+**Gist.** A plain [work queue](/articles/sys-patterns/2026-07-26-work-queue-pattern) is first-in-first-out (FIFO), so a payment confirmation waits behind a nightly analytics batch that happened to arrive first. The **Priority Queue pattern** attaches a priority to each task so that, in the Azure Architecture Center's wording, "a workload processes high-priority requests more quickly than lower-priority ones." The cost is starvation: under strict priority ordering, low-priority work is served only while the high-priority side is empty, and if it never empties, the low-priority side never advances and **no error is raised**.
 
 ## Two shapes, one guarantee
 
-The Azure Architecture Center describes two implementations. The first is a **single priority-ordered queue**: one queue that "orders messages by priority, ensuring that consumers process higher-priority messages before lower-priority ones." Clean, but it needs a broker that supports priority ordering (RabbitMQ's `x-max-priority`, a database-backed queue with `ORDER BY priority`).
+The Azure Architecture Center describes two implementations. The first is a **single priority-ordered queue**: one queue that "orders messages by priority, ensuring that consumers process higher-priority messages before lower-priority ones." This requires a broker that supports priority ordering — RabbitMQ's `x-max-priority` argument, or a database-backed queue whose claim statement carries `ORDER BY priority`.
 
-The second is **multiple queues**, one per priority level, and here the consumer topology is the real decision:
+The second is **multiple queues**, one per priority level. Here the consumer topology, not the broker, decides whether starvation is possible:
 
-| Topology | How it works | Cost | Starvation risk |
+| Topology | Mechanism | Cost | Starvation risk |
 |----------|--------------|------|-----------------|
 | Single ordered queue | Broker sorts by priority | Low | High |
-| Multi-queue, single consumer pool | Workers drain high queue first; touch low only when high is empty | Low | High |
-| Multi-queue, multiple pools | Dedicated (bigger) pools per queue | Higher | Low — low-prio always gets *some* workers |
+| Multi-queue, single consumer pool | Workers drain the high queue first; touch low only when high is empty | Low | High |
+| Multi-queue, multiple pools | Dedicated pools per queue, sized per priority | Higher | Low — the low-priority queue always retains some workers |
 
-The single-pool model is the trap. "The single consumer pool always processes higher priority messages before lower priority ones" — which is exactly strict priority scheduling, and exactly how you starve the bottom of the queue.
+The single-pool model is the trap. "Single consumer pools always process higher-priority messages before lower-priority ones" — which is strict priority scheduling, and the condition under which the bottom of the queue is starved.
 
 ## The failure mode: starvation
 
-Strict priority has a well-known pathology. Azure states it plainly: this "could lead to lower priority messages being continually delayed and potentially never processed." As long as a high-priority message is available, the low-priority queue is never touched. Your analytics job isn't slow — it's stuck, indefinitely, and no error fires.
+The invariant of strict priority is that **a worker dequeues from level *k* only if every level above *k* is observed empty at that instant**. The invariant is locally correct on every dequeue and globally fatal: it never bounds waiting time at the lower levels. Azure states the consequence directly — this setup "can lead to lower-priority messages being continually delayed and potentially never processed."
 
-This is not a cloud problem; it's a 1960s problem. CPU schedulers hit it first, and their fixes are the canonical mitigations.
+The observable symptom is distinctive. Throughput is healthy, worker utilisation is high, the error rate is zero, and one queue's depth sits at a non-zero constant while its **oldest-message age grows without bound**. Depth alone does not distinguish a starved queue from a busy one; age does.
 
-**Aging (priority boosting).** Raise a task's effective priority the longer it waits, so a starved item eventually outranks fresh arrivals. Azure's own recommendation — "dynamically increase the priority of aged messages" — is aging by another name. A Python worker pulling from an in-process heap can implement it directly. `heapq` is a min-heap, so *lower number = more urgent*, and we subtract a boost proportional to wait time:
+The mitigations come from CPU scheduling, and they all work by making effective priority a function of waiting time rather than a constant.
+
+**Aging (priority boosting).** Raise a task's effective priority the longer it has waited, so a delayed item eventually outranks fresh arrivals. Azure's recommendation to "dynamically increase the priority of old messages to ensure that low-priority messages eventually get processed" is aging under another name. A worker pulling from an in-process heap can implement it directly. Python's `heapq` is a min-heap, so *lower number means more urgent*, and the boost is subtracted in proportion to waiting time:
 
 ```python
 import heapq, itertools, time
@@ -69,14 +71,61 @@ class AgingPriorityQueue:
         return item
 ```
 
-A base-priority-5 task that has waited 12 seconds has effective priority `5 - 0.5*12 = -1`, so it now beats a freshly-arrived priority-0 task. The caveat: re-aging every element on each `pop` is O(n). Fine for a modest in-memory queue; for a large one, re-age lazily on a timer or push aged items up a level instead.
+A base-priority-5 task that has waited 12 seconds has effective priority `5 - 0.5*12 = -1` and therefore outranks a freshly arrived priority-0 task. The cost is that re-aging every element on each `pop` is **O(n) per dequeue**, plus the O(n) `heapify`; this is acceptable for a modest in-memory queue and not for a large one, where the alternatives are to re-age on a timer or to promote aged items a level at a time.
 
-**Multi-level feedback queues (MLFQ).** The OS scheduler's answer, and the one worth stealing wholesale. OSTEP's rules: a new job "is placed in the highest priority queue"; "once a job uses up its time allotment at a level, its priority is reduced"; and — the anti-starvation rule — "after some time period S, move all the jobs in the system to the topmost queue." That last rule *is* aging applied to whole queues: a periodic priority boost. MLFQ also warns about **gaming** — a task that does a tiny bit of I/O to reset its slot and cling to a high priority — fixed by "better accounting" that tracks cumulative work regardless of voluntary yields. In a worker pool, the same abuse is a "high-priority" producer that floods the top queue; the boost period S and per-tenant accounting are your defenses.
+**Multi-level feedback queues (MLFQ).** The operating-system scheduler's answer. OSTEP (Ch. 8) states the rules: "When a job enters the system, it is placed at the highest priority (the topmost queue)"; "Once a job uses up its time allotment at a given level (regardless of how many times it has given up the CPU), its priority is reduced (i.e., it moves down one queue)"; and, as the anti-starvation rule, "After some time period S, move all the jobs in the system to the topmost queue." **That last rule is aging applied to whole queues** — a periodic bulk boost rather than a continuous per-item recomputation, which removes the O(n)-per-dequeue cost and pays it once per period S instead.
 
-**Weighted fair queueing (WFQ).** Instead of strict "high before low," give each priority a *share* of the workers — say 8:3:1 across three RabbitMQ queues. High priority gets most of the pool but low priority always keeps at least one consumer, so it drains slowly rather than never. This is the multi-pool row of the table, sized by weight.
+OSTEP also names the abuse case: **gaming**, where a job performs a small amount of I/O to relinquish the processor before its allotment expires and so retains its high priority. The documented fix is to "perform better accounting of CPU time at each level of the MLFQ" — track cumulative allotment consumed at a level regardless of how many times the job yields voluntarily. The analogue in a worker pool is a producer that labels all of its traffic high-priority and floods the top queue; the boost period S bounds how long the other levels wait before being returned to the top queue, and per-tenant accounting is what prevents one producer from holding the top level indefinitely.
 
-## Choosing, honestly
+**Weighted fair queueing (WFQ).** Rather than strict "high before low", allocate each priority level a *share* of the pool — for example 8:3:1 across three queues. The high level receives most of the capacity while the low level retains at least one consumer, so it drains slowly rather than not at all. This is the multi-pool row of the table, with pool sizes set by weight.
 
-Strict priority is simplest and correct *only* if low-priority work is genuinely optional — droppable telemetry, best-effort backfill. The instant a low-priority task has any deadline, you need aging or a weighted split, and you should alert on oldest-message age per priority so silent starvation becomes a page. And priority ordering does nothing for a total overload: if arrivals exceed capacity across all priorities, even the top queue backs up. Pair this pattern with **Queue-Based Load Leveling** to absorb bursts, and with autoscaling so the pool grows when the high-priority queue does.
+### Implementation sketch (Scala)
 
-**Try next:** Stand up two RabbitMQ queues, `high` and `low`, and a single worker that always drains `high` first. Fire a steady stream into `high` and watch `low` freeze at a non-zero depth forever. Then give `low` its own guaranteed consumer (an 8:1 weighted split) and confirm it drains — slowly but without starving.
+Deficit-based weighted selection over per-priority queues. The load-bearing idea is that **the choice of queue is made by a credit counter, not by emptiness of the level above**, so every weighted level makes progress whenever it has work.
+
+```scala
+final case class Level[A](weight: Int, q: java.util.Queue[A])
+
+final class WeightedDrain[A](levels: Vector[Level[A]]):
+  // One credit counter per level; refilled by weight each round.
+  private val credit = Array.fill(levels.size)(0)
+
+  /** Returns the next task, or None when every level is empty. */
+  def next(): Option[A] =
+    var attempts = 0
+    while attempts <= levels.size do
+      val i = pick()
+      if i >= 0 then
+        credit(i) -= 1
+        val t = levels(i).q.poll()
+        if t != null then return Some(t)
+      else
+        // No level holds credit: start a new round.
+        levels.indices.foreach(j => credit(j) += levels(j).weight)
+        attempts += 1
+    None
+
+  /** Highest-weight level that still has both credit and work. */
+  private def pick(): Int =
+    levels.indices
+      .filter(i => credit(i) > 0 && !levels(i).q.isEmpty)
+      .maxByOption(levels(_).weight)
+      .getOrElse(-1)
+```
+
+With weights `8:3:1`, a round in which every level has work yields twelve dequeues, one of them from the lowest level, however much work the top level holds. Replacing `pick` with "first non-empty level" recovers strict priority — and its starvation.
+
+## Choosing
+
+Strict priority is the simplest correct choice **only when low-priority work is genuinely droppable** — best-effort telemetry, backfill with no deadline. Once a low-priority task carries any deadline, the choice is aging or a weighted split, and the operational requirement is an alert on **oldest-message age per priority level**, because that is the signal starvation produces.
+
+Priority ordering does not address total overload: when the arrival rate exceeds service capacity across all levels, the top queue backs up as well, and reordering cannot create capacity. The pattern therefore pairs with **Queue-Based Load Leveling** to absorb bursts, and with Azure's recommendation to "scale the size of consumer pools based on the length of the queue they're servicing."
+
+## Pitfalls
+
+- **Monitoring queue depth instead of message age.** A starved queue holds a constant depth, which looks like a steady backlog rather than a fault; only oldest-message age grows without bound and identifies it.
+- **Re-aging the whole heap on every dequeue.** The `AgingPriorityQueue` above is O(n) per `pop`; at large n the aging pass dominates the work being scheduled. A periodic bulk boost, as in the MLFQ rule for period S, moves that cost off the dequeue path.
+- **Treating a single ordered queue as sufficient.** Broker-side priority ordering changes which message is delivered first; it does not bound how long the lowest priority waits, so starvation survives the migration to a priority-capable broker.
+- **Trusting producer-supplied priority.** A producer that marks all of its traffic high-priority collapses the scheme to FIFO with extra steps — the worker-pool form of the gaming behaviour OSTEP describes, and it requires per-tenant accounting rather than a larger top-level pool.
+- **Assuming a dedicated low-priority pool cannot starve.** It guarantees consumers, not throughput; if the low pool's tasks are slower than their arrival rate, the queue grows regardless of the reserved share.
+- **Aging that is unbounded and untuned.** A boost large enough to make every aged task outrank fresh arrivals inverts the ordering the pattern exists to provide, and the payment confirmation then waits behind the analytics batch it was meant to overtake.

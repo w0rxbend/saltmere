@@ -1,8 +1,8 @@
 ---
-title: "Multi-Level Caching: The Near Cache and the Coherence Tax You Pay for Microseconds"
+title: "Multi-Level Caching: The Near Cache and the Coherence Tax Paid for Microseconds"
 date: 2026-08-10
 track: sys-patterns
-summary: "A two-tier cache puts a microsecond-scale in-process L1 (Caffeine) in front of a large, shared L2 (Redis) — and the moment you do, every app instance holds its own private copy that a write on another node cannot reach. A concrete get/put through both tiers, why the coherence problem is the whole game, and the four ways people solve it: short L1 TTLs, pub/sub invalidation broadcast, versioned keys, and the fire-and-forget-plus-reconciliation model Hazelcast and Coherence ship as a 'near cache'."
+summary: "A two-tier cache places a microsecond-scale in-process L1 (Caffeine) in front of a large shared L2 (Redis); from that moment every application instance holds a private copy that a write on another node cannot reach. A concrete get/put through both tiers, why coherence is the whole problem, and four mitigations: short L1 TTLs, pub/sub invalidation broadcast, versioned keys, and the fire-and-forget-plus-reconciliation model shipped by Hazelcast and Oracle Coherence as a near cache."
 reading_time: 7
 tags: [caching, near-cache, redis, caffeine, hazelcast, pub-sub, cache-coherence, invalidation]
 sources:
@@ -16,115 +16,109 @@ sources:
     url: "https://oneuptime.com/blog/post/2026-03-31-redis-cache-coherence-multi-node/view"
 ---
 
-You have a distributed cache — Redis, a network hop away, holding everything and consistent across all your app instances. Reads are already fast. Then someone profiles the hot path and finds that even a 0.5 ms Redis round-trip, multiplied by the number of times a request touches the cache, is the dominant cost. So they add a second cache: an in-process map (Caffeine, or a plain `ConcurrentHashMap`) that answers in *hundreds of nanoseconds* with no serialization and no socket. That is multi-level caching, and the local tier is what Hazelcast and Oracle Coherence call a **near cache**.
+**Gist.** A distributed cache such as Redis answers over a socket in sub-millisecond time, and on a hot path that touches the cache many times per request the accumulated round-trips dominate. Multi-level caching adds an in-process first tier — a **near cache**, in Hazelcast and Oracle Coherence terminology — that answers in hundreds of nanoseconds with no socket and no deserialization. The cost is coherence: each instance now holds a private replica, and a write performed on one node leaves stale copies on every other node that no mechanism removes for free.
 
-The speedup is real. The bill comes due immediately, and it is called coherence.
+## Why two tiers
 
-## Why two tiers at all
+The two tiers have complementary properties, and that complementarity is the entire justification for running both.
 
-The two caches are good at opposite things, and that is the whole justification for running both.
+- **L1 (in-process, e.g. Caffeine).** Sub-microsecond hits, no network, no deserialization. It is **per-instance** — twenty application nodes mean twenty independent L1 caches — bounded by the heap allocated to it, and lost on restart.
+- **L2 (distributed, e.g. Redis).** One authoritative copy shared by every instance, large, surviving application restarts, and **single-copy** for a given key: a write to the primary is visible to every reader that issues its next `GET` against that primary. Every hit costs a network round-trip and a deserialization.
 
-- **L1 (in-process, e.g. Caffeine).** Sub-microsecond hits, zero network, zero deserialization. But it is *per-instance* — 20 app nodes means 20 independent L1 caches — and it is small, bounded by the heap you are willing to spend. It also vanishes on restart.
-- **L2 (distributed, e.g. Redis).** One authoritative copy shared by every instance, large, survives app restarts, and consistent — a write is visible to all readers on the next `GET`. But every hit is a network round-trip and a deserialization.
+Stacking them produces a hit-rate cascade: whatever fraction of reads L1 absorbs is removed from both the mean read latency and the L2 query rate, because those reads never leave the process. L1 absorbs the hottest keys — the ones read most often — which is precisely the traffic that would otherwise concentrate on L2. Caffeine's window-TinyLFU admission policy, covered separately in this series, is aimed at exactly that skew: retaining the frequently requested entries in a small cache.
 
-Stacking them gives a hit-rate cascade. If L1 catches 90% of reads at ~200 ns and L2 catches most of the rest at ~0.5 ms, your average read latency and your Redis QPS both collapse. L1 absorbs the hottest keys — the ones read thousands of times a second — precisely the traffic that would otherwise pound L2. (Caffeine's window-TinyLFU admission policy, covered in its own article in this series, is what makes that small L1 punch above its size.)
-
-## The read and write flow
+## Read and write paths
 
 The read path is a cascade; the write path is where the design decisions live.
 
-**Read (get):** check L1 → on miss check L2 → on miss load from the database, then *backfill both tiers* on the way out.
+**Read (get):** consult L1; on miss consult L2; on miss load from the origin database, then **backfill both tiers** on the way out.
 
-**Write (put):** update the database, update or delete the key in L2, and then — the hard part — get rid of the now-stale copy sitting in every *other* node's L1.
+**Write (put):** write the origin, update or delete the key in L2, and then remove the now-stale copy held in every *other* node's L1. Only the last step is contentious. Without it, the update is invisible to L1 on all other instances until their entries expire.
 
-```java
-public class TwoTierCache<V> {
-    private final Cache<String, V> l1;          // Caffeine, short TTL
-    private final RedisCommands<String, V> l2;   // shared Redis (L2)
-    private final Function<String, V> dbLoader;
-    private final Duration l2Ttl;
+### Implementation sketch (Scala)
 
-    public V get(String key) {
-        V v = l1.getIfPresent(key);              // L1: ~200 ns
-        if (v != null) return v;
+The L2 and the broadcast channel are declared as local traits so the sketch commits to no particular client library; `l1` is a Caffeine cache used through its Java API.
 
-        v = l2.get(key);                         // L2: ~0.5 ms network hop
-        if (v != null) {
-            l1.put(key, v);                      // backfill L1
-            return v;
-        }
+```scala
+trait L2[V]:
+  def get(key: String): Option[V]
+  def setex(key: String, ttl: Duration, value: V): Unit
 
-        v = dbLoader.apply(key);                 // origin
-        if (v != null) {
-            l2.setex(key, l2Ttl.getSeconds(), v);// backfill L2 with TTL
-            l1.put(key, v);                      // backfill L1
-        }
-        return v;
-    }
+trait Invalidations:
+  def publish(key: String): Unit
+  def subscribe(onKey: String => Unit): Unit
 
-    public void put(String key, V value) {
-        // origin write happens elsewhere (DB) — then update the tiers
-        l2.setex(key, l2Ttl.getSeconds(), value);
-        l1.put(key, value);                      // fresh on THIS node only
-        publishInvalidation(key);                // tell the OTHER nodes
-    }
-}
+final class TwoTierCache[V](
+    l1: com.github.benmanes.caffeine.cache.Cache[String, V], // short TTL
+    l2: L2[V],
+    bus: Invalidations,
+    load: String => Option[V],
+    l2Ttl: Duration
+):
+  bus.subscribe(l1.invalidate)   // drop the local copy on any node's write
+
+  def get(key: String): Option[V] =
+    Option(l1.getIfPresent(key)) // in-process, no socket
+      .orElse:
+        l2.get(key).map: v =>
+          l1.put(key, v)         // backfill L1 only
+          v
+      .orElse:
+        load(key).map: v =>
+          l2.setex(key, l2Ttl, v)
+          l1.put(key, v)         // backfill both tiers
+          v
+
+  def put(key: String, value: V): Unit =
+    l2.setex(key, l2Ttl, value)
+    l1.put(key, value)           // fresh on this node only
+    bus.publish(key)             // every other node must be told
 ```
 
-Everything above is uncontroversial except the last line. Without it, the update you just made is invisible to L1 on all the other instances until their entries happen to expire.
+## The coherence failure
 
-## The hard problem: L1 caches drift apart
+The failure states in one sentence: **node A writes `user:42`, updates L2 and refreshes its own L1, while nodes B, C and D still hold the previous `user:42` in their L1 and have received no instruction to discard it.** Until something instructs them, a read on B returns stale data even though L2 is correct. This is the cache-coherence problem that CPU designers face between per-core caches, relocated to a fleet of application servers connected by a network, without a hardware coherence protocol underneath.
 
-Here is the failure in one sentence: **node A writes key `user:42`, updates L2, and refreshes its own L1 — but nodes B, C, and D still hold the old `user:42` in their L1, and nothing has told them to drop it.** Until something does, a read on B returns stale data even though L2 is perfectly correct. This is the same cache-coherence problem CPU designers face between per-core caches, transplanted to a fleet of app servers over a network — except you get no hardware MESI protocol for free.
+The distributed tier does not exhibit the problem, because it is single-copy and authoritative. The problem is **intrinsic to replicating data into many private L1 caches**. Each mitigation below trades freshness against message traffic and complexity.
 
-The distributed tier does not have this problem: it is single-copy and authoritative. The problem is *intrinsic to replicating data into many private L1 caches*. Every mitigation below is a different trade of freshness against traffic and complexity.
+### 1. Short L1 TTLs
 
-### 1. Short L1 TTLs (bound the staleness, do nothing else)
+Assign L1 entries a small time-to-live and accept that a stale value can persist for at most that interval. No messaging is involved; the bound on staleness is the only guarantee. This is appropriate where the data tolerates brief staleness and inappropriate where it does not, such as balances and permissions. **L1 and L2 TTLs are independent**: L1 short to bound drift, L2 long to shield the origin.
 
-Give L1 entries a small time-to-live — say 5 seconds — and accept that a stale value can live at most that long. No messaging, no moving parts; you are simply capping the blast radius. This is the right default when the data tolerates brief staleness (product listings, config, counts) and wrong when it does not (balances, permissions). Note L1 and L2 TTLs are independent: L1 short to limit drift, L2 long to protect the origin.
+### 2. Pub/sub invalidation broadcast
 
-### 2. Pub/sub invalidation broadcast (push a "drop this key" message)
+On every write, publish the changed key to a channel to which every instance subscribes; each subscriber evicts that key from its own L1. This is the mechanism described in the OneUptime multi-node coherence write-up: *"When any node writes to the database, it publishes an invalidation event. All nodes (including the writer) subscribe and clear their local cache entry."*
 
-On every write, publish the changed key to a channel every instance subscribes to; each subscriber evicts that key from its own L1. This is the mechanism in the OneUptime multi-node coherence write-up: *"When any node writes to the database, it publishes an invalidation event. All nodes (including the writer) subscribe and clear their local cache entry."*
+Publication need not be explicit. With Redis **keyspace notifications** enabled (`CONFIG SET notify-keyspace-events KEA`), Redis emits an event on every mutation to `__keyevent@0__:set`, carrying the key, and to `__keyspace@0__:<key>`, carrying the event name. Two properties documented by Redis determine whether this is safe for a given deployment: delivery is **fire-and-forget**, so a subscriber that disconnects and reconnects **misses every event in the gap**; and in Redis Cluster **each node emits events only for its own keyspace**, so a single `psubscribe` does not observe the whole cluster.
 
-```java
-private static final String CHANNEL = "cache:invalidate";
+Redis's purpose-built form of this is **server-assisted client-side caching** over RESP3 tracking, treated in its own article in this series. The server records which keys each client has cached and pushes invalidations on `__redis__:invalidate`; `BCAST` mode instead broadcasts by key prefix, holding no per-client key state on the server. It inherits the same fire-and-forget property, which is why the reference directs clients to **flush the entire local cache** whenever the invalidation connection drops.
 
-void publishInvalidation(String key) {
-    redis.publish(CHANNEL, key);            // fan-out to all instances
-}
+### 3. Versioned keys
 
-// One daemon subscriber per instance, started at boot:
-redisPubSub.subscribe(new RedisPubSubListener() {
-    public void message(String channel, String key) {
-        l1.invalidate(key);                 // drop the local copy
-    }
-}, CHANNEL);
-```
+Rather than mutating `user:42`, write `user:42:v7` and advance a small version pointer that readers resolve first. An L1 entry keyed `user:42:v6` is then never requested again and ages out without harm. This avoids the race in which an invalidation message arrives *before* the fresh value has been cached; the Redis client-side-caching reference identifies that race and recommends caching a placeholder entry to defend against it. The cost is one extra indirection per read plus the cache space occupied by dead versions until eviction.
 
-You need not publish it yourself. Enable Redis **keyspace notifications** (`CONFIG SET notify-keyspace-events KEA`) and Redis emits an event on every mutation to `__keyevent@0__:set` (carrying the key) and `__keyspace@0__:<key>` (carrying the event name) — subscribe and let writes invalidate themselves. Two caveats from the Redis docs decide whether this is safe for you: delivery is **fire-and-forget** — a subscriber that disconnects and reconnects *misses* events in the gap — and in a Redis Cluster **each node only emits events for its own keyspace**, so a single `psubscribe` will not see the whole cluster.
+### 4. The near-cache model: assume events are lost, then reconcile
 
-Redis's purpose-built version of this is **server-assisted client-side caching** (RESP3 tracking, its own article in this series). The server itself remembers which keys each client cached and pushes invalidations on `__redis__:invalidate`; `BCAST` mode instead broadcasts by key prefix at zero server memory. Same idea as your hand-rolled pub/sub, moved into the protocol — and it inherits the same fire-and-forget property, which is why the reference tells clients to **flush the entire local cache** if the invalidation connection ever drops.
+Hazelcast and Coherence productise this two-tier pattern and treat lost broadcasts as expected. With `invalidate-on-change` set to `true`, the default, a mutation evicts the near-cache entry cluster-wide. The Hazelcast documentation states that *"invalidation events can be lost due to the fire-and-forget fashion of the eventing system,"* and adds two mechanisms a plain pub/sub scheme lacks:
 
-### 3. Versioned keys (never invalidate — make staleness unnameable)
+- **Batching.** Invalidations are coalesced (`hazelcast.map.invalidation.batch.size`, default **100**; flushed at least every `hazelcast.map.invalidation.batchfrequency.seconds`, default **10 s**), so a write storm does not become a message storm.
+- **Reconciliation (anti-entropy).** A periodic task (`hazelcast.invalidation.reconciliation.interval.seconds`, default **60 s**) compares the invalidation-event sequence numbers each member *generated* against those each near cache *received*. If more than `hazelcast.invalidation.max.tolerated.miss.count` (default **10**) are missing, the stale data is made unreachable and the next `get` falls through to the authoritative map.
 
-Instead of mutating `user:42`, write `user:42:v7` and bump a small, cheap-to-read version pointer. Readers resolve the current version first, so an old L1 entry keyed `user:42:v6` is simply never asked for again — it ages out harmlessly. This sidesteps the race where an invalidation message arrives *before* the fresh value is cached (the Redis client-side-caching reference calls this out explicitly and recommends a placeholder entry to defend against it). The cost is an extra indirection on read and cache space spent on dead versions until they evict.
+The combination — best-effort push for latency, periodic reconciliation for correctness — transfers to a hand-built Redis arrangement: pub/sub for the common case, and a short L1 TTL as the bound that holds when a message is lost.
 
-### 4. The near-cache model: assume you'll miss events, then reconcile
+## Interaction with stampede
 
-Hazelcast and Coherence productize exactly this two-tier pattern and confront the fact that broadcasts get lost. With `invalidate-on-change` set to `true` (the default), a mutation evicts the near-cache entry cluster-wide. But — straight from the Hazelcast docs — *"invalidation events can be lost due to the fire-and-forget fashion of the eventing system,"* so they add two things a naive pub/sub scheme lacks:
+Multi-level caching alters the shape of cache stampede, the thundering-herd problem covered under invalidation strategies elsewhere in this series. **A broadcast invalidation is a coordinated eviction**: the same hot key leaves every L1 at nearly the same instant, and every node then misses to L2, or to the database. Synchronised short L1 TTLs produce the same synchronised expiry. Two defences apply: per-node TTL jitter, so expiries scatter; and a per-key load lock (single-flight) over the L1 → L2 → origin fill, so one thread per node repopulates while the rest wait. L1 also reduces the herd, since once one thread refills L1 the remaining requests on that node are served locally.
 
-- **Batching.** Invalidations are coalesced (`hazelcast.map.invalidation.batch.size`, default **100**; flushed at least every `hazelcast.map.invalidation.batchfrequency.seconds`, default **10 s**) so a write storm does not become a message storm.
-- **Reconciliation / anti-entropy.** A periodic task (`hazelcast.invalidation.reconciliation.interval.seconds`, default **60 s**) compares invalidation-event sequence numbers each member *generated* against what each near cache *received*. If more than `hazelcast.invalidation.max.tolerated.miss.count` (default **10**) went missing, the stale data is made unreachable and the next `get` falls through to the authoritative map.
+## When the local tier is justified
 
-That combination — best-effort push for latency plus periodic reconciliation for correctness — is worth copying even in a DIY Redis setup: pub/sub for the common case, a short L1 TTL as the safety net that keeps drift bounded even when a message is lost.
+The local tier pays where reads greatly outnumber writes, a small set of hot keys dominates traffic, values are expensive to deserialize, and the data tolerates seconds of staleness. It is a liability where writes are frequent, since invalidation traffic then exceeds the saving; where the working set is uniform with no hot keys, giving a low L1 hit rate and pure overhead; and where correctness forbids any stale read, in which case the single authoritative L2 and its network hop remain the correct design. The near cache buys microseconds, and the coherence machinery is the price of those microseconds.
 
-## The stampede interaction
+## Pitfalls
 
-Multi-level caching changes the shape of cache stampede (the thundering-herd problem, covered under invalidation strategies elsewhere in this series). A broadcast invalidation is a coordinated eviction: the same hot key drops out of *every* L1 at nearly the same instant, and every node misses to L2 — or worse, to the database — simultaneously. Short synchronized L1 TTLs cause the same synchronized expiry. Defenses: add per-node TTL jitter so expiries scatter, and put a per-key load lock (single-flight) on the L1→L2→DB fill so only one thread per node repopulates while the rest wait. L1 actually *helps* here too — once one thread refills L1, the herd on *that* node is served locally.
-
-## When L1 is worth it (and when it is a liability)
-
-Add the local tier when reads vastly outnumber writes, a handful of hot keys dominate traffic, the values are expensive to deserialize, and the data tolerates seconds of staleness. Skip it when writes are frequent (you will spend more on invalidation chatter than you save), when the working set is uniform with no hot keys (low L1 hit rate, pure overhead), or when correctness forbids *any* stale read — in that last case, keep the single authoritative L2 and pay the network hop honestly. The near cache buys microseconds; the coherence machinery is the price, and you should only pay it where the microseconds actually matter.
-
-**Try next:** enable `notify-keyspace-events KEA` on a scratch Redis, `psubscribe '__keyevent@0__:*'` in one terminal, and run writes in another — watch the events, then kill and restart the subscriber mid-write to see exactly which invalidations fire-and-forget drops on the floor.
+- **A restarted or reconnected subscriber silently serves stale data.** Redis pub/sub and keyspace notifications are fire-and-forget: events emitted during the disconnection are never redelivered, so the local L1 retains entries whose invalidations were dropped. The Redis client-side-caching reference prescribes flushing the entire local cache on reconnection.
+- **A single `psubscribe` misses most invalidations in Redis Cluster.** Each cluster node emits keyspace events only for the keys it owns, so a subscriber connected to one node observes only that node's share of the keyspace.
+- **An invalidation that arrives before the fresh value is cached leaves the stale value cached until its TTL expires.** The eviction removes an entry that has not yet been rewritten, and the subsequent fill stores the value read before the write, which no further invalidation will arrive to remove; caching a placeholder entry closes the window.
+- **Broadcast invalidation of a hot key produces a synchronised fleet-wide miss.** Every L1 drops the entry at the same instant and every node refills concurrently, converting one write into a burst against L2 or the origin; TTL jitter and per-key single-flight bound the burst.
+- **A long L1 TTL turns a lost invalidation into a long-lived incorrect read.** The TTL is the only bound on staleness once a message is lost, so its length is the worst-case staleness of the system regardless of how reliable the broadcast normally appears.
+- **Writes that bypass the application's `put` path never invalidate anything.** Administrative scripts, batch jobs and direct database updates leave every L1 holding values the write path would have evicted; keyspace notifications catch the subset of those writes that pass through Redis, and none of the ones that do not.

@@ -2,8 +2,8 @@
 title: "Scatter/Gather: Buying Latency With Parallelism"
 date: 2026-07-26
 track: sys-patterns
-summary: "Burns' scatter/gather pattern fans a request out to many leaves in parallel and merges their partial answers to cut latency — but the merge step means your P99 is only as fast as your slowest leaf, and fan-out width has a computational-cost tax."
-reading_time: 5
+summary: "Burns' scatter/gather pattern fans a request out to many leaves in parallel and merges their partial answers to cut latency — but the merge step makes the response no faster than the slowest leaf, and fan-out width carries a computational-cost tax."
+reading_time: 6
 tags: [scatter-gather, latency, fan-out, tail-latency, hedged-requests, distributed-search, burns]
 sources:
   - title: "Designing Distributed Systems, 2nd ed. — Ch. 8, Scatter/Gather (Burns, O'Reilly)"
@@ -18,29 +18,33 @@ sources:
     url: "https://gemsofcoding.com/Designing-Distributed-Systems-Scatter-Event-Driver/"
 ---
 
-The [sharded-service pattern](/articles/sys-patterns/2026-07-26-sharded-service-pattern) on this journal solves a *capacity* problem: state too big for one node, so a root routes each request to the *one* shard that owns it. Scatter/gather solves a different problem entirely — it's a *serving* pattern for cutting **latency** on a single request that's too big for one node to compute alone. Burns puts it in the same tree-topology family (a root, a set of leaves) but flips the routing rule: instead of sending a request to the one correct leaf, the root sends it to *every* leaf at once.
+**Gist.** A single request can require more computation than one node can perform within the caller's latency budget. Scatter/gather splits that computation across a set of **leaves** that run concurrently and merges their partial answers at a **root**, converting a serial cost of N slices into roughly the cost of one slice. The price is that the response cannot complete before the *slowest* leaf replies, so widening the fan-out both raises the probability that some leaf is slow and multiplies the root's fixed per-leaf dispatch and merge overhead.
 
-## Root and leaves, fired in parallel
+The [sharded-service pattern](/articles/sys-patterns/2026-07-26-sharded-service-pattern) on this journal addresses a *capacity* problem: state too large for one node, so a root routes each request to the *one* shard that owns the relevant key. Scatter/gather addresses a *serving* problem. Burns places it in the same tree topology — one root, a set of leaves — but inverts the routing rule: the root dispatches the request to *every* leaf rather than to one.
 
-The shape: a **root** receives the request, **fans it out** simultaneously to all leaves (or all leaves relevant to the query), each leaf does a bounded slice of work over its own data, and the root **merges** the partial results into one response. Burns frames it as trading *replication for scalability in time* — you're not replicating for redundancy, you're using the replicas' combined CPU to answer one request faster than any single one of them could.
+## Root and leaves, dispatched concurrently
 
-The canonical example is distributed search: an index sharded across a hundred machines, a query that needs to touch all hundred, and a client that can't wait for them sequentially. Scatter the query, let a hundred CPUs work on it in parallel for 20ms each, gather and re-rank the top results. Sequentially that's 2 seconds; in parallel it's roughly the time of the slowest one.
+The shape is fixed. A **root** accepts the request, **fans it out** concurrently to all leaves (or to every leaf relevant to the query), each leaf performs a bounded slice of work over its own data partition, and the root **merges** the partial results into a single response. The distinction from a replicated service is that a replica there answers a whole request on its own, whereas a leaf here answers one slice of a single request; the copies contribute combined processing capacity rather than redundancy.
 
-That word "slowest" is the whole story of this pattern's failure modes.
+The canonical instance is distributed search: an index sharded across a hundred machines, a query that must touch all hundred, and a caller that cannot tolerate a serial traversal. If each leaf spends 20 ms on its slice, the serial cost is roughly 2 seconds and the concurrent cost is approximately the completion time of the slowest leaf. **That last qualifier — slowest, not average — generates the pattern's failure modes.**
 
-## The merge step is where correctness lives
+## The merge step carries the correctness burden
 
-Fan-out is the easy half. The **gather/merge** step decides what "the response" even means when it's assembled from N independent, partial answers computed against N different slices of data — dedupe, re-rank by a global score, combine partial aggregates (sum, top-k, histogram buckets), and — critically — decide what to do when a leaf didn't answer at all. A merge function that silently assumes all N leaves always respond will produce a response object that looks fine and is quietly wrong the first time a leaf times out.
+Fan-out is the mechanically simple half. The **gather/merge** step defines what "the response" means once it is assembled from N independent partial answers computed over N disjoint slices: deduplication, re-ranking by a global score rather than per-leaf scores, combination of partial aggregates (sums, top-k lists, histogram buckets), and — the case most often omitted — the decision of what to emit when a leaf did not answer.
 
-## Failure mode 1: the straggler tames your average, ruins your tail
+The invariant the merge function must maintain is that **the completeness of the answer is part of the answer**. A merge that assumes all N leaves always respond emits a well-formed response object that is silently wrong the first time a leaf times out: the top-20 list is drawn from 99 shards instead of 100, the sum is short by one partition, and nothing in the response records that fact. Returning the count of leaves that answered alongside the merged payload turns a silent corruption into an observable degradation the caller can act on.
 
-Burns calls out that the pattern's latency is bounded by the *slowest* leaf, not the average one — and Dean & Barroso's "The Tail at Scale" (CACM, 2013) is the paper that quantifies why fan-out makes this brutal. Their illustrative model: if a single server has a 99th-percentile latency of 1 second, and a request must fan out to 100 such servers to complete, **63% of requests** end up waiting past that one-second mark — because completing "in time" now requires *all 100* to land inside their own 99th percentile simultaneously. At 2,000 servers it's essentially guaranteed that someone is slow. Their real production numbers make the same point without the model: a single leaf's own P99 is 10ms, but the P99 of the *fanned-out* request — waiting on every leaf — is 140ms. Widening the fan-out to go faster on average makes the tail worse, not better, and the tail is what a user actually experiences on a bad day.
+## Failure mode 1: the straggler leaves the mean intact and destroys the tail
 
-Their fix, and the standard mitigation for this pattern, is **hedged requests**: don't just wait — after a short delay (Dean & Barroso use roughly the 95th-percentile latency), fire a duplicate request to a second replica of the same leaf and take whichever answers first, cancelling the other. Their benchmark cut P99.9 from 1,800ms to 74ms for about 2% more load. **Tied requests** (queue on two replicas simultaneously, cancel cross-server on completion) trade a small resource cost for an even larger cut. Either way, the fix isn't "make every leaf fast" — at scale, someone is always the slow one that day — it's "don't let waiting on any one leaf gate the whole response."
+Burns notes that latency is bounded by the slowest leaf rather than the average one. Dean and Barroso's "The Tail at Scale" (*Communications of the ACM*, 2013) quantifies why fan-out amplifies this. Their illustrative model: if a single server has a 99th-percentile latency of 1 second and a request must fan out to 100 such servers before it can complete, **63% of requests wait longer than one second** — completing within the budget now requires *all 100* leaves to land inside their own 99th percentile at the same time. At 2,000 servers, at least one slow leaf per request is effectively certain. Their production measurements make the same point without a model: a single leaf's own 99th percentile is **10 ms**, while the 99th percentile of the fanned-out request that waits on every leaf is **140 ms**.
 
-## Failure mode 2: computational cost doesn't stay flat
+The consequence is counter-intuitive and load-bearing: **widening the fan-out to reduce the mean makes the tail worse**, and the tail is the latency a user observes on a bad day.
 
-The second problem Burns highlights is less about latency variance and more about the shape of the cost curve. Adding leaves shrinks the *data* each leaf must scan — that's the entire point — but it does not shrink the fixed overhead of dispatching a request, opening a connection, and merging one more partial result at the root. Fan out to 10 leaves and each does 1/10th the compute; fan out to 1,000 and each is nearly idle while the root pays dispatch-and-merge overhead 1,000 times over and now also has 1,000 chances to hit a straggler or a dead leaf. Wider isn't free — it converts a compute-bound problem into an overhead-and-tail-latency-bound one, and the pattern's sweet spot is the fan-out width where those two costs cross.
+The mitigation Dean and Barroso propose, and the standard one for this pattern, is **hedged requests**. Rather than waiting indefinitely on the primary replica, the root waits a short interval — they use approximately the 95th-percentile latency — and then issues a duplicate request to a second replica of the same leaf, accepting whichever response arrives first and cancelling the other. In their benchmark this reduced the 99.9th percentile from **1,800 ms to 74 ms for roughly 2% additional load**. **Tied requests** — enqueueing on two replicas simultaneously and cancelling across servers once one dequeues the work — trade a small resource cost for a larger reduction. The structural point is that the remedy is not making every leaf uniformly fast, which is unattainable at scale, but ensuring that no single leaf gates the response.
+
+## Failure mode 2: the cost curve is not flat in fan-out width
+
+The second problem Burns identifies concerns the shape of the cost curve rather than latency variance. Adding leaves shrinks the *data volume* each leaf must scan, which is the pattern's purpose, but it does not shrink the fixed overhead of dispatching one more request, establishing one more connection, and merging one more partial result at the root. At a fan-out of 10, each leaf performs one tenth of the compute. At a fan-out of 1,000, each leaf is close to idle, the root pays dispatch-and-merge overhead 1,000 times, and there are 1,000 independent opportunities for a straggler or a dead leaf. Widening therefore converts a compute-bound problem into an overhead-and-tail-latency-bound one, and **the operating point is the width at which the falling per-leaf compute cost and the rising per-leaf overhead-plus-straggler cost cross**.
 
 | | Sharded service | Work queue | Scatter/gather |
 |---|---|---|---|
@@ -49,57 +53,60 @@ The second problem Burns highlights is less about latency variance and more abou
 | Dominant failure | Hot shard | Slow/dead worker (retried later) | Straggler leaf (blocks the response *now*) |
 | Scaling knob | Shard count vs. data volume | Worker count vs. queue depth | Leaf count vs. dispatch/merge overhead |
 
-## A root that fans out, times out per leaf, and hedges
+### Implementation sketch (Scala)
 
-```python
-import asyncio
+The load-bearing elements are a hard per-leaf deadline, a hedge fired after a delay shorter than that deadline, and a merge that accepts absence as a normal input.
 
-LEAF_TIMEOUT = 0.150   # hard budget: don't let one leaf gate the response
-HEDGE_DELAY = 0.050    # fire a backup replica if the primary is slow
+```scala
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit.MILLISECONDS
+import java.time.Duration
+import scala.jdk.FutureConverters.*
+import scala.concurrent.{Future, ExecutionContext}
 
-async def call_leaf(session, url, query):
-    async with session.get(url, params={"q": query}) as resp:
-        return await resp.json()
+case class Hit(id: String, score: Double)
+case class Leaf(primary: String, backup: String)
+case class Merged(results: Seq[Hit], leavesAnswered: Int, leavesTotal: Int)
 
-async def call_leaf_hedged(session, primary_url, backup_url, query):
-    """Race a primary replica against a backup fired after HEDGE_DELAY.
-    Whoever answers first wins; the loser is cancelled."""
-    primary = asyncio.ensure_future(call_leaf(session, primary_url, query))
-    done, _ = await asyncio.wait({primary}, timeout=HEDGE_DELAY)
-    if primary in done:
-        return primary.result()
-    backup = asyncio.ensure_future(call_leaf(session, backup_url, query))
-    done, pending = await asyncio.wait(
-        {primary, backup}, return_when=asyncio.FIRST_COMPLETED
-    )
-    for task in pending:
-        task.cancel()
-    return done.pop().result()
+val leafDeadline = Duration.ofMillis(150) // one leaf must not gate the response
+val hedgeDelay   = Duration.ofMillis(50)  // ~p95 of a healthy leaf
 
-async def scatter_gather(session, leaves, query):
-    async def bounded(leaf):
-        try:
-            return await asyncio.wait_for(
-                call_leaf_hedged(session, leaf["primary"], leaf["backup"], query),
-                timeout=LEAF_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            return None  # merge must tolerate a missing leaf, not crash on it
+def query(replica: String, q: String): CompletableFuture[Seq[Hit]] = ???
 
-    partials = await asyncio.gather(*(bounded(l) for l in leaves))
-    return merge(partials, query)
+/** Race the primary against a backup issued only if the primary is still
+  * outstanding after hedgeDelay; whichever settles `race` first cancels the other. */
+def hedged(leaf: Leaf, q: String)(using ExecutionContext): Future[Option[Seq[Hit]]] =
+  val primary = query(leaf.primary, q)
+  val race    = new CompletableFuture[Seq[Hit]]()
+  primary.whenComplete((hits, err) => if err == null then race.complete(hits))
+  CompletableFuture.runAsync(
+    () =>
+      if !primary.isDone then
+        val backup = query(leaf.backup, q)
+        backup.whenComplete((hits, err) => if err == null then race.complete(hits))
+        race.whenComplete((_, _) => backup.cancel(true))
+    ,
+    // delayedExecutor is the timer: nothing is dispatched until hedgeDelay elapses
+    CompletableFuture.delayedExecutor(hedgeDelay.toMillis, MILLISECONDS))
+  race.whenComplete((_, _) => primary.cancel(true))
+  race.orTimeout(leafDeadline.toMillis, MILLISECONDS)
+    .thenApply(Option(_))
+    .exceptionally(_ => None)      // a missing leaf is data, not an exception
+    .asScala
 
-def merge(partials, query):
-    hits = [h for p in partials if p is not None for h in p["hits"]]
-    hits.sort(key=lambda h: h["score"], reverse=True)
-    return {
-        "query": query,
-        "results": hits[:20],
-        "leaves_answered": sum(p is not None for p in partials),
-        "leaves_total": len(partials),
-    }
+def scatterGather(leaves: Seq[Leaf], q: String)(using ExecutionContext): Future[Merged] =
+  Future.sequence(leaves.map(hedged(_, q))).map: partials =>
+    val hits = partials.flatten.flatten.sortBy(-_.score)
+    Merged(hits.take(20), partials.count(_.isDefined), leaves.size)
 ```
 
-Three things this snippet insists on: every leaf call has a hard per-leaf `LEAF_TIMEOUT` so one straggler can't block the whole `gather`; the primary/backup race inside `call_leaf_hedged` is the hedged-request mitigation from Dean & Barroso applied at the single-leaf level; and `merge` treats a missing leaf (`None`) as a normal, expected input rather than an exception — it returns `leaves_answered` so callers can tell a complete result from a degraded one instead of silently trusting a partial answer.
+The count `leavesAnswered` is not diagnostic decoration: it is the only field distinguishing a complete answer from a degraded one, and callers that ignore it re-introduce the silent-partial-result failure the merge step was written to prevent.
 
-**Try next:** instrument the snippet above with per-leaf timing, run it against 10 simulated leaves where one has a long-tail latency distribution (mix of 20ms and, 1% of the time, 2s), and compare P50/P99 of the merged response with `HEDGE_DELAY` on versus set to `None` — that's Dean & Barroso's whole argument, reproduced on your own laptop.
+## Pitfalls
+
+- **A merge function without a missing-leaf branch produces a plausible wrong answer.** The symptom is a top-k list or aggregate that is quietly short by one partition; the cause is treating a leaf timeout as an exception that propagates or as an empty result indistinguishable from a genuinely empty shard.
+- **Per-leaf timeouts absent, only a global one.** The symptom is the whole fan-out completing at the global deadline whenever any single leaf hangs; the cause is that without a per-leaf budget the slowest leaf, not the deadline, sets the response time for every other leaf's already-completed work.
+- **A hedge delay set longer than the per-leaf deadline.** The symptom is the backup replica never being issued; the cause is that the leaf budget expires before the hedge timer fires, so the mitigation is present in the code and inert at runtime.
+- **Hedging without cancelling the loser.** The symptom is load growth proportional to fan-out rather than the ~2% Dean and Barroso report; the cause is that both replicas run to completion when the abandoned request is not cancelled.
+- **Increasing fan-out width to reduce mean latency.** The symptom is a falling median with a rising 99th percentile; the cause is that each additional leaf adds an independent chance of a straggler while per-leaf compute is already small relative to dispatch and merge overhead.
+- **Re-ranking on per-leaf scores.** The symptom is result ordering that changes with shard assignment; the cause is that scores computed against a single partition's statistics are not comparable across partitions without a global normalisation at the root.

@@ -1,9 +1,9 @@
 ---
-title: "LLM Model Routing: Send Each Request to the Cheapest Model That Can Handle It"
+title: "LLM Model Routing: Dispatching Each Request to the Cheapest Adequate Model"
 date: 2026-08-10
 track: sys-patterns
-summary: "Running one frontier model for every request is expensive and slow when most queries are easy. Model routing puts a lightweight classifier in front of a model pool that sends hard prompts to a strong model and easy ones to a cheap model. This walks through predictive routers (RouteLLM), semantic routing by embedding similarity (semantic-router), and cascade escalation, with runnable code and the published cost numbers."
-reading_time: 6
+summary: "Serving every request from one frontier model overpays for the easy majority of traffic. Model routing places a cheap decision — a learned win-rate predictor, an embedding-similarity match, or an optimistic cascade — in front of a pool of models of differing cost. This article covers RouteLLM's predictive routing and its published call-performance figures, semantic-router's embedding routing, cascade escalation, and the calibration and drift failure modes each one carries."
+reading_time: 7
 tags: [llm-serving, model-routing, semantic-router, routellm, cost-optimization]
 sources:
   - title: "RouteLLM: An Open-Source Framework for Cost-Effective LLM Routing (LMSYS Org)"
@@ -18,21 +18,21 @@ sources:
     url: "https://docs.aurelio.ai/semantic-router/user-guide/concepts/overview"
 ---
 
-## The problem: one big model for everything
+**Gist.** Large language model (LLM) traffic is long-tailed in difficulty: reformatting, classification and frequently-asked-question lookups sit alongside a minority of hard reasoning and code tasks, yet a single-model architecture charges frontier price and frontier latency for all of them. Model routing inserts a decision cheaper than either model — a learned strong-win predictor, a cosine-similarity match against labelled example utterances, or an optimistic cheap-first call with a verifier — and dispatches each prompt to the least expensive model expected to answer it adequately. The cost is a second calibrated component in the serving path: it has its own latency budget, its own accuracy, and a threshold whose correctness decays as the prompt distribution drifts.
 
-The default architecture for an LLM feature is a single call to the best model you can afford. It is simple and it works, but it is wasteful. Traffic in most production systems is long-tailed: a large fraction of requests are "reformat this", "classify this ticket", "answer this FAQ" — queries a small model handles perfectly — and a minority are genuinely hard reasoning or code tasks that need a frontier model. Paying frontier prices, and eating frontier latency, on every request means overpaying for the easy majority.
+## The routing decision as a serving-layer component
 
-Model routing is the serving-layer answer. It is the same idea as an L7 load balancer or a cache tier: put a cheap decision in front of an expensive resource. Here the cheap decision is *which* model, not *which* replica. A lightweight router looks at each incoming prompt, estimates how hard it is, and dispatches to a small/cheap model or a large/expensive one. The router itself must be far cheaper than the models it routes between, or the whole thing is pointless.
+Routing is structurally the same move as an L7 (application-layer) load balancer or a cache tier: a cheap decision guards an expensive resource. The distinguishing constraint is the cost ratio. **The router's own latency and cost must remain a small fraction of a weak-model call**, because the router runs on every request while the strong model runs on only a fraction of them. A router that requires a generation step to decide has already spent an inference to save an inference.
 
-There are three main approaches worth knowing, in rough order of how much machinery they need.
+Three families of routers differ in how much machinery they need and in what they require the operator to supply: a training signal, a taxonomy, or a verifier.
 
-## Approach A: predictive / learned routers (RouteLLM)
+## Predictive routers: learned strong-win probability (RouteLLM)
 
-RouteLLM, from LMSYS, frames routing as a binary decision between a fixed **strong** model and a fixed **weak** model. It trains a router on human preference data (Chatbot Arena battles) to predict, for a given prompt, the probability that the strong model's answer would actually win. You then pick a **threshold**: prompts whose predicted "strong-win" score clears the threshold go to the strong model; everything else goes to the weak one. Slide the threshold and you slide along the cost/quality curve.
+RouteLLM, from LMSYS, reduces routing to a binary choice between one fixed **strong** model and one fixed **weak** model. The router is trained on human preference data from Chatbot Arena battles to predict, for a given prompt, the probability that the strong model's response would win the comparison. A **threshold** turns that score into a dispatch: prompts scoring above it go to the strong model, the remainder to the weak model. The threshold is the single knob that moves the system along the cost/quality curve.
 
-The published results are the reason this pattern got attention. On MT Bench, RouteLLM's matrix-factorization router reached **95% of GPT-4's performance while calling GPT-4 for only 26% of queries** (dropping to 14% of calls after augmenting the training data with an LLM judge), which the LMSYS post reports as **cost reductions of over 85%** versus always calling the strong model. The same "95% of GPT-4 performance" bar cost roughly **45% of calls on MMLU and 35% on GSM8K**. Against commercial routing offerings, LMSYS reported matching performance while being **over 40% cheaper**. Treat these as benchmark figures, not a promise for your traffic — but the shape (most queries don't need the big model) generalizes.
+The published measurements on the LMSYS blog are the reason the pattern drew attention. On MT Bench, a router trained with data augmented by an LLM judge reached **95% of GPT-4's performance while routing only 26% of queries to GPT-4**. Holding that same 95%-of-GPT-4 bar, LMSYS reports **cost reductions of over 85% on MT Bench, 45% on MMLU and 35% on GSM8K** against always calling GPT-4 — the saving available at a fixed quality bar differs by benchmark, so it is a property of the workload as much as of the router. Against commercial routing offerings LMSYS reported matching performance while being **over 40% cheaper**. These are benchmark figures on benchmark distributions; the transferable claim is the shape of the curve, not the specific percentages.
 
-RouteLLM ships four trained routers: `mf` (matrix factorization, the recommended one), `sw_ranking` (a similarity-weighted Elo calculation), `bert` (a BERT classifier), and `causal_llm` (an LLM-based classifier), plus a `random` baseline. The SDK mimics the OpenAI client:
+Four trained routers ship with the framework: `mf` (matrix factorization, the recommended one), `sw_ranking` (a similarity-weighted Elo calculation), `bert` (a BERT classifier) and `causal_llm` (an LLM-based classifier), alongside a `random` baseline. The software development kit (SDK) mirrors the OpenAI client surface:
 
 ```python
 from routellm.controller import Controller
@@ -52,7 +52,7 @@ response = client.chat.completions.create(
 print(response.choices[0]["message"]["content"])
 ```
 
-Where does `0.11593` come from? You calibrate it against a target rate of strong-model calls, using your own query distribution:
+The threshold is not a quality target and cannot be read as one. **It is a quantile of the router's score distribution over a specific corpus**, produced by calibration against a desired strong-call rate:
 
 ```
 python -m routellm.calibrate_threshold --routers mf \
@@ -60,11 +60,11 @@ python -m routellm.calibrate_threshold --routers mf \
 # -> "For 50.0% strong model calls for mf, threshold = 0.11593"
 ```
 
-So `router-mf-0.11593` means "route about half of *this* traffic to the strong model." Push `--strong-model-pct` down and the threshold rises, sending more to the weak model and cutting cost — at some point quality drops off, which is why you calibrate on representative prompts rather than guessing.
+`router-mf-0.11593` therefore means "route approximately half of *this* corpus to the strong model". Lowering `--strong-model-pct` raises the threshold and shifts traffic to the weak model. Because the mapping from threshold to call rate is defined by the calibration corpus, **a threshold calibrated on one prompt distribution encodes a different call rate on another** — the reason calibration must run on representative traffic rather than on a default.
 
-## Approach B: semantic routing by embedding similarity (semantic-router)
+## Semantic routing: nearest labelled utterance (semantic-router)
 
-Learned win-rate routers are great when the axis you care about is "hard vs easy". But often you know your *categories* up front: billing questions go to a cheap model with a billing tool, coding questions go to a strong code model, off-topic chit-chat gets a canned deflection. For that, `aurelio-labs/semantic-router` is a much lighter tool. Instead of training a classifier, you define **routes** as a handful of example utterances, embed them once, and at request time embed the incoming query and pick the route with the highest cosine similarity. There is no generation step in the decision — it is a vector comparison, so it adds milliseconds, not a model call.
+Learned win-rate routers answer "hard or easy". Where the useful partition is known in advance — billing enquiries, coding tasks, off-topic input — `aurelio-labs/semantic-router` decides by similarity instead of by training. A **route** is a name plus a handful of example utterances. Those utterances are embedded once; at request time the incoming query is embedded and assigned to the route with the highest cosine similarity. **The decision contains no generation step**, so its cost is one embedding call plus a vector comparison.
 
 ```python
 from semantic_router import Route
@@ -100,18 +100,60 @@ choice = router("my for-loop is off by one, help").name  # -> "coding"
 model = "gpt-4o" if choice == "coding" else "gpt-4o-mini"
 ```
 
-Calling the router returns the matched route (or `None` when nothing clears the similarity threshold, which is your cue to fall back to a default model). You then map route names to models, system prompts, and tools. The encoder is pluggable — `OpenAIEncoder`, `CohereEncoder`, `HuggingFaceEncoder`, and `FastEmbedEncoder` are all supported, and a local embedding model keeps the routing decision both cheap and private. The tradeoff versus RouteLLM: you get transparent, editable routing you can debug by reading the utterance lists, but you own the taxonomy and must add utterances as new query shapes appear. The `None` return is a real operational lever — tune the score threshold to control how aggressively you fall back.
+Invoking the router returns the matched route, or `None` when no route clears the similarity threshold. **The `None` case is the fallback path and the primary operational lever**: raising the threshold sends more traffic to the default model, lowering it forces more prompts into a named route. Encoders are pluggable — `OpenAIEncoder`, `CohereEncoder`, `HuggingFaceEncoder` and `FastEmbedEncoder` are supported — and a local encoder keeps the routing decision off the network. Against RouteLLM the trade is legibility for maintenance: the routing rule is a readable list of utterances that can be debugged directly, but the taxonomy is owned by the operator and must be extended as new query shapes appear.
 
-## Approach C: cascade / speculative escalation
+## Cascade escalation: optimistic execution with a verifier
 
-The third approach skips prediction entirely: **try the cheap model first, and escalate only if the answer is not good enough.** Send the prompt to the small model, run a fast verifier on its output, and re-issue to the large model only when the verifier rejects it. This is the routing analogue of speculative decoding — optimistic execution on the cheap path, fallback on the expensive one.
+The third family makes no prediction. The cheap model is called first, a verifier inspects its output, and the expensive model is called only if the verifier rejects. This is the routing analogue of speculative decoding: optimistic execution on the cheap path with fallback on the expensive one.
 
-The verifier is the whole game. It can be a rule (did the output parse as valid JSON? did the code compile? did the SQL execute?), a self-reported confidence score, or a small LLM-as-judge check. Cascades shine when verification is cheap and reliable and when most easy queries pass on the first try, because the small-model cost is nearly free and only the hard tail pays for two calls. They hurt when the small model fails *often* (you pay for both models plus the verifier on most requests) or when a wrong small-model answer is expensive to catch. Cascades and predictive routing compose: route first to skip obviously-hard prompts, then cascade within the "probably easy" bucket.
+The verifier determines whether the cascade pays. It may be a mechanical check (the output parses as JSON, the emitted code compiles, the generated SQL executes), a self-reported confidence score, or a small LLM-as-judge pass. **The expected cost is `c_weak + c_verify + p_fail · c_strong`**, so the cascade wins when verification is cheap and the failure rate is low, and loses on both counts when the weak model fails often — every request then pays for two models plus the verifier. A verifier that accepts wrong answers converts a cost saving into a quality regression that the call-rate metric will not reveal. Cascades compose with predictive routing: route first to divert prompts predicted hard, then cascade inside the remaining bucket.
 
-## The cost/quality tradeoff, and how to evaluate
+### Implementation sketch (Scala)
 
-Every router exposes one knob — a threshold, a similarity cutoff, an escalation trigger — that trades quality for cost. Evaluating it means plotting the curve, not picking one number. The clean way, and the metric RouteLLM itself uses, is a **call-performance graph**: on the x-axis, the fraction of requests sent to the strong model; on the y-axis, task quality. Two reference points anchor it — random routing (a straight line between the weak and strong models) is the baseline any real router must beat, and the strong-model-only ceiling. A good router bows above the random line: it reaches most of the quality ceiling with a small fraction of strong-model calls.
+The escalation loop, with the verifier as the load-bearing parameter:
 
-To run this yourself: assemble a few hundred representative prompts with a scorer (exact match, unit tests, an LLM judge — whatever fits your task), sweep the router's threshold across its range, and at each setting record both the strong-model call rate and the average score. Read off the point where the quality curve flattens — that is your knee, the setting past which extra strong-model spend buys almost nothing. Two things that bite in production: **routing overhead** (the router's own latency and cost must stay a small fraction of the weak-model call, or it eats the savings) and **distribution drift** (a threshold calibrated on last quarter's traffic silently degrades as prompts change, so recalibrate on a rolling sample and alarm on the strong-model call rate). Route on the input, log the outcome, and let the logs recalibrate the threshold.
+```scala
+enum Tier:
+  case Weak, Strong
 
-**Try next:** Take one endpoint, define three or four semantic-router routes over your real logs, and map two of them to a cheaper model behind a feature flag. Measure the strong-model call rate and quality delta for a week before touching the threshold.
+case class Answer(text: String, tier: Tier)
+
+trait Model:
+  def complete(prompt: String): String
+
+/** Accepts an answer or rejects it, forcing escalation. */
+type Verifier = (String, String) => Boolean  // (prompt, output) => accepted
+
+final class Cascade(weak: Model, strong: Model, verify: Verifier):
+
+  def answer(prompt: String): Answer =
+    val cheap = weak.complete(prompt)
+    // The weak call is always paid for; only rejection adds the strong call.
+    if verify(prompt, cheap) then Answer(cheap, Tier.Weak)
+    else Answer(strong.complete(prompt), Tier.Strong)
+
+/** Threshold routing: score once, dispatch, never call both. */
+final class Predictive(weak: Model, strong: Model, score: String => Double, threshold: Double):
+
+  def answer(prompt: String): Answer =
+    if score(prompt) >= threshold then Answer(strong.complete(prompt), Tier.Strong)
+    else Answer(weak.complete(prompt), Tier.Weak)
+```
+
+The structural difference is visible in the types: `Cascade` observes the weak output before deciding and can pay twice; `Predictive` decides from the prompt alone and pays once, at the price of deciding without evidence from the answer.
+
+## Evaluating the knob
+
+Every router exposes one continuous parameter — a threshold, a similarity cutoff, an escalation trigger — and the meaningful artefact is the curve it traces, not a single operating point. The metric RouteLLM uses is a **call-performance graph**: strong-model call fraction on the x-axis, task quality on the y-axis. Two reference lines bound it. Random routing traces a straight line between weak-model and strong-model quality and is the baseline any router must beat; the strong-model-only score is the ceiling. **A router earns its place by bowing above the random line** — reaching most of the ceiling at a small strong-call fraction.
+
+Producing that curve requires a few hundred representative prompts, a scorer appropriate to the task (exact match, unit tests, or an LLM judge), a sweep of the threshold across its range, and a record of both the strong-call rate and the mean score at each setting. The knee — where the quality curve flattens — marks the setting beyond which additional strong-model spend buys close to nothing.
+
+## Pitfalls
+
+- **A threshold copied from documentation encodes an unknown call rate.** The threshold is a quantile of the router's score distribution over the calibration corpus, so transplanting `0.11593` onto different traffic yields neither 50% strong calls nor any predictable figure.
+- **Prompt-distribution drift degrades quality silently.** A threshold calibrated on last quarter's traffic keeps returning a score above a fixed cutoff for a shifted population; nothing errors, and the symptom is a slow change in the strong-model call rate. Alarming on that rate and recalibrating on a rolling sample is what makes the drift observable.
+- **Router overhead consumes the saving.** If the decision costs a meaningful fraction of a weak-model call in latency or tokens, per-request routing cost is multiplied by total traffic while the saving applies only to the diverted fraction.
+- **A permissive verifier turns a cascade into a quality regression.** Cost metrics improve because escalation rarely fires, and the accepted-but-wrong weak answers appear nowhere in the call-rate dashboard.
+- **A cascade over a weak model with a high failure rate costs more than no routing.** Expected cost `c_weak + c_verify + p_fail · c_strong` exceeds `c_strong` once `p_fail` approaches 1.
+- **Semantic routes decay as query phrasing changes.** New query shapes fail to clear the similarity threshold, return `None`, and fall through to the default model — the fallback rate rises without any route reporting an error.
+- **Benchmark call rates are not traffic call rates.** The 26% strong-call figure comes from MT Bench, and the reported saving at the same quality bar falls to 45% on MMLU and 35% on GSM8K; the achievable strong-call fraction is a property of the workload's difficulty distribution.

@@ -1,9 +1,9 @@
 ---
-title: "The Claim Check Pattern: Keep Big Payloads Out of Your Queue"
+title: "The Claim Check Pattern: Keeping Large Payloads Out of the Broker"
 date: 2026-07-31
 track: sys-patterns
-summary: "Message brokers cap payloads at kilobytes-to-a-megabyte. The Claim Check pattern stores the blob in S3 or blob storage and passes only a reference through the queue — here's the flow, cleanup, security, and trade-offs."
-reading_time: 5
+summary: "Message brokers cap payloads between a few hundred kilobytes and a megabyte. The Claim Check pattern stores the blob in object storage and passes only a reference through the queue: flow, cleanup, security, and trade-offs."
+reading_time: 6
 tags: [messaging, kafka, sqs, azure-service-bus, s3, architecture, integration-patterns]
 sources:
   - title: "Store in Library (Claim Check) — Enterprise Integration Patterns, Hohpe & Woolf"
@@ -18,81 +18,95 @@ sources:
     url: "https://www.confluent.io/learn/kafka-message-size-limit/"
 ---
 
-A message broker is a router, not a file server. Push a 40 MB video through it and you pay for it in broker memory, replication bandwidth, consumer buffer pressure, and — usually first — a hard rejection, because every broker caps message size.
+**Gist.** A message broker routes small records; every major broker enforces a maximum message size, so a multi-megabyte payload is rejected outright or degrades every other message sharing the same queue or partition. The **Claim Check** pattern — named *Store in Library* by Hohpe and Woolf — writes the payload to external object storage and publishes only an opaque reference, so the broker carries a few hundred bytes instead of the blob. The cost is a second storage system on the critical path: one extra write and one extra read per payload, a new failure mode when the store is unavailable, and a lifecycle problem, because the blob outlives the message that points at it.
 
-The **Claim Check** pattern (Hohpe & Woolf call it *Store in Library*) is the fix: store the large payload in external storage, put only a small reference on the queue, and let the consumer fetch the blob on demand. The luggage-check analogy is exact — you hand over the bag, get a numbered ticket, and carry only the ticket.
+## Broker size ceilings
 
-## Why brokers cap message size
+- **Apache Kafka** — the broker setting `message.max.bytes` defaults to approximately **1 MB**, with a matching per-topic `max.message.bytes`. Raising it in isolation is not sufficient: the replica fetcher limit `replica.fetch.max.bytes` and the consumer fetch limits must be raised alongside it, otherwise a record accepted by the leader cannot be replicated or consumed.
+- **Amazon Simple Queue Service (SQS)** — long capped at **256 KB**, since raised to **1 MiB**. The SQS Extended Client Library remains available and carries larger payloads by storing them in Amazon S3 — Claim Check shipped as a first-party library.
+- **Azure Service Bus** — **256 KB** on the Standard tier; the Premium tier supports up to **100 MB** per message over the Advanced Message Queuing Protocol (AMQP).
 
-Small messages keep a broker fast: they fit in page cache, replicate cheaply, and don't stall consumers. So brokers enforce limits (verified July 2026):
+A generous ceiling does not make large messages cheap. A single large record occupies broker memory, consumes replication bandwidth, and holds head-of-line position in a partition or queue, so it raises tail latency for the small messages behind it.
 
-- **Apache Kafka** — `message.max.bytes` defaults to **1 MB (1,048,576 bytes)** at the broker, with a matching per-topic `max.message.bytes`. You can raise it, but you must also bump `replica.fetch.max.bytes` and consumer `fetch.max.bytes` in lockstep, and large records erode throughput.
-- **Amazon SQS** — historically **256 KB**, raised to **1 MiB (1,048,576 bytes)** in August 2025. The SQS Extended Client Library still exists to push up to **2 GB** via S3 — which is Claim Check as a first-party library.
-- **Azure Service Bus** — **256 KB** on the Standard tier; Premium defaults to 1 MB and supports up to **100 MB** per message over AMQP.
+## The write and read flow
 
-Even where the ceiling is generous, big messages are a bad idea: they inflate p99 latency for every other message sharing the partition or queue.
+The pattern splits one publish into two steps on each side, and the ordering is load-bearing.
 
-## The write / read flow
+**Producer.** First write the blob to object storage under an opaque, unguessable key. Then publish a small message containing that key plus metadata: size, content type, and a checksum. **The storage write must complete before the message is published**; the reverse ordering permits a consumer to receive a reference to an object that does not yet exist.
 
-**Producer (check the bag):**
-1. Write the blob to object storage, keyed by an opaque, unguessable ID.
-2. Publish a small message containing the key plus metadata (size, content type, checksum).
+**Consumer.** Read the message, extract the key, fetch the blob — preferably through a time-limited signed URL rather than broad bucket credentials — verify the checksum, and process.
 
-**Consumer (redeem the ticket):**
-3. Read the message, pull the key.
-4. Fetch the blob from storage — ideally via a time-limited signed URL — and process it.
+The invariant the pattern maintains is one-directional: **every published reference points at an object that already exists, and objects may exist with no reference**. The surplus is orphaned storage, which a lifecycle rule reclaims; the deficit — a reference with no object — is a dangling pointer that no amount of retrying repairs.
 
-The broker never sees the payload. The message stays a few hundred bytes.
+### Implementation sketch (Scala)
 
-```python
-import boto3, json, uuid
+The load-bearing decisions are the size threshold and the ordering of the two writes. `ObjectStore` and `Broker` stand in for whichever client library is in use.
 
-s3, sqs = boto3.client("s3"), boto3.client("sqs")
-BUCKET, QUEUE = "media-ingest", "https://sqs.us-east-1.amazonaws.com/123/ingest"
+```scala
+def sha256(bytes: Array[Byte]): String =
+  java.security.MessageDigest.getInstance("SHA-256")
+    .digest(bytes).map("%02x".format(_)).mkString
 
-def publish_video(raw_bytes: bytes, content_type: str):
-    key = f"uploads/{uuid.uuid4()}"                 # opaque, unguessable
-    s3.put_object(Bucket=BUCKET, Key=key, Body=raw_bytes,
-                  ContentType=content_type)
-    # claim check: reference only, not the blob
-    sqs.send_message(QueueUrl=QUEUE, MessageBody=json.dumps({
-        "bucket": BUCKET, "key": key,
-        "content_type": content_type,
-        "size": len(raw_bytes),
-        "sha256": _sha256(raw_bytes),               # for idempotent verify
-    }))
+enum Envelope:
+  case Inline(bytes: Array[Byte], contentType: String)
+  case ClaimCheck(bucket: String, key: String, contentType: String,
+                  size: Int, sha256: String)
 
-def consume(msg):
-    ref = json.loads(msg["Body"])
-    blob = s3.get_object(Bucket=ref["bucket"], Key=ref["key"])["Body"].read()
-    assert _sha256(blob) == ref["sha256"]           # integrity check
+final class Publisher(store: ObjectStore, broker: Broker,
+                      bucket: String, thresholdBytes: Int):
+
+  def publish(payload: Array[Byte], contentType: String): Unit =
+    val envelope =
+      if payload.length <= thresholdBytes then
+        Envelope.Inline(payload, contentType)
+      else
+        val key = s"uploads/${java.util.UUID.randomUUID()}"  // opaque, non-enumerable
+        // storage write first: a reference must never outrun its object
+        store.put(bucket, key, payload, contentType)
+        Envelope.ClaimCheck(bucket, key, contentType, payload.length, sha256(payload))
+    broker.send(encode(envelope))
+
+def consume(store: ObjectStore, envelope: Envelope): Unit = envelope match
+  case Envelope.Inline(bytes, _) => process(bytes)
+  case Envelope.ClaimCheck(bucket, key, _, _, digest) =>
+    val blob = store.get(bucket, key)
+    require(sha256(blob) == digest, s"checksum mismatch for $key")
     process(blob)
 ```
 
+The threshold branch matters because the pattern is not free: below the broker limit, an inline message costs only the broker hop, while a claim check adds a storage write on the producer and a storage read on the consumer.
+
 ## Lifecycle and cleanup
 
-The blob outlives the message, so someone must delete it — otherwise storage leaks forever. Two strategies (per the Azure guidance):
+The blob outlives the message, so deletion has to be assigned to someone. Two strategies are available.
 
-- **Synchronous** — the consumer deletes the object after successful processing. Simple, but a lost/failed consumer orphans the blob, and retries need the object to still exist.
-- **Asynchronous** — let storage expire it. On S3, an **object-lifecycle rule** or TTL (e.g. delete after 7 days) reclaims space regardless of consumer fate. This decouples cleanup from the message workflow and is the safer default for at-least-once queues.
+- **Synchronous** — the consumer deletes the object after processing succeeds. This bounds storage growth tightly, but a consumer that crashes between fetch and delete orphans the object, and a consumer that deletes before the broker acknowledges the message destroys the payload that redelivery will need.
+- **Asynchronous** — storage expires the object. An S3 object-lifecycle rule with a time to live (TTL) reclaims the object regardless of consumer fate, which decouples cleanup from the message workflow.
 
-Rule of thumb: use a TTL long enough to cover your maximum redelivery/retry window, and only add explicit deletion if storage cost demands it.
+The constraint linking the two is that **the TTL must exceed the maximum redelivery window**, including dead-letter inspection time. A TTL shorter than the retry horizon converts a transient consumer failure into permanent data loss: the message returns to the queue, the object is already gone, and every subsequent attempt fails identically.
 
 ## Idempotency and security
 
-**Idempotency** — most brokers deliver *at least once*, so the same claim check can arrive twice. Because the reference is immutable and the blob is content-addressable, redelivery is naturally safe: fetch the same key, verify the same checksum, dedupe on a message ID before committing side effects.
+**Idempotency.** Most brokers deliver at least once, so the same claim check can arrive more than once. Because the reference is immutable and the key is never reused, redelivery is idempotent at the fetch layer — the second delivery reads the same bytes and verifies the same checksum. Idempotency of the *side effects* is a separate obligation and requires deduplication on a message identifier before committing.
 
-**Security** — the whole point is that the payload leaves the broker, so protect it at the store, not in transit:
-- Hand out **pre-signed / SAS URLs** scoped to a single object and a short expiry (minutes), not broad bucket credentials.
-- Keep keys **opaque** (UUIDs, not `user-42/invoice.pdf`) so a leaked reference reveals nothing and can't be enumerated.
-- A side benefit noted by Hohpe & Woolf and Azure: sensitive data never touches broker storage or logs, tightening your access-control surface.
+**Security.** The payload leaves the broker, so access control moves to the store.
+
+- Issue **pre-signed URLs (S3) or shared access signature (SAS) URLs (Azure)** scoped to a single object with a short expiry, rather than distributing bucket-wide credentials.
+- Keep keys **opaque** — a UUID rather than `user-42/invoice.pdf` — so a leaked reference discloses nothing about the object and neighbouring keys cannot be enumerated by guessing.
+- A consequence of moving the payload out of the message is that sensitive content never enters broker storage or broker logs; it is exposed instead wherever the object store is exposed.
 
 ## Trade-offs
 
-- **Extra round trip.** Every payload now costs a storage write and a storage read. Apply the pattern *conditionally* — send small messages inline, check the bag only when the payload is large. A common trick: put a size threshold in the producer and branch.
-- **Two systems to keep consistent.** A blob with no message is orphaned storage; a message with no blob is a dangling pointer. TTLs and checksums are your guardrails.
-- **Storage becomes a dependency of message processing.** If the object store is down, consumers can't complete — factor it into availability budgets.
+- **Extra round trips per payload.** Each large message costs one storage write and one storage read on top of the broker hop, which is why the threshold branch exists.
+- **Two systems that must stay consistent.** The checksum detects a corrupted or replaced object; the lifecycle rule bounds orphan accumulation. Neither repairs a dangling reference.
+- **Object storage becomes a dependency of message processing.** Consumers cannot complete while the store is unavailable, so the availability of the pipeline is bounded by the lower of the two, not by the broker alone.
 
-The pattern trades a little latency and one more moving part for the ability to move arbitrarily large payloads through a broker that was never built to carry them.
+## Pitfalls
 
-**Try next:** Stand up LocalStack, create an SQS queue and an S3 bucket, and run the snippet above end to end with a 5 MB file. Then add an S3 lifecycle rule that expires `uploads/` after one day and confirm the object disappears while the (already-consumed) message does not.
+- **Publishing the message before the storage write commits.** A consumer fetches the key, receives a not-found error, and the message is retried or dead-lettered even though the producer succeeded moments later.
+- **A lifecycle TTL shorter than the redelivery window.** The message is redelivered after the object expires; every retry fails with not-found and the payload is unrecoverable.
+- **Deleting the object before the broker acknowledges the message.** The acknowledgement is lost, the message is redelivered, and the blob it references no longer exists.
+- **Raising `message.max.bytes` on Kafka brokers without raising `replica.fetch.max.bytes`.** The leader accepts records that followers cannot fetch, so replication stalls on the oversized record.
+- **Structured, guessable keys such as `user-42/invoice.pdf`.** A single leaked reference discloses the naming scheme, and other users' objects can be requested by constructing keys.
+- **No checksum in the reference.** A truncated upload or an overwritten key is processed as valid input, and the corruption surfaces downstream rather than at the fetch.
+- **Applying the pattern unconditionally.** Kilobyte messages that fit inline pay two extra storage operations each, adding latency and cost to the common case.
