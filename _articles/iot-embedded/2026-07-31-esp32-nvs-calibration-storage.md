@@ -2,8 +2,8 @@
 title: "Persisting Sensor Calibration on the ESP32 with NVS"
 date: 2026-07-31
 track: iot-embedded
-summary: "Your ADC offset or air-quality baseline shouldn't reset every power cycle. NVS is the ESP32's wear-leveled key-value store in flash — here's how to read a float calibration value with a first-boot default, write it back, and why you must commit. Plus the float gotcha in ESP-IDF 5.x."
-reading_time: 5
+summary: "An ADC offset or air-quality baseline must survive power cycles. NVS is the ESP32's wear-levelled key-value store in flash: reading a float calibration value with a first-boot default, writing it back, the commit requirement, and the absence of a native float type in ESP-IDF 5.x."
+reading_time: 6
 tags: [esp32, esp-idf, nvs, flash, calibration, arduino]
 sources:
   - title: "Non-Volatile Storage Library — ESP-IDF Programming Guide"
@@ -18,17 +18,32 @@ sources:
     url: "https://randomnerdtutorials.com/esp32-save-data-permanently-preferences/"
 ---
 
-You calibrate an air-quality node once — measure the ADC offset against a reference, note the sensor's clean-air baseline — and then the board reboots and forgets all of it. Hardcoding the value defeats the point of calibrating per-unit. What you want is a tiny slice of flash that survives power cycles and firmware updates, and on the ESP32 that's **NVS**, the Non-Volatile Storage library.
+**Gist.** Per-unit calibration constants — an analogue-to-digital converter (ADC) offset measured against a reference, a gas sensor's clean-air baseline — are determined once and must outlive every reset and firmware update, which rules out compiling them into the image. The ESP32's Non-Volatile Storage (NVS) library provides a key-value store inside a dedicated flash partition, with wear levelling and named scopes, reached through `nvs_get_*` and `nvs_set_*`. The cost is a stricter contract than a variable in random-access memory (RAM): names are length-limited, writes are staged until an explicit commit, the partition can refuse a write when it has no free pages, and in ESP-IDF 5.x there is no native floating-point type, so a calibration float travels as a blob.
 
-## What NVS actually is
+## The storage model
 
-NVS is a **key-value store in a flash partition** (the `nvs` partition in your partition table) with **wear leveling built in** — writes append to free space rather than rewriting a fixed location, so you're not burning the same flash cells on every save. Keys are grouped into **namespaces** (opened with `nvs_open`), so independent modules can reuse key names without colliding. A few constraints to keep in your head: key and namespace names are capped at **15 characters**, strings at 4000 bytes, and blobs are large but bounded by the partition. Writes are *staged* until you call **`nvs_commit()`** — skip it and your value can vanish on the next reset.
+NVS occupies a **partition of type `data`, subtype `nvs`**, declared in the project's partition table. Within it, entries are addressed by a pair: a **namespace** opened with `nvs_open`, and a **key** within that namespace. The namespace makes key names local to a module, so a sensor-calibration component and a networking component can both own a key called `offset` without collision.
 
-The one wrinkle: in **ESP-IDF 5.x the C API has no native `float`**. Types are the integer widths, zero-terminated strings, and variable-length blobs; the docs literally say float and double "might be added later." (They did, in ESP-IDF 6.0's `nvs_set_float`/`nvs_get_float` — but for 5.x you store a float as a 4-byte blob, or as a fixed-point integer.) On the Arduino side, the `Preferences` wrapper *does* give you `putFloat`/`getFloat` because it serializes the float for you onto the same NVS partition.
+Writes do not rewrite the previous location. NVS appends the new entry into free space within a page and marks the old entry erased; whole pages are reclaimed by NVS's own housekeeping rather than synchronously by the caller. The consequence for the caller is that **a write consumes space even when it overwrites an existing key**.
 
-## Reading and writing a calibration offset (ESP-IDF 5.x)
+Three limits are load-bearing. **Key names and namespace names are capped at 15 characters** — a longer literal is not a compile-time error in ordinary C, so it surfaces at runtime as an error code from `nvs_set_*`. **Strings are capped at 4000 bytes.** Blobs have both a fixed upper bound and a bound derived from the size of the NVS partition, whichever is smaller, so blob capacity is partly a property of the partition table entry.
 
-The pattern is: bring up NVS, open a namespace, read the offset with a **first-boot default** when the key is missing, and commit after every write.
+The fourth, and the one that produces the most confusing bug reports: **`nvs_set_*` stages a value; `nvs_commit()` flushes it.** Between the two, the new value is visible to reads through the same handle but is not guaranteed to be on flash. A reset in that window — a watchdog, a brownout, a user pressing the button — leaves the previous value in place, with no error reported anywhere.
+
+## The float gap in ESP-IDF 5.x
+
+In **ESP-IDF 5.x the C API has no native `float`**. The supported types are the fixed-width integers, zero-terminated strings, and variable-length blobs; the v5.1 documentation states that support for float and double "might be added later". Until such a type exists, the two workable encodings are:
+
+- **A 4-byte blob** holding the object representation of the `float`. The value round-trips correctly because it is written and read by the same architecture and the same compiler; the encoding is not a documented interchange format.
+- **A fixed-point integer** — for example, the offset in units of 1/1000 stored as `int32_t`. This has a defined range and resolution, which a blob of raw bytes does not.
+
+Arduino-ESP32's `Preferences` wrapper exposes `putFloat` / `getFloat` against the same NVS partition; the wrapper performs the serialisation that the 5.x C API leaves to the caller.
+
+## First boot as a normal state, not an error
+
+A freshly flashed board has no `nvs` entries. The distinguishing detail is that **NVS reports a missing namespace and a missing key with `ESP_ERR_NVS_NOT_FOUND`, which is a return code and not a fault**. Treating it as a fault produces a device that refuses to boot until it has been calibrated; treating it as the signal to substitute a compiled-in default produces a device that runs with defined behaviour from the first power-up.
+
+`nvs_flash_init` has its own two recoverable failures. **`ESP_ERR_NVS_NO_FREE_PAGES`** indicates the partition has no free page available, and **`ESP_ERR_NVS_NEW_VERSION_FOUND`** indicates the partition was written by a newer NVS format than the running library understands. Both are handled by erasing the partition with `nvs_flash_erase` and initialising again — which destroys every stored value, including the calibration.
 
 ```c
 #include "nvs_flash.h"
@@ -72,11 +87,11 @@ esp_err_t cal_store_offset(float offset) {
 }
 ```
 
-The `ESP_ERR_NVS_NOT_FOUND` branch is the whole trick for robust first-boot behavior: a missing key (or missing namespace) is not an error, it's your cue to substitute the compiled-in default and carry on. That's how a freshly flashed board runs with sane values before anyone has calibrated it.
+The length check in `cal_load_offset` is not redundant with the error check. `nvs_get_blob` reports the stored length through the in/out `len` parameter, so **a key that exists but holds a value of a different size is detected by comparing the returned length against `sizeof(float)`** rather than by any type tag the caller can rely on.
 
-## The Arduino shortcut
+## The Arduino path
 
-If you're on Arduino-ESP32, `Preferences` collapses this to a few lines against the same partition, with a native float and a built-in default argument:
+`Preferences` collapses the same sequence against the same partition, with a native float accessor and a default supplied at the call site:
 
 ```cpp
 #include <Preferences.h>
@@ -95,6 +110,18 @@ void storeOffset(float off) {
 }
 ```
 
-One more thing worth knowing before you store anything sensitive: NVS can be **encrypted**, backed by flash encryption using XTS-AES, with the keys living in a dedicated `nvs_keys` partition. When flash encryption is on, NVS encryption is on by default and your `nvs_get_*`/`nvs_set_*` calls keep working transparently — so a stolen device doesn't hand over your Wi-Fi password in plaintext.
+The namespace argument to `begin` is subject to the same 15-character limit as `nvs_open`, and the second argument selects read-only or read-write mode — opening read-only and then calling a `put*` method fails rather than writing.
 
-**Try next:** Add a serial command to your node that captures the current raw ADC reading against a known reference, computes the offset, and calls `cal_store_offset`. Power-cycle and confirm `cal_load_offset` returns it. Then wipe with `idf.py erase-flash` (or `nvs_flash_erase`) and verify the node falls back to `DEFAULT_OFFSET` cleanly instead of reading garbage.
+## Encryption
+
+NVS supports an **encrypted mode backed by flash encryption, using XTS-AES**, with the encryption keys held in a separate partition of subtype `nvs_keys`. When flash encryption is enabled, NVS encryption is enabled by default, and the `nvs_get_*` / `nvs_set_*` calls are unchanged for the caller: decryption happens below the API. The property this provides is that values read out of the flash chip by an attacker with physical access — a stored Wi-Fi credential, for example — are ciphertext rather than plaintext.
+
+## Pitfalls
+
+- **A value written without `nvs_commit` disappears on the next reset.** `nvs_set_*` stages the change; only the commit guarantees it reached flash. The staged value reads back correctly through the open handle, so a same-session read-after-write test passes while the device still loses the value.
+- **A key or namespace name longer than 15 characters is rejected at runtime, not at compile time.** The symptom is a `set` or `open` call returning an error on a name that looks fine in the source.
+- **`ESP_ERR_NVS_NOT_FOUND` treated as a fatal error bricks the first boot.** A device that has never been calibrated has no key; the code path must substitute the default.
+- **The `ESP_ERR_NVS_NO_FREE_PAGES` recovery erases the calibration.** `nvs_flash_erase` clears the whole partition, so a device that hits this condition returns to defaults with no other warning.
+- **Opening with `NVS_READONLY` and then writing fails.** The mode is fixed at `nvs_open` time; the write returns an error rather than promoting the handle.
+- **A 4-byte blob carries no type information.** Changing the stored representation — from raw `float` to fixed-point `int32_t`, both 4 bytes — leaves old devices reading the new bytes as the old type, with no length mismatch to catch it.
+- **Erasing flash with `idf.py erase-flash` removes the NVS partition contents along with the firmware.** Per-unit calibration is lost by a routine reflash unless it is read out and restored.

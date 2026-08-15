@@ -2,7 +2,7 @@
 title: "A dB(A) Noise Node: INMP441 I2S Microphone on the ESP32"
 date: 2026-08-15
 track: iot-embedded
-summary: "An I2S MEMS mic like the INMP441 turns an ESP32 into a continuous sound-level meter for a few dollars: read 24-bit samples out of 32-bit slots, run an A-weighting IIR cascade, integrate Leq over 125 ms windows, and anchor absolute dB SPL on the mic's -26 dBFS sensitivity spec."
+summary: "An inter-IC sound (I2S) micro-electro-mechanical (MEMS) microphone such as the INMP441 turns an ESP32 into a continuous sound-level meter: 24-bit samples arrive MSB-aligned in 32-bit slots, an A-weighting IIR cascade shapes them, Leq integrates over 125 ms windows, and the mic's -26 dBFS sensitivity anchors absolute dB SPL."
 reading_time: 6
 tags: [inmp441, i2s, esp32, sound-level, dba, esp-idf, noise]
 sources:
@@ -18,15 +18,17 @@ sources:
     url: "https://github.com/stas-sl/esphome-sound-level-meter"
 ---
 
-An air-quality station tells you the room is stuffy; a noise channel tells you *why you can't sleep in it*. Traffic, HVAC, the neighbour's heat pump — LAeq trends correlate with windows-open decisions just like CO2 does, and the sensor is a three-dollar board. The INMP441 (and its better-calibrated sibling, the ICS-43434) is a MEMS microphone with the ADC already inside: it speaks I2S, so the ESP32 clocks in finished 24-bit samples over DMA and no analog front end exists to get wrong.
+**Gist.** A noise channel answers a question a CO2 channel cannot: which of traffic, heating-ventilation-and-air-conditioning (HVAC) plant or a neighbour's heat pump is driving the room's sound level, and when. The mechanism is a micro-electro-mechanical-systems (MEMS) microphone with the analogue-to-digital converter (ADC) already on die, emitting inter-IC sound (I2S) frames that the ESP32 clocks in over direct memory access (DMA); firmware then applies an A-weighting infinite-impulse-response (IIR) cascade and integrates equivalent continuous level (Leq) over fixed windows. The cost is accuracy that is bounded by the part's sensitivity tolerance and its own noise floor, not by the arithmetic: on the INMP441 that tolerance is **±3 dB**, and levels below roughly 35 dB(A) are the microphone measuring itself.
 
-## The mic, honestly specced
+## The part, as specified
 
-From the INMP441 datasheet: sensitivity **-26 dBFS** at 94 dB SPL / 1 kHz, SNR **61 dBA**, equivalent input noise **33 dBA SPL**, flat response **60 Hz–15 kHz**. Two consequences. First, the noise floor means readings below ~35 dB(A) are the mic measuring itself — fine for "how loud is the street", useless for a recording studio. Second, sensitivity tolerance is **±3 dB** on the INMP441 versus **±1 dB** on the ICS-43434, which is why Ivan Kostoski's reference project recommends the ICS-43434 when you care about absolute accuracy. Wiring is five lines: VDD (3.3 V), GND, SCK, WS, SD — plus L/R tied to GND to put mono data in the left slot.
+The INMP441 datasheet gives sensitivity **-26 dBFS** at 94 dB sound pressure level (SPL) and 1 kHz, signal-to-noise ratio **61 dBA**, equivalent input noise **33 dBA SPL**, and a flat response over **60 Hz–15 kHz**. Two consequences follow directly. The equivalent input noise sets a floor: readings near or below the mid-30s dB(A) are dominated by the sensor, which suits street-level trend data and does not suit a quiet room. The sensitivity tolerance sets absolute accuracy: **±3 dB** part to part, which no amount of arithmetic recovers. Ivan Kostoski's reference project recommends the ICS-43434 instead where absolute accuracy matters, its sensitivity tolerance being the tighter of the two.
 
-## I2S std mode and the 24-in-32 gotcha
+Wiring is five lines — VDD (3.3 V), GND, SCK, WS, SD — with the L/R pin tied to GND so the mono word lands in the left slot. Every subsequent decision in firmware depends on that slot choice.
 
-On ESP-IDF 5+ the old `i2s_driver_install` API is replaced by channel-based drivers; standard Philips mode lives in `driver/i2s_std.h`. The one thing everyone trips over: the INMP441 ships **24-bit data MSB-aligned inside a 32-bit slot** (the datasheet specifies 64 SCK cycles per stereo frame — 32 per word). So you configure 32-bit slots, receive `int32_t`, and arithmetic-shift right by 8 to recover a signed 24-bit sample. Skip the shift and your levels are off by 48 dB and full of garbage in the low byte.
+## I2S standard mode and the 24-in-32 alignment
+
+On ESP-IDF 5 and later the older `i2s_driver_install` interface is superseded by channel-based drivers, and standard Philips mode lives in `driver/i2s_std.h`. The alignment detail is the one that silently corrupts levels: the INMP441 emits **24-bit data MSB-aligned inside a 32-bit slot**, the datasheet specifying **64 SCK cycles per stereo frame**, thirty-two per word. The slot width is therefore configured as 32 bits, samples are received as `int32_t`, and each is arithmetic-shifted right by 8 to recover a signed 24-bit value. Omitting the shift scales every sample by 2^8, an offset of **48 dB**, and leaves the undefined low byte in the data.
 
 ```c
 #include "driver/i2s_std.h"
@@ -76,18 +78,30 @@ float read_block_db(void) {
 }
 ```
 
-The calibration constant is the whole trick: a 94 dB SPL sine should read `-26 dBFS`, i.e. a peak amplitude of about **420,426** counts in 24-bit data. Anchor on that and the dB numbers become absolute SPL, not arbitrary dBFS — within the mic's ±3 dB part tolerance, anyway. A $20 calibrator (or a phone SLM app held next to the board, for the unfussy) tightens that to ~1 dB.
+Three details in that block carry the result. `n` is a byte count, so the sample count is `n / 4` for 32-bit slots. The one-pole recursive filter tracks and subtracts the direct-current (DC) offset, which would otherwise be squared into the sum and inflate every reading at low levels. The calibration constant converts relative full-scale units into absolute SPL: a 94 dB SPL sine reads **-26 dBFS**, so its peak amplitude is 8388607 × 10^(-26/20) ≈ **420,426** counts in 24-bit data, and the root-mean-square (RMS) reference is that peak divided by √2. Anchored on this, the output is dB SPL rather than arbitrary dBFS — within the part's ±3 dB tolerance. Comparison against a reference meter narrows the residual, but no published figure fixes how far.
 
-## From dB(Z) to dB(A)
+## From dB(Z) to dB(A), and on to Leq
 
-The code above is unweighted ("Z"). Regulations and every published noise figure use **A-weighting** — a standardized curve that discounts the low frequencies human ears discount. Digitally it's an IIR filter, and the clean implementation is a cascade of **second-order sections (biquads)** run in single precision per sample block. The esp32-i2s-slm project ships exactly this: one biquad cascade equalizing the microphone's own response, then a three-stage A-weighting cascade with coefficients designed for 48 kHz (the MATLAB used to derive them is in the repo — half the repo by volume, usefully). Filtering 1024 samples between DMA reads costs single-digit milliseconds on a 240 MHz ESP32; the FPU makes FFT-based weighting unnecessary.
+The listing above is unweighted, conventionally labelled Z. Published noise figures and regulatory limits use **A-weighting**, a standardized curve that attenuates low frequencies in the manner human hearing does. It is realized as an IIR filter, implemented as a cascade of **second-order sections (biquads)** applied per sample block. The esp32-i2s-slm project ships this arrangement: one biquad cascade equalizing the microphone's own response, followed by an A-weighting cascade with coefficients designed for 48 kHz. Each sample costs a fixed handful of multiply-accumulates per section, independent of block size, so a fast Fourier transform is not required to obtain the weighting.
 
-Then integrate: **Leq** is just RMS-over-a-window expressed in dB. The standard fast meter response is a **125 ms** window (LAeq,125ms) — that's your "live" bar. Accumulate the same sum-of-squares for 1 s (LAeq,1s) for publishing, or 15 min for the neighborhood-noise number that actually means something. Because you accumulate energy (squares), longer windows are free: keep one running sum, snapshot at each horizon.
+Integration follows. **Leq** is RMS over a window expressed in dB. A **125 ms** window matches the time scale of the conventional Fast meter response and gives LAeq,125ms as the live indication; a 1 s window gives LAeq,1s for publishing, and a 15 min window gives the aggregate used for neighbourhood noise. Because the accumulated quantity is energy — a sum of squares — the longer horizons cost nothing extra: one running sum is maintained and snapshotted at each horizon boundary.
 
-How good can this get? Kostoski compared the ICS-43434 build against a Brüel & Kjær 2250 class-1 meter and got agreement across roughly 35–116 dB SPL, with a theoretical **±1 dB(A)** over 20 Hz–20 kHz for the factory-calibrated mic. Not a legal instrument — microphone aging, enclosure acoustics and wind all go unhandled — but easily good enough for trend data. If you'd rather not write the firmware, stas-sl's ESPHome external component packages the same DSP; this article is for the node you build yourself.
+The achievable agreement is reported rather than derived. Kostoski gives a usable range of roughly **35–116 dB(A)** for an ICS-43434 build; the lower end is the microphone's own noise and the upper end its acoustic overload point. Microphone aging, enclosure acoustics and wind noise remain unhandled, so the node is a trend instrument, not a legal one. Where writing the firmware is not the objective, stas-sl's ESPHome external component packages equivalent processing.
 
-## Fitting it into the station
+## Fitting the node into the station
 
-Publish `laeq_1s` (or 1-min aggregates) next to PM2.5 and CO2 — MQTT discovery from the [previous article](/articles/iot-embedded/2026-08-15-home-assistant-mqtt-discovery-esp32/) makes it one more `cmps` entry with `unit_of_meas: "dB"`. Two integration notes: keep the mic port outside any sealed enclosure (a foam-plugged hole works), and don't share the I2S pins with anything — the 3.072 MHz bit clock radiates into sloppy wiring. Privacy is a design choice, not an accident: compute Leq on-device and publish only the number, never raw audio, and the node is a noise meter rather than a bug.
+The published channel is `laeq_1s`, or one-minute aggregates, alongside particulate matter and CO2; the MQTT discovery scheme from the [previous article](/articles/iot-embedded/2026-08-15-home-assistant-mqtt-discovery-esp32/) admits it as one further `cmps` entry with `unit_of_meas: "dB"`. Two physical constraints apply. The microphone port must sit outside any sealed enclosure — a foam-plugged hole suffices — because a sealed port measures the enclosure. And the I2S lines should not be shared with other signals: the bit clock runs at **3.072 MHz** for 48 kHz, 32-bit stereo frames, and couples into adjacent wiring.
 
-**Try next:** port the A-weighting biquads from esp32-i2s-slm into `read_block_db()`, play a 1 kHz tone at a known level, and check that A- and Z-weighted readings agree at 1 kHz (A-weighting is 0 dB there) but diverge hard on a 100 Hz tone.
+Privacy is determined by where the arithmetic happens. Computing Leq on-device and publishing only the scalar keeps raw audio off the network; publishing samples instead makes the same hardware a microphone in the other sense.
+
+A useful verification step is to port the A-weighting biquads into `read_block_db()`, play a 1 kHz tone at a known level, and confirm that A- and Z-weighted readings coincide at 1 kHz, where A-weighting is 0 dB, while diverging on a 100 Hz tone.
+
+## Pitfalls
+
+- **Levels 48 dB high and jittery at low amplitude**: the `>> 8` shift was omitted, so 24-bit data is read at 32-bit scale with an undefined low byte.
+- **Sample count off by four**: `i2s_channel_read` returns bytes in `n`, not samples; dividing the sum of squares by `n` rather than `n / 4` understates RMS.
+- **A floor near 40 dB(A) that never drops**: DC offset is being squared into the sum, or the reading is at the INMP441's 33 dBA SPL equivalent input noise, which no filtering removes.
+- **Silence or one channel of zeros**: the L/R pin is floating or the slot mask selects the right slot while the part transmits in the left.
+- **Absolute readings wrong by several dB between two identical boards**: the INMP441's sensitivity tolerance is ±3 dB per part; the calibration constant assumes the nominal -26 dBFS.
+- **Weighted readings wrong at every frequency but 1 kHz**: A-weighting biquad coefficients are sample-rate specific, and the esp32-i2s-slm set is designed for 48 kHz.
+- **Readings track wind rather than sources**: wind noise at the port is unhandled by A-weighting and appears as low-frequency energy.

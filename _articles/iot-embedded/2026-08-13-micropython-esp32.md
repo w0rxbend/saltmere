@@ -2,8 +2,8 @@
 title: "MicroPython on ESP32 in 2026: v1.28, Eight Chip Families, and a 30-Line Sensor Node"
 date: 2026-08-13
 track: iot-embedded
-summary: "MicroPython v1.28.0 (April 2026) runs on essentially the whole ESP32 family now — classic, S2, S3, C2, C3, C5, C6, P4. Where it earns a place next to ESP-IDF and Arduino in a sensor fleet, plus the full path from esptool flash to an SHT4x publishing over MQTT with umqtt in about 30 lines."
-reading_time: 5
+summary: "MicroPython v1.28.0 (April 2026) runs on essentially the whole ESP32 family — classic, S2, S3, C2, C3, C5, C6, P4. Where it earns a place next to ESP-IDF and Arduino in a sensor fleet, plus the path from esptool flash to an SHT4x publishing over MQTT with umqtt in about 30 lines."
+reading_time: 6
 tags: [micropython, esp32, mqtt, i2c, prototyping]
 sources:
   - title: "MicroPython downloads — ESP32-S3 firmware"
@@ -18,25 +18,27 @@ sources:
     url: "https://soldered.com/blogs/learn/micropython-vs-arduino"
 ---
 
-I write most of this journal in C against ESP-IDF, so it may surprise you that half my sensor bring-up happens in MicroPython first. In 2026 that's a more defensible position than ever: the port matrix caught up with Espressif's silicon, and the tooling matured into something you can hand a colleague.
+**Gist.** Bringing up an unfamiliar sensor against ESP-IDF (Espressif IoT Development Framework) costs a compile-flash-monitor cycle for every hypothesis about the part's register map. MicroPython replaces that cycle with an interactive read-eval-print loop (REPL) running **on the target device**, so a bus scan and a register poke are two lines typed at a prompt rather than two rebuilds. The cost is a bytecode virtual machine (VM) between the script and the silicon: slower wake, larger flash and RAM footprint, and no access to the ESP-IDF-level controls that battery and transport-security work depend on.
 
-## Where MicroPython stands in 2026
+## Port status
 
-Current release is **v1.28.0, out 6 April 2026**. The esp32 port now builds against ESP-IDF v5.3–v5.5.1 and covers essentially the whole family: classic ESP32, S2, S3, C2, C3, C5, and C6, plus the P4 — the C5 and P4 gained board profiles in v1.27.0 (December 2025), and v1.28 added boards like the SparkFun Thing Plus ESP32-C5 and Seeed XIAO ESP32-C6. Headline language feature this cycle: PEP 750 template strings and nested f-strings, which is more CPython compatibility than you might expect from a microcontroller runtime. Firmware images for S3 want 4 MiB+ flash and auto-detect SPIRAM.
+The current release is **v1.28.0 (April 2026)**. The esp32 port builds against a pinned ESP-IDF v5.x — the port's build instructions name the exact supported range, and building against an unlisted version is unsupported rather than merely untested. Board profiles cover the classic ESP32, S2, S3, C2, C3, C5 and C6, plus the P4; the newer families arrived later than the classic parts, so a given board's profile may postdate the silicon by several releases.
 
-## When I reach for it (and when I don't)
+S3 firmware is published as **several variants per flash and SPIRAM (serial peripheral interface RAM, the external pseudo-static RAM attached over SPI) configuration**. The download page names the variant a given board needs; the generic image is not universal across S3 modules.
 
-**Reach for it:** sensor bring-up and prototyping. An interactive REPL on the device means I can probe an I2C bus, poke registers, and have a new sensor decoded in minutes — no compile-flash-monitor loop. Also: bench rigs, calibration jigs, one-off data-collection nodes, and anything a Python-fluent, C-shy collaborator needs to maintain.
+## Where the runtime fits
 
-**Don't:** the battery fleet. A MicroPython node wakes slower (VM boot plus script compile), eats a few hundred KB more flash and tens of KB more RAM, and gives you no access to the knobs I lean on in ESP-IDF — TLS session tickets, fine Wi-Fi power-save tuning, ULP coprocessor tricks. `machine.deepsleep()` works fine, but at thousands of wake cycles the boot overhead is real battery. Arduino sits in the middle: C++ performance with friendlier APIs, covered in the core 3.x article.
+The distinction that matters is between rigs whose cost is *engineering time* and fleets whose cost is *energy and attack surface*.
 
-Two nuances worth knowing before you commit. Performance: interpreted bytecode is slow, but the `@micropython.native` and `@micropython.viper` decorators compile hot functions to machine code, and tight bit-banging belongs in the C modules the firmware already ships (`machine.I2C`, `machine.bitstream`) — so "Python is slow" rarely bites at sensor cadences of seconds. Security: `umqtt.simple` accepts an `ssl` context, so TLS to the broker works, but you're managing CA certificates by hand and paying the mbedTLS handshake on every reconnect with none of the session-resumption control ESP-IDF gives you — fine for a lab, thin for a hostile network.
+**Suited:** sensor bring-up and prototyping, bench rigs, calibration jigs, one-off data-collection nodes, and any device that a Python-fluent, C-averse collaborator must maintain. The REPL makes an I2C (inter-integrated circuit) bus probe interactive: scan, write a command byte, read the response, decode by hand.
 
-The honest framing: MicroPython is where firmware ideas get cheap to test. Winners get rewritten in C; plenty of rigs never need to be.
+**Not suited:** the battery fleet. A MicroPython node **wakes more slowly** — the VM must boot and the script must be compiled — carries **the whole interpreter in flash and a resident heap in RAM** whether or not the script uses them — no published measurement separates the two footprints across comparable applications — and exposes none of the controls ESP-IDF does: TLS (transport layer security) session tickets, fine-grained Wi-Fi power-save tuning, ULP (ultra-low-power) coprocessor use. `machine.deepsleep()` functions correctly; across thousands of wake cycles the per-boot overhead is a measurable battery cost. Arduino occupies the middle position: C++ performance with friendlier application programming interfaces (APIs).
 
-## Flashing it
+Two qualifications. **Performance:** interpreted bytecode is slow, but the `@micropython.native` and `@micropython.viper` decorators compile annotated functions to machine code, and tight bit-banging belongs in the C modules the firmware already ships — `machine.I2C`, `machine.bitstream`. At sensor cadences measured in seconds, the interpreter is not the bottleneck. **Security:** `umqtt.simple` accepts an `ssl` context, so TLS to the broker works, but **certificate-authority (CA) material is managed by hand and the full mbedTLS handshake is paid on every reconnect**, with none of the session-resumption control ESP-IDF offers. That is adequate on a lab network and thin on a hostile one.
 
-Two tools, both pip-installable: `esptool` to flash firmware, `mpremote` to talk to the running board. For an S3 (note: app offset is 0 on S3/S2/C3; the classic ESP32 uses 0x1000 — the download page for each board states it):
+## Flashing
+
+Two tools, both installable with pip: `esptool` writes firmware, `mpremote` talks to the running board. The **application offset differs by chip family — 0 on S3, S2 and C3, and 0x1000 on the classic ESP32** — and each board's download page states the correct value. Writing an image at the wrong offset produces a board that resets in a loop with no usable REPL.
 
 ```bash
 pip install esptool mpremote
@@ -48,11 +50,13 @@ mpremote                          # opens a REPL on the auto-detected port
 mpremote mip install umqtt.simple # install the MQTT client onto the board
 ```
 
-`mip` is MicroPython's on-device package installer, and `mpremote` proxies it through your PC's network connection — no Wi-Fi setup needed just to install libraries.
+`mip` is MicroPython's on-device package installer. `mpremote` proxies it over the serial link through the host's network connection, so no Wi-Fi credentials are required on the board to install a library.
 
-## A 30-line air node: SHT4x → MQTT
+## A 30-line air node: SHT4x to MQTT
 
-The SHT4x is the easiest Sensirion part to drive raw: one command byte, wait, read six bytes. No driver library needed. Save as `main.py` and copy with `mpremote fs cp main.py :main.py`:
+The SHT4x is the simplest Sensirion part to drive without a driver library: **write one command byte, wait, read six bytes**. The six bytes are temperature high, temperature low, cyclic redundancy check (CRC), humidity high, humidity low, CRC. Both 16-bit words are converted with the fixed affine transforms the part defines over the full 0–65535 range.
+
+Saved as `main.py` and copied with `mpremote fs cp main.py :main.py`:
 
 ```python
 import time, network, machine
@@ -84,8 +88,24 @@ while True:
     time.sleep(10)
 ```
 
-That's the entire node. Things I'd add before trusting it: CRC-8 checks on bytes 2 and 5 (I covered the Sensirion CRC algorithm in the SEN5x article — it's identical here), a try/except around `publish` that reconnects on `OSError`, and `machine.deepsleep(10_000)` instead of `time.sleep(10)` if it ever leaves the bench. For development, skip `main.py` entirely and iterate with `mpremote run node.py` — the script executes from your PC against the live board, which is the fastest firmware feedback loop that exists on this hardware.
+Three properties of this listing are load-bearing and three omissions are deliberate.
 
-The debugging experience deserves a sentence: when the node misbehaves, `mpremote` drops you into a REPL *on the misbehaving device*, where you can call `read_sht4x()` by hand and inspect state. Compare that to adding printf and reflashing, and you understand why prototypes start here.
+The **10 ms sleep between the command write and the read is not optional**: the high-precision command `0xfd` starts a conversion, and a read issued before it completes is not answered. The **clamp on relative humidity** is a consequence of the affine transform, whose range extends past the physically meaningful 0–100 % band. The **`keepalive=120`** argument sets the MQTT keepalive interval in seconds; `umqtt.simple` does not send pings on its own timer, so a broker will disconnect a node that stays inside the publish loop longer than the interval without traffic.
 
-**Try next:** flash v1.28.0 on a spare S3 board, then run `mpremote` and scan your I2C bus interactively with `machine.I2C(0, scl=machine.Pin(9), sda=machine.Pin(8)).scan()` — whatever addresses come back, you're three REPL lines from reading the part.
+Omitted: **CRC-8 verification of bytes 2 and 5**, which is the same Sensirion algorithm covered in the SEN5x article; a **`try`/`except` around `publish` that reconnects on `OSError`**, without which one dropped TCP connection ends the loop; and **`machine.deepsleep(10_000)` in place of `time.sleep(10)`** for anything that leaves bench power. Note that `deepsleep` is not a substitute drop-in — it restarts the program from the top, so Wi-Fi association and the MQTT connect are re-paid each cycle, which is the same per-boot overhead that rules the runtime out of battery fleets.
+
+## The development loop
+
+For iteration, `main.py` can be skipped entirely: `mpremote run node.py` executes a host-side script against the live board without writing it to flash. When a node misbehaves, `mpremote` opens a REPL **on the misbehaving device**, where `read_sht4x()` can be called by hand and interpreter state inspected directly. The comparison is against inserting a print statement and reflashing.
+
+The framing this supports: MicroPython is where firmware ideas become cheap to test. Ideas that survive get rewritten in C; many bench rigs never need to be.
+
+## Pitfalls
+
+- **Firmware written at the wrong offset boots into a reset loop.** The application offset is 0 on S3, S2 and C3 but 0x1000 on the classic ESP32; a single flash command reused across families produces an unbootable board with no REPL to diagnose it.
+- **Reading the SHT4x before the conversion finishes returns no data.** The `0xfd` command needs its measurement interval; dropping the 10 ms sleep turns a working driver into an I2C read error.
+- **Skipping the CRC bytes silently accepts corrupt readings.** Bytes 2 and 5 exist because the I2C line can glitch; ignoring them lets a bit-flipped word through as a plausible temperature.
+- **An unguarded `publish` ends the loop on the first network hiccup.** `umqtt.simple` raises `OSError` on a broken socket and does not reconnect; without a handler the node stops publishing and looks dead.
+- **A publish interval longer than the keepalive drops the connection.** `umqtt.simple` does not ping autonomously, so a node that sleeps past `keepalive` seconds without traffic is disconnected by the broker.
+- **Replacing `time.sleep` with `machine.deepsleep` restarts the script from the top.** State held in module-level variables, the Wi-Fi association and the MQTT session do not survive; the code must be restructured, not one line edited.
+- **TLS to the broker re-handshakes on every reconnect.** `umqtt.simple` takes an `ssl` context but gives no session-resumption control, so a flapping link pays the full mbedTLS handshake each time.

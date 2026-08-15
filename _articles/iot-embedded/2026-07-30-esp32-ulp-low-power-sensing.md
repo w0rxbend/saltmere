@@ -2,8 +2,8 @@
 title: "Sampling a sensor while the ESP32 sleeps: the ULP coprocessor"
 date: 2026-07-30
 track: iot-embedded
-summary: "Deep sleep saves current, but a sleeping ESP32 can't watch a sensor. The ULP coprocessor can — it runs a tiny program in RTC power domain while both main cores are off, samples an ADC or GPIO, and wakes the CPU only when a threshold trips. Here's the ULP-RISC-V/LP-core programming model and the µA math that justifies it."
-reading_time: 5
+summary: "Deep sleep saves current, but a sleeping ESP32 cannot watch a sensor. The ultra-low-power (ULP) coprocessor can: it runs a small program in the RTC power domain while both main cores are off, samples an ADC channel or GPIO, and wakes the CPU only when a threshold trips. This article covers the ULP-RISC-V and LP-core programming model and the microamp arithmetic that justifies it."
+reading_time: 6
 tags: [esp32, ulp, low-power, deep-sleep, esp-idf, risc-v, coprocessor]
 sources:
   - title: "ULP RISC-V Coprocessor Programming (ESP32-S3) — ESP-IDF Programming Guide"
@@ -18,25 +18,25 @@ sources:
     url: "https://lastminuteengineers.com/esp32-sleep-modes-power-consumption/"
 ---
 
-The [deep-sleep article](/articles/iot-embedded/2026-07-26-esp32-deep-sleep-power) got a periodic node down to single-digit microamps by shutting off both main cores and waking on an RTC timer. That works when your schedule is *time*-driven — sample every five minutes. It falls apart when the schedule is *event*-driven: wake when the water level crosses a line, when a door opens, when a gas reading spikes. A sleeping CPU sees none of that, and waking every few seconds just to check burns the battery you were trying to protect.
+**Gist.** Deep sleep on an ESP32 shuts down both main cores, so a node cannot observe a sensor between wake-ups; an event-driven condition — a water level crossing a line, a door opening — is invisible until the next timer wake, and polling on a fast timer spends the current that deep sleep was meant to save. The ultra-low-power (ULP) coprocessor resides in the real-time-clock (RTC) power domain, which remains powered during deep sleep, and is relaunched by the RTC timer to sample RTC-connected peripherals and signal a wake-up only when a condition is met. The cost is a raised sleep floor — monitoring with the ULP at roughly a 1 % duty cycle averages roughly **100 µA** against the **single-digit-to-10 µA** of a bare RTC-timer sleep — so the arrangement pays only when the monitored event is rare.
 
-The ULP coprocessor is the answer. It's a tiny processor that lives in the RTC power domain, which stays powered during deep sleep. It runs your program on a timer while the main cores are dark, reads RTC-connected peripherals, and pokes the CPU awake only when your condition is met. Duty-cycled polling at microamp cost.
+The [deep-sleep article](/articles/iot-embedded/2026-07-26-esp32-deep-sleep-power) reached single-digit microamps for a node whose schedule is *time*-driven: sample every five minutes. The ULP addresses the *event*-driven case, where the sampling instant is determined by the physical world rather than by a clock.
 
-## Three flavors, know which chip you have
+## Three coprocessor variants
 
-There isn't one ULP — there are three, and the programming model differs:
+There is no single ULP. Three exist, and the programming model differs between them.
 
 | Coprocessor | Chips | Programmed in |
 |---|---|---|
 | FSM ULP | ESP32, ESP32-S2, ESP32-S3 | Assembly or C macros |
 | ULP-RISC-V | ESP32-S2, ESP32-S3 | Standard C |
-| LP core (RV32I) | ESP32-C6, ESP32-C5, ESP32-P4 | Standard C |
+| LP core | ESP32-C6, ESP32-C5, ESP32-P4 | Standard C |
 
-The original **FSM ULP** is a quirky finite-state-machine core with a handful of instructions; you write it in a special assembly or fiddly C-macro DSL. It's capable but painful. On the S2/S3 you can skip it entirely and use the **ULP-RISC-V** core, which runs ordinary C compiled by the RISC-V toolchain. The newest parts (C6, C5, P4) ship an **LP core** — a fuller RV32IMAC processor that can reach more peripherals and even stay running as a low-power companion while the main CPU is active. The ULP-RISC-V and LP-core APIs are nearly identical in shape (`ulp_riscv_*` vs `ulp_lp_core_*`), so porting between them is mechanical. This article uses ULP-RISC-V for the sensor example and shows the LP-core variant at the end.
+The original **finite-state-machine (FSM) ULP** exposes a small instruction set and is programmed either in a dedicated assembly dialect or through a C-macro domain-specific language. On the S2 and S3 the **ULP-RISC-V** core is available instead and runs ordinary C compiled by the RISC-V toolchain. The C6, C5 and P4 carry an **LP (low-power) core**, a RISC-V processor that reaches more peripherals and can also run while the main CPU is active, as a low-power companion rather than only as a sleep-time monitor. The two C-programmable APIs differ mainly by prefix (`ulp_riscv_*` against `ulp_lp_core_*`), so a port between them is largely mechanical. The example below uses ULP-RISC-V, with the LP-core form given afterwards.
 
-## The ULP program: sample and decide
+## The ULP program: sample, compare, signal
 
-A ULP-RISC-V app is a separate C file that gets cross-compiled and embedded as a binary blob in your main firmware. Here's one that reads an ADC channel and wakes the CPU only when the reading exceeds a threshold. Any global you declare here becomes visible to the main CPU.
+A ULP-RISC-V application is a separate C translation unit, cross-compiled and embedded as a binary blob inside the main firmware image. Every global declared in it is visible to the main CPU through a generated header.
 
 ```c
 // ulp/main.c  — runs on the ULP-RISC-V core
@@ -54,7 +54,7 @@ volatile uint32_t wake_count   = 0;
 
 int main(void)
 {
-    uint16_t raw = ulp_riscv_adc_read_channel(ADC_UNIT, ADC_CHANNEL);
+    int32_t raw = ulp_riscv_adc_read_channel(ADC_UNIT, ADC_CHANNEL);
     last_reading = raw;
 
     if (raw > THRESHOLD) {
@@ -66,11 +66,11 @@ int main(void)
 }
 ```
 
-There's no `while(1)` loop and no sleep call inside the ULP. The main CPU configures a wake period; the RTC timer relaunches `main()` on each tick, the code runs to completion in microseconds, and the core halts until the next tick. State you want to keep — `wake_count`, `last_reading` — lives in globals, which persist in RTC memory across relaunches.
+The control flow is the load-bearing detail: **the ULP program contains no `while (1)` loop and no sleep call.** The main CPU configures a wake period; on each RTC-timer tick the coprocessor re-enters `main()` from the top, runs to completion, and halts until the next tick. Because each launch starts a fresh invocation, **all state that must survive between samples lives in globals held in RTC memory** — `wake_count` and `last_reading` here. Local variables do not persist across relaunches.
 
 ## The main-CPU side: load, run, sleep
 
-The main firmware compiles the ULP program (via the `ulp_embed_binary` CMake helper), loads the blob into RTC memory, starts it, arms the ULP wakeup source, and drops into deep sleep. The build system auto-generates `ulp_main.h` exposing your ULP globals as `ulp_last_reading`, `ulp_wake_count`, etc.
+The main firmware compiles the ULP program through the `ulp_embed_binary` CMake helper, loads the blob into RTC memory, starts the coprocessor, arms the ULP wake-up source, and enters deep sleep. The build system generates `ulp_main.h`, which exposes the ULP globals under the `ulp_` prefix as `ulp_last_reading`, `ulp_wake_count` and so on.
 
 ```c
 #include "esp_sleep.h"
@@ -107,13 +107,15 @@ void app_main(void)
 }
 ```
 
-On the very first boot you also initialize the ADC for ULP use on the main side with `ulp_riscv_adc_init()` (an `ulp_riscv_adc_cfg_t` naming the unit, channel, and attenuation) before launching the ULP — the ULP core reads the channel but the calibration/config is set up by the CPU. Watching a **GPIO threshold** instead of an ADC is the same skeleton: in the ULP, `ulp_riscv_gpio_init(pin)` then poll `ulp_riscv_gpio_get_level(pin)`, calling `ulp_riscv_wakeup_main_processor()` on the edge you care about. Espressif's `system/ulp/ulp_riscv/gpio` example is exactly this.
+`app_main` therefore implements a two-state machine keyed on `esp_sleep_get_wakeup_cause()`: **the cold-boot branch installs and starts the coprocessor, and the ULP-wake branch reads the shared variables and performs the real measurement.** Both branches converge on re-arming the wake-up source and re-entering deep sleep, so the ULP is loaded once and survives subsequent sleep cycles.
 
-## Does it actually save current?
+Division of responsibility for the analogue-to-digital converter (ADC) matters. On first boot the main CPU calls `ulp_riscv_adc_init()` with an `ulp_riscv_adc_cfg_t` naming the unit, channel and attenuation before launching the coprocessor: **the ULP core performs the conversion, but the configuration and calibration are established by the CPU.** Watching a **GPIO level** instead uses the same skeleton — `ulp_riscv_gpio_init(pin)` followed by polling `ulp_riscv_gpio_get_level(pin)` and calling `ulp_riscv_wakeup_main_processor()` on the transition of interest. Espressif's `system/ulp/ulp_riscv/gpio` example follows this shape.
 
-Yes, decisively, when your event is rare. From the ESP32 datasheet figures: pure deep sleep with just the RTC timer and RTC memory sits around **6–10 µA**, while running the ULP to monitor a sensor at a ~1% duty cycle averages about **100 µA**. Against an active core — tens of milliamps, e.g. an ESP32-S3-WROOM-1 module draws roughly **23.9 mA active** versus **8.1 µA in plain deep sleep** — even 100 µA is three orders of magnitude cheaper than keeping the CPU awake to poll.
+## Current arithmetic
 
-The LP-core parts do better still. Espressif's own LP-core walkthrough measures a C6 running a periodic LP-core task at about **20 µA during the short wake-ups and 10 µA between them** — genuinely microamp-class continuous sensing. The LP-core code is the same story with renamed calls:
+The figures determine whether the arrangement is worthwhile. Deep sleep with only the RTC timer and RTC memory retained sits at **roughly 10 µA or below**; the ULP sensor-monitored pattern — the coprocessor waking on its timer at roughly a 1 % duty cycle — is quoted at **about 100 µA**. A main core that is awake and running draws **tens of milliamps**, three orders of magnitude more, so even the raised ULP floor is far cheaper than polling from the CPU. Exact figures are per-chip and per-module; the datasheet for the specific part is the only reliable source.
+
+The LP-core parts land lower still, and Espressif's LP-core walkthrough shows a C6 running a periodic LP-core task in the low tens of microamps. The LP-core startup path is the same sequence under renamed calls, with the timer period supplied in the configuration structure rather than through a separate setter:
 
 ```c
 ulp_lp_core_cfg_t cfg = {
@@ -127,6 +129,15 @@ ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
 esp_deep_sleep_start();
 ```
 
-The decision rule: if your trigger fires often, the ULP's ~100 µA overhead may not beat just waking the CPU on a fast timer. If your trigger is rare — a threshold crossed once an hour — the ULP lets you watch continuously for the price of a coin cell's self-discharge.
+The resulting decision rule is a comparison of averages. A frequently firing trigger wakes the main CPU often enough that the ULP's standing overhead is not recovered, and a plain fast RTC-timer wake may consume less. A rare trigger — a threshold crossed once an hour — makes continuous monitoring available for a standing current two to three orders of magnitude below an awake CPU.
 
-**Try next:** flash Espressif's `examples/system/ulp/ulp_riscv/adc` on an S3 (or `ulp_lp_core/lp_adc` on a C6), put a multimeter in series with the 3.3 V rail, and watch the average current while you sweep the sensor past your threshold — then compare it to the same node polling from the main CPU.
+**Try next:** flash Espressif's `examples/system/ulp/ulp_riscv/adc` on an S3, or the corresponding `examples/system/ulp/lp_core` example on a C6, place a multimeter in series with the 3.3 V rail, and record average current while the sensor is swept past the threshold; compare against the same node polling from the main CPU.
+
+## Pitfalls
+
+- **A sensor on a pin that is not RTC-capable is unreadable during deep sleep.** The ULP reaches RTC-domain peripherals only; a GPIO outside that domain loses power with the main cores, so the poll returns nothing useful.
+- **Expecting local variables to persist across launches produces a monitor with no memory.** The RTC timer re-enters `main()` each cycle rather than resuming it, so only globals in RTC memory carry state; a debounce counter held in a local resets on every tick.
+- **Omitting `ulp_riscv_adc_init()` on the CPU side leaves the ADC unconfigured.** The coprocessor reads a channel whose unit, attenuation and calibration were never established, and the raw counts compared against the threshold are not the intended measurement.
+- **Omitting `esp_sleep_enable_ulp_wakeup()` before sleeping discards the wake signal.** The ULP still detects the event and still calls `ulp_riscv_wakeup_main_processor()`, but the wake-up source is not armed and the CPU stays asleep.
+- **Re-running `start_ulp()` on every boot re-loads the binary and clears accumulated state.** Guarding the branch on `esp_sleep_get_wakeup_cause()` is what keeps `wake_count` meaningful across sleep cycles.
+- **A trigger that fires frequently inverts the saving.** At high event rates the ULP's standing current is added to main-CPU wake-ups that would have happened anyway, and average current exceeds the timer-polled arrangement it replaced.

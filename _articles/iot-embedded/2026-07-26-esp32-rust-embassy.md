@@ -2,8 +2,8 @@
 title: "Async embedded Rust on the ESP32: Embassy + esp-hal"
 date: 2026-07-26
 track: iot-embedded
-summary: "A no_std tour of the esp-rs stack — esp-hal plus the Embassy async executor — for event-driven sensor nodes. Toolchain setup with espup, a minimal await-on-a-timer task, and how it stacks up against ESP-IDF/FreeRTOS."
-reading_time: 5
+summary: "A no_std tour of the esp-rs stack — esp-hal plus the Embassy async executor — for event-driven sensor nodes: toolchain constraints imposed by the Xtensa backend, a minimal await-on-a-timer task, and a comparison with ESP-IDF/FreeRTOS."
+reading_time: 6
 tags: [esp32, rust, embassy, esp-hal, async, no_std, espflash, espup]
 sources:
   - title: "esp-hal — no_std HALs for ESP32 (esp-rs)"
@@ -18,22 +18,23 @@ sources:
     url: "https://github.com/esp-rs/espup"
 ---
 
-My air-quality nodes spend almost all their time doing nothing: wait for a timer, read a sensor over I2C, publish, sleep. That is the shape async was invented for. On the ESP32 you no longer have to reach for ESP-IDF and FreeRTOS in C to get it — the `esp-rs` project ships a mature bare-metal Rust stack, and it pairs cleanly with the Embassy executor. This is the Rust angle to the same hardware the rest of this track covers.
+**Gist.** An air-quality sensor node spends nearly all of its wall-clock time waiting — for a timer, for an inter-integrated-circuit (I2C) transaction, for a network publish to complete — and a superloop or a real-time operating system (RTOS) charges either busy-polling or one preallocated stack per concurrent activity for that waiting. The `esp-rs` stack answers with **`esp-hal`**, a bare-metal (`no_std`) hardware abstraction layer, plus **Embassy**, a `no_std` async executor that multiplexes cooperatively scheduled `async fn` tasks **on a single stack**, suspending the whole set when every task is awaiting. The cost is cooperative scheduling — a task that never reaches an `.await` starves the others — and an ecosystem that is younger and less driver-complete than ESP-IDF, with the Embassy initialisation entry point still moving between releases.
 
 ## The no_std picture
 
-Two crates carry the weight:
+Two crates carry the weight.
 
-- **`esp-hal`** — a bare-metal (`no_std`) hardware abstraction layer maintained by `esp-rs`, on its 1.x line. No RTOS, no C, no `libc` — it talks directly to the peripherals. It covers the whole family: the Xtensa parts (ESP32, ESP32-S2, ESP32-S3) and the RISC-V parts (ESP32-C2/C3/C5/C6/C61, ESP32-H2, ESP32-P4).
-- **Embassy** — a `no_std` async executor and timer/HAL ecosystem. You write `async fn` tasks, `.await` on timers and peripherals, and the executor multiplexes them cooperatively on a single stack.
+**`esp-hal`** is a bare-metal hardware abstraction layer (HAL) maintained by the `esp-rs` project, on its 1.x line. It requires no RTOS, no C, and no `libc`; it drives the peripheral registers directly. Coverage spans both instruction-set families in the ESP32 line: the **Xtensa** parts (ESP32, ESP32-S2, ESP32-S3) and the **RISC-V** parts (ESP32-C2/C3/C5/C6/C61, ESP32-H2, ESP32-P4).
 
-Why async instead of a superloop or a hand-rolled RTOS? An event-driven sensor node is a set of independent "wait, then do a little work" loops. With Embassy each becomes a task that `.await`s. While one task waits on a 2-second `Timer`, the executor runs others or puts the core to sleep — no busy-polling, no manually juggling FreeRTOS task priorities and stack sizes. You get concurrency without threads, and the borrow checker still enforces that your ISR and your task don't race over shared state.
+**Embassy** supplies the async executor together with a timer and HAL ecosystem, also `no_std`. Tasks are written as `async fn` and suspend at `.await` points on timers and peripherals.
 
-One current-facts note worth flagging: as `esp-hal` moved to 1.x the Embassy integration glue has been reshuffled between releases (the old `esp-hal-embassy` init path is being folded into an `esp-rtos`-style runtime crate). The concepts below are stable; the exact init call name is the thing most likely to have shifted, so scaffold from an up-to-date `esp-rs` template and let `cargo build` guide any import fixes.
+The structural argument for async here is that an event-driven node decomposes into independent "wait, then perform a short burst of work" loops. Each loop becomes a task. **While one task awaits a two-second `Timer`, the executor either runs a ready task or, when none is ready, has no work to poll** — no busy-polling loop, and no per-task stack sizing or priority assignment of the kind FreeRTOS requires. Concurrency is obtained without threads. Rust's borrow-checking rules continue to apply across the interrupt-service-routine (ISR) boundary, so shared state reached from both an ISR and a task must be expressed in a type the compiler accepts rather than by convention.
 
-## Toolchain: espup, and the Xtensa catch
+One moving part deserves explicit flagging rather than confident detail: **as `esp-hal` moved to its 1.x line, the Embassy integration glue has been reshuffled between releases**, with the former `esp-hal-embassy` initialisation path being folded into an `esp-rtos`-style runtime crate. The mechanisms described below are stable; the name of the initialisation call is the element most likely to have changed, so the reliable procedure is to scaffold from a current `esp-rs` template and let `cargo build` surface the import corrections.
 
-The one thing to know before you `cargo build`: **the Xtensa targets are not upstream in the Rust compiler.** LLVM's Xtensa backend isn't in stock `rustc`, so for the classic ESP32 and the S2/S3 you install Espressif's Rust fork with **`espup`**. RISC-V chips (the -C and -H series) need no fork — they build on plain stable Rust.
+## Toolchain: espup, and the Xtensa constraint
+
+The constraint that determines the whole setup is this: **the Xtensa targets are not upstream in the Rust compiler.** LLVM's Xtensa backend is absent from stock `rustc`, so the classic ESP32 and the S2/S3 require Espressif's Rust fork, installed by **`espup`**. The RISC-V chips (the -C and -H series) need no fork; they build on plain stable Rust, because their backend is upstream.
 
 | Chip family | Arch | Toolchain | Target triple |
 |---|---|---|---|
@@ -46,11 +47,11 @@ For a classic ESP32 (Xtensa):
 ```bash
 cargo install espup --locked
 espup install                 # installs the esp Rust + LLVM fork
-. $HOME/export-esp.sh         # put the esp fork on PATH (source per shell)
-cargo install espflash --locked   # the flasher/monitor
+. $HOME/export-esp.sh         # puts the esp fork on PATH; source per shell
+cargo install espflash --locked   # flasher and serial monitor
 ```
 
-For a RISC-V part like the ESP32-C3, skip `espup` entirely:
+For a RISC-V part such as the ESP32-C3, `espup` is not involved:
 
 ```bash
 rustup toolchain install stable --component rust-src
@@ -58,9 +59,11 @@ rustup target add riscv32imc-unknown-none-elf
 cargo install espflash --locked
 ```
 
+The `. $HOME/export-esp.sh` step is per-shell state, not a persistent installation record: a shell that has not sourced it resolves `cargo` to the stock toolchain, which has no Xtensa target.
+
 ## A minimal Embassy task
 
-Here is a self-contained node: main blinks a status LED on a 500 ms cadence, while a spawned task wakes every 2 seconds to sample a sensor. Both use `embassy_time::{Timer, Duration}` and neither blocks the other. (Init/module paths on this fast-moving stack drift between releases — treat this as the shape, not a pinned copy-paste.)
+The following node runs two concurrent activities: `main` toggles a status light-emitting diode (LED) on a 500 ms cadence, and a spawned task wakes every 2 s to sample a sensor. Both suspend through `embassy_time::{Timer, Duration}`, so neither blocks the other. Initialisation and module paths on this stack drift between releases; the listing shows the shape rather than a pinned copy.
 
 ```rust
 #![no_std]
@@ -76,19 +79,19 @@ use esp_hal::{
 use esp_backtrace as _;      // panic + backtrace handler
 use esp_println::println;    // println! over the UART
 
-#[esp_hal::main]
+#[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Hand a timer to the Embassy runtime: this installs the async time
-    // driver and starts the executor. (Init entry point varies by release.)
+    // Handing a hardware timer to the Embassy runtime installs the async time
+    // driver that backs Timer. (Init entry point varies by release.)
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_hal_embassy::init(timg0.timer0);
 
     spawner.spawn(sensor_task()).unwrap();
 
-    // Drive the on-board LED from main; await instead of a busy delay.
+    // The LED loop suspends at .await rather than spinning in a busy delay.
     let mut led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
     loop {
         led.toggle();
@@ -108,26 +111,37 @@ async fn sensor_task() {
 }
 ```
 
-Wire `espflash` in as the Cargo runner in `.cargo/config.toml`:
+The load-bearing line is `esp_hal_embassy::init(timg0.timer0)`: **the executor's notion of time is backed by a concrete hardware timer group**, so `Timer::after` resolves to a hardware deadline rather than a counted delay loop. `main` is itself a task; its `loop` returns control at each `.await`, which is the only point at which `sensor_task` can be resumed.
+
+`espflash` is wired in as the Cargo runner through `.cargo/config.toml`:
 
 ```toml
 [target.'cfg(any(target_arch = "riscv32", target_arch = "xtensa"))']
 runner = "espflash flash --monitor"
 ```
 
-Now `cargo run --release` builds, flashes over USB, and drops you into a serial monitor showing the `println!` output. (Or invoke it directly: `espflash flash --monitor target/xtensa-esp32-none-elf/release/my-app`.)
+With that runner in place, `cargo run --release` builds, flashes over universal serial bus (USB), and opens a serial monitor carrying the `println!` output. The equivalent direct invocation is `espflash flash --monitor target/xtensa-esp32-none-elf/release/my-app`.
 
-## How it compares to ESP-IDF / FreeRTOS
+## Comparison with ESP-IDF / FreeRTOS
 
 | | esp-hal + Embassy (Rust) | ESP-IDF + FreeRTOS (C) |
 |---|---|---|
 | Runtime | `no_std`, no RTOS required | FreeRTOS tasks + IDF services |
 | Concurrency | async tasks on one stack | preemptive threads, per-task stacks |
-| Waiting | `.await` a timer/peripheral | block a task or poll |
+| Waiting | `.await` a timer or peripheral | block a task or poll |
 | Memory safety | compiler-enforced | manual |
-| Wi-Fi / BLE stack | via esp-rs radio crates (`no_std`) | mature, first-party |
-| Maturity | fast-moving, 1.x | battle-tested, huge ecosystem |
+| Wi-Fi / Bluetooth Low Energy | via esp-rs radio crates (`no_std`) | first-party, long-established |
+| Maturity | fast-moving, 1.x | long-established, large ecosystem |
 
-The honest trade-off: ESP-IDF is the incumbent with the deepest driver and connectivity support, and if you need the full networking stack it is still the safer bet. But for a battery-minded sensor node, Embassy's await-and-sleep model is a better structural fit than a superloop, and Rust's guarantees remove a whole class of ISR/shared-state bugs before the board even powers on.
+The trade-off is asymmetric by area rather than uniform. ESP-IDF is the incumbent with the deepest driver and connectivity coverage, and a design that depends on the full networking stack is better served there. For a battery-oriented sensor node whose duty cycle is dominated by waiting, the await-and-suspend model matches the workload's structure more closely than a superloop, and the compiler rejects a class of ISR/shared-state aliasing errors before the board is powered.
 
-**Try next:** swap the `println!` stub for a real `embassy`-friendly I2C read — bring up an SEN5x over `esp-hal`'s async I2C in `sensor_task`, and add a second task that debounces the BOOT button with `.await` so a press forces an immediate sample.
+**Extension.** Replacing the `println!` stub with an SEN5x read over `esp-hal`'s async I2C exercises the peripheral-await path rather than only the timer path; adding a second task that debounces the BOOT button through `.await` introduces an event source that is not timer-driven.
+
+## Pitfalls
+
+- **A task that computes without reaching an `.await` stops every other task.** Scheduling is cooperative on a single stack, so a long blocking loop inside one task is not preempted; the LED cadence visibly stalls.
+- **A blocking delay primitive defeats the model.** Spinning in a busy delay rather than awaiting a `Timer` keeps the executor from finding an idle point, so nothing else runs and the core does not become idle.
+- **Building for the ESP32/S2/S3 in a shell that has not sourced `export-esp.sh` fails at target resolution**, because stock `rustc` has no Xtensa backend; the symptom is an unknown-target error rather than a compile error in the code.
+- **Copying an initialisation snippet across `esp-hal` releases breaks the build**, since the Embassy integration path has been reshuffled during the 1.x transition — the failure appears as an unresolved import or missing function, not as misbehaviour at runtime.
+- **Omitting a panic handler crate such as `esp_backtrace` fails the link in `no_std`**, where no default handler exists; the `use esp_backtrace as _;` line is load-bearing despite naming nothing.
+- **Sharing state between an ISR and a task through a plain mutable static does not compile**, and substituting an `unsafe` block to force it reintroduces exactly the data race the type system was rejecting.

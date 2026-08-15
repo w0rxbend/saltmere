@@ -1,9 +1,9 @@
 ---
-title: "ESP-NOW for Battery Sensor Nodes: Wake, Blast, Sleep"
+title: "ESP-NOW for Battery Sensor Nodes: Wake, Transmit, Sleep"
 date: 2026-07-27
 track: iot-embedded
-summary: "Why ESP-NOW's connectionless frames beat Wi-Fi + MQTT for battery air-quality nodes, with an ESP-IDF send/recv example and a gateway that bridges to MQTT."
-reading_time: 5
+summary: "ESP-NOW's connectionless frames against Wi-Fi plus MQTT for battery air-quality nodes: payload and peer limits, the channel constraint, an ESP-IDF send/receive pair, and a gateway that bridges to MQTT."
+reading_time: 7
 tags: [esp32, esp-now, low-power, deep-sleep, mqtt, sensors]
 sources:
   - title: "ESP-NOW — ESP-IDF Programming Guide (stable, ESP32)"
@@ -16,23 +16,27 @@ sources:
     url: "https://developer.espressif.com/blog/2024/08/arduino-esp-now-lib/"
 ---
 
-In the [SEN5x + MQTT article](/articles/iot-embedded/2026-07-24-esp32-sen5x-air-quality-mqtt/) the node associated with an access point, waited for DHCP, opened a TCP socket, and did an MQTT handshake before a single PM2.5 reading left the board. For a mains-powered gateway that is fine. For a coin-cell or 18650 air-quality node that wakes once a minute, the association and DHCP dance can burn more energy than the measurement itself. ESP-NOW removes that whole stack.
+**Gist.** A battery-powered sensor node that reports once a minute over conventional Wi-Fi must associate with an access point (AP), obtain an address by Dynamic Host Configuration Protocol (DHCP), open a Transmission Control Protocol (TCP) socket and complete a Message Queuing Telemetry Transport (MQTT) handshake before the first measurement leaves the board — a multi-step exchange whose energy cost can exceed the measurement itself. ESP-NOW removes that stack: it is a connectionless protocol carried in Wi-Fi action frames, addressed by peer Media Access Control (MAC) address, so a node can wake, transmit one frame and sleep without any association. The cost is that everything the discarded stack provided must be supplied elsewhere — there is no routing, no fragmentation beyond a small frame limit, no channel negotiation, and no delivery guarantee past a single MAC-layer acknowledgement.
 
-## What ESP-NOW actually is
+The [SEN5x + MQTT article](/articles/iot-embedded/2026-07-24-esp32-sen5x-air-quality-mqtt/) describes the association-based path. It suits a mains-powered gateway. It suits a coin-cell or 18650 node poorly.
 
-ESP-NOW is Espressif's connectionless Wi-Fi protocol. It rides on the Wi-Fi radio using action frames, but there is no association, no AP, no DHCP, and no TCP/IP. You hand it a peer MAC address and a buffer; it puts a short frame on the air. Because there is no handshake, a node can boot from deep sleep, transmit a reading, and go back to sleep in a few milliseconds instead of the hundreds of milliseconds a full Wi-Fi association takes. That latency delta is the entire reason ESP-NOW fits battery sensors.
+## What ESP-NOW is
 
-It is supported across the ESP32 family (ESP32, S2, S3, C3, C6, and newer parts) and even ESP8266, so a cheap node and a beefier gateway can talk.
+ESP-NOW is Espressif's connectionless Wi-Fi protocol. It uses the Wi-Fi radio and Wi-Fi action frames, but performs no association, requires no AP, and carries no Internet Protocol (IP) stack. The application supplies a peer MAC address and a buffer; the driver places a short frame on the air. **Because there is no handshake, the awake window is bounded by the time to configure the radio and transmit one frame, rather than by a multi-round association and address-assignment exchange.** That difference in awake time is the reason the protocol suits battery sensors.
 
-## Payload limits and peers
+The protocol is supported across the ESP32 family (ESP32, S2, S3, C3, C6 and newer parts) and on ESP8266, so an inexpensive node and a larger gateway part can interoperate.
 
-Per the [ESP-IDF ESP-NOW docs](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/network/esp_now.html), the classic maximum payload is **250 bytes** (`ESP_NOW_MAX_DATA_LEN`). This is the number to design around today, and it is plenty: a struct with a few floats, a battery voltage, and a sequence counter is well under it. Newer v2.0 devices raise the ceiling to **1470 bytes** (`ESP_NOW_MAX_DATA_LEN_V2`), but v1.0 peers still cap a single frame at 250, so keep sensor payloads small for interoperability.
+## Payload and peer limits
 
-Other limits worth knowing: up to **20 total peers**, of which no more than **17** can use encryption (default 7). A frame can be unicast to one peer's MAC or broadcast to `ff:ff:ff:ff:ff:ff` (no ack, no encryption). Broadcast is handy for one-to-many telemetry; unicast gives you a per-send delivery status in the callback.
+Per the [ESP-IDF ESP-NOW documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/network/esp_now.html), the classic maximum payload is **250 bytes** (`ESP_NOW_MAX_DATA_LEN`). A packed structure holding a few floats, a battery voltage and a sequence counter is far below that bound. Devices implementing v2.0 raise the ceiling to **1490 bytes** (`ESP_NOW_MAX_DATA_LEN_V2`), but a v1.0 peer still caps a single frame at 250 bytes, so a payload that must reach mixed peers is constrained by the lower figure.
 
-## Channel constraint
+Two further limits shape the topology: **at most 20 peers in total, of which at most 17 may use encryption** (the default configuration allows 7). A frame is either unicast to one peer's MAC address or broadcast to `ff:ff:ff:ff:ff:ff`. **Broadcast frames are neither acknowledged nor encrypted;** unicast frames yield a per-send delivery status in the send callback. One-to-many telemetry therefore trades away the only delivery signal the protocol offers.
 
-ESP-NOW has no channel negotiation. If you pass channel `0` to `esp_now_add_peer`, the frame goes out on whatever channel the radio is currently on. Otherwise the peer's channel must match the local device's channel. This matters for the gateway (below): once it connects to your home Wi-Fi, the router pins its channel, and every sensor node must transmit on that same channel or the frames are never heard.
+## The channel constraint
+
+ESP-NOW performs no channel negotiation. Passing channel `0` to `esp_now_add_peer` means the frame is transmitted on whichever channel the radio currently occupies; any other value must match the local device's channel. The invariant is blunt: **sender and receiver must be on the same Wi-Fi channel at the moment of transmission, and nothing in the protocol discovers or corrects a mismatch.** The failure mode is silent. A node on channel 1 sending to a gateway parked on channel 6 receives no error at the application programming interface (API) level; the send callback reports failure only for unicast, and the frames are never heard.
+
+This binds the gateway design. A gateway that also associates with a router inherits the router's channel, and every sensor node must transmit on that same channel. A router that performs automatic channel selection can move that channel without notice.
 
 ## A sensor node in ESP-IDF
 
@@ -78,13 +82,17 @@ void app_main(void) {
 }
 ```
 
-## How deep sleep rewrites the flow
+Two details in that listing are load-bearing. **Station mode must be started but must not associate** — the radio is required, the association is not. And the deep-sleep call sits in the send callback rather than after `esp_now_send`, because the send call returns before the frame has been handed to the air.
 
-There is no persistent connection to keep alive, so the loop is stateless: **deep-sleep timer wakes the chip, `app_main` runs top to bottom, one frame goes out, the send callback confirms the ack, and the node sleeps again.** Nothing is retained between cycles except what you stash in RTC memory (a sequence counter is worth keeping there to detect drops). Contrast this with the association-per-wake pattern from the [ESP32 deep-sleep article](/articles/iot-embedded/2026-07-26-esp32-deep-sleep-power/): here the radio is on for a single frame, not a multi-step handshake, so the awake window shrinks dramatically. Don't block waiting in `app_main` after `esp_now_send`; let the callback drive the transition to sleep so you never sleep before the frame is actually transmitted.
+## The wake cycle as a state machine
+
+There is no connection to keep alive, so the cycle is stateless and linear: **the deep-sleep timer wakes the chip, `app_main` runs from the top, one frame is queued, the send callback reports the MAC-layer acknowledgement, and the node re-enters deep sleep.** Deep sleep does not preserve ordinary random-access memory, so nothing survives a cycle except what is written to real-time clock (RTC) memory. A sequence counter kept there lets the gateway detect gaps, which is the only drop signal available for broadcast traffic and a cross-check on the acknowledgement for unicast.
+
+The association-per-wake pattern discussed in the [ESP32 deep-sleep article](/articles/iot-embedded/2026-07-26-esp32-deep-sleep-power/) keeps the radio powered for a multi-step handshake. Here the radio is powered for one frame. The saving is proportional to the difference in awake time, which is why the measurement below is the one worth taking.
 
 ## The gateway: ESP-NOW to MQTT
 
-The gateway is a mains-powered ESP32 that never sleeps. It runs Wi-Fi in station mode and stays connected to your router, so it also has ESP-NOW available on that same channel. Its receive callback unpacks each struct and republishes it over MQTT, reusing the broker and topic scheme from the SEN5x article.
+The gateway is a mains-powered ESP32 that does not sleep. It runs Wi-Fi in station mode, stays associated with the router, and has ESP-NOW available on that same channel. Its receive callback unpacks each structure and republishes the reading over MQTT, reusing the broker and topic scheme from the SEN5x article.
 
 ```c
 static void on_recv(const esp_now_recv_info_t *info,
@@ -100,6 +108,16 @@ static void on_recv(const esp_now_recv_info_t *info,
 }
 ```
 
-Register it with `esp_now_register_recv_cb(on_recv)` after `esp_now_init()`. The sensor MAC in `src_addr` becomes the node identity in the topic, so you never have to configure IDs on the nodes themselves. The result: nodes that spend 99% of their life asleep, a gateway that turns their frames into normal MQTT the rest of your stack already understands.
+The callback is registered with `esp_now_register_recv_cb(on_recv)` after `esp_now_init()`. **The length check is the only validation an unencrypted ESP-NOW receiver gets for free:** any device within range can transmit a frame to a known MAC address, and a frame of the wrong size is the cheapest thing to reject. The source MAC address in `src_addr` supplies the node identity used in the topic, which removes any need to provision identifiers on the nodes.
 
-**Try next:** Flash the node and gateway, put a multimeter or a power profiler in series with the node's battery, and compare the total charge (mAh) per wake cycle against the same reading sent over full Wi-Fi + MQTT — the ESP-NOW path should be a fraction of the association-based one.
+A useful measurement: place a multimeter or power profiler in series with the node's battery and compare total charge (mAh) per wake cycle against the same reading delivered over associated Wi-Fi and MQTT.
+
+## Pitfalls
+
+- **A channel mismatch produces no error and no log line.** The receiving radio never sees the frame, and a broadcast sender has no acknowledgement to fail on, so the gateway stays quiet; the symptom is a node that appears healthy and a topic that never updates.
+- **A router with automatic channel selection breaks a working deployment overnight.** The gateway follows the router to the new channel; the nodes, which hard-code a channel, do not.
+- **Calling `esp_deep_sleep` immediately after `esp_now_send` can cut the transmission.** `esp_now_send` returns before the frame is on the air, so the sleep transition must be driven from the send callback.
+- **Broadcast frames carry no acknowledgement and no encryption.** A design that switches from unicast to broadcast for fan-out silently loses its only per-frame delivery signal.
+- **Exceeding 250 bytes breaks interoperability rather than failing loudly on the sender.** A v2.0 sender may accept a payload up to 1490 bytes that a v1.0 peer cannot receive.
+- **The peer table is finite.** With a maximum of 20 peers, and at most 17 encrypted, a deployment that grows past those counts requires broadcast or multiple gateways rather than more `esp_now_add_peer` calls.
+- **Values in ordinary RAM do not survive deep sleep.** A sequence counter kept outside RTC memory restarts at its initial value every cycle, making drop detection at the gateway meaningless.

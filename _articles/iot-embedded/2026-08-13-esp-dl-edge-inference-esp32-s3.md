@@ -2,7 +2,7 @@
 title: "Edge Inference on the ESP32-S3 with ESP-DL: ONNX to .espdl, and What the Vector ISA Buys"
 date: 2026-08-13
 track: iot-embedded
-summary: "Running quantized neural nets on the ESP32-S3 with Espressif's ESP-DL v3.3 and the esp-ppq quantization toolchain: why the S3's SIMD instructions matter, the ONNX-to-.espdl workflow with espdl_quantize_onnx, loading and running a model from the C++ side, and realistic expectations for anomaly detection on sensor data."
+summary: "Running quantized neural networks on the ESP32-S3 with Espressif's ESP-DL v3 and the esp-ppq quantization toolchain: the role of the S3's SIMD instructions, the ONNX-to-.espdl workflow through espdl_quantize_onnx, model loading and execution from C++, and how to size an anomaly-detection workload against the part."
 reading_time: 6
 tags: [esp32-s3, esp-dl, edge-ai, quantization, tinyml]
 sources:
@@ -18,22 +18,26 @@ sources:
     url: "https://github.com/espressif/esp-ppq"
 ---
 
-My air-quality fleet has a classification problem: which "CO2 spike" is a meeting room filling up, and which is a sensor drifting into nonsense? Threshold rules got me 80% of the way; the last 20% wants a model. Cloud inference means shipping every raw window upstream — exactly the traffic a fleet design tries to avoid — so the interesting question is what actually runs *on* the node. On the ESP32-S3, the answer in 2026 is Espressif's own stack: **ESP-DL** for inference, **esp-ppq** for quantization. The ESP-DL v3 line has been iterating fast — the component registry is at v3.3.9 as of this month — and it requires ESP-IDF v5.3 or newer.
+**Gist.** Distinguishing a genuine carbon-dioxide (CO2) event from sensor drift is a classification problem that threshold rules solve only partially, and solving it in the cloud requires uploading every raw sensor window — the traffic a fleet design exists to avoid. Espressif's **ESP-DL** inference runtime plus the **esp-ppq** quantization toolchain move the model onto the node, executing an int8-quantized network directly on the ESP32-S3. The cost is a lossy conversion: the model must be post-training quantized against real calibration data, the resulting artefact is bound to one target chip, and the operator set the network may use is restricted to what ESP-DL implements.
 
-## Why the S3 specifically
+The ESP-DL v3 line iterates quickly; the ESP Component Registry lists a **3.3.x** release at the time of writing, and the registry entry records a **minimum ESP-IDF version** that has moved upward across the v3 line, so the required IDF release should be read from the component manifest rather than assumed.
 
-The S3's Xtensa LX7 cores carry Espressif's processor instruction extensions: 128-bit-wide SIMD operations that do multiple int8 multiply-accumulates per cycle — exactly the inner loop of a quantized convolution or matrix multiply. ESP-DL's operator kernels are hand-optimized in assembly for the S3 (and for the RISC-V ESP32-P4). The framework technically supports nine chips including the classic ESP32 and the C-series, but on those the operators fall back to plain C implementations, and Espressif's own docs say execution is "significantly slower." Practical translation: prototype wherever you like, but if inference latency matters, the S3 or P4 is the target. The P4 also gets a better quantization scheme (more below), which makes it the pick for bigger models.
+## Chip selection
 
-## The toolchain: ONNX in, .espdl out
+The S3's Xtensa LX7 cores carry Espressif's processor instruction extensions: **128-bit-wide single-instruction-multiple-data (SIMD) operations** performing several int8 multiply-accumulate steps per cycle. That operation is the inner loop of a quantized convolution or general matrix multiply (GEMM), so the extension maps directly onto the dominant cost of inference. ESP-DL's operator kernels are hand-written in assembly for the S3 and for the RISC-V ESP32-P4.
 
-ESP-DL runs its own format, `.espdl` — FlatBuffers-based, zero-copy deserialization, int8 or int16 quantized. You get there with esp-ppq, Espressif's fork of the PPQ quantization framework:
+The framework also targets parts without those extensions, including the original ESP32 and the C-series. On those parts the operators fall back to plain C implementations, and Espressif's documentation warns that execution is much slower without quantifying the gap. **Prototyping is portable; latency is not.** The P4 additionally receives a finer quantization scheme for Conv and GEMM (below), which is the relevant distinction for larger models.
+
+## Quantization: ONNX in, .espdl out
+
+ESP-DL executes its own container format, `.espdl` — FlatBuffers-based, deserialized without copying, holding int8 or int16 quantized weights. The producer is esp-ppq, Espressif's fork of the PPQ quantization framework:
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install esp-ppq
 ```
 
-Train in PyTorch, export to ONNX (TensorFlow/TFLite users convert with tf2onnx first), then run post-training quantization with a calibration set of real sensor windows:
+The path is: train in PyTorch, export to Open Neural Network Exchange (ONNX) format — TensorFlow and TFLite models convert through `tf2onnx` first — then run post-training quantization against a calibration set drawn from real sensor windows.
 
 ```python
 from esp_ppq.api import espdl_quantize_onnx
@@ -51,11 +55,15 @@ quantized_graph = espdl_quantize_onnx(
 )
 ```
 
-You get three files: the deployable `.espdl` (viewable in Netron), an `.info` text dump for debugging, and a `.json` with the quantization metadata. Details that matter: the S3 uses per-tensor symmetric quantization with power-of-two scales; the P4 upgrades Conv and GEMM to per-channel, which is why the same model often keeps more accuracy there. And `.espdl` files are **target-specific** — an `esp32s3` model produces wrong results on other chips, so quantize per target. Before touching hardware, run the returned graph through esp-ppq's `TorchExecutor` on your validation set; the docs commit to bit-exact alignment between PC simulation and on-device inference, and that promise held in my testing.
+Three files result: the deployable `.espdl` (inspectable in Netron), an `.info` text dump for debugging, and a `.json` carrying the quantization metadata.
 
-## Running it on the node
+Two properties of the conversion are load-bearing. First, the scheme differs by target: **the S3 uses per-tensor symmetric quantization with power-of-two scales, while the P4 raises Conv and GEMM to per-channel quantization**. Per-channel assigns each output channel its own scale, so a channel whose weights occupy a narrow range is no longer forced to share a scale with a wide-range channel; the same network therefore tends to retain more accuracy on the P4. Second, **`.espdl` artefacts are target-specific** — a file quantized for `esp32s3` produces incorrect results on another chip rather than failing to load, so quantization must be repeated per target.
 
-The C++ side is compact. Embed the model in flash rodata (or a dedicated partition — better, since `idf.py app-flash` then skips re-flashing the model during development):
+The returned graph should be evaluated on the validation set through esp-ppq's `TorchExecutor` before any hardware is involved. The ESP-DL documentation states that PC-side simulation and on-device inference agree numerically, which makes the host-side result an admissible proxy for on-device accuracy.
+
+## Execution on the node
+
+The model is embedded either in flash read-only data (rodata) or in a dedicated partition. The partition arrangement is preferable during development because `idf.py app-flash` then rewrites only the application and leaves the model image in place.
 
 ```cpp
 #include "dl_model_base.hpp"
@@ -85,12 +93,22 @@ for (int i = 0; i < 64; i++) {
 // err above threshold => reconstruction failed => anomalous window
 ```
 
-Because you exported `export_test_values`, call `model->test()` once at bring-up: it runs the embedded test vector and returns `ESP_OK` only if on-device output matches the PC-side result. That one call has caught every misquantized deployment I've attempted.
+The detector is an autoencoder: the network is trained to reconstruct normal windows, so a large squared reconstruction error indicates a window unlike the training distribution. Note that the tensors expose an `exponent` rather than a floating-point scale — a direct consequence of the power-of-two scale constraint, which reduces rescaling to a shift.
 
-## Realistic expectations
+When the model was exported with `export_test_values=True`, **`model->test()` runs the embedded test vector and returns `ESP_OK` only if the on-device output matches the PC-side result**. Calling it once at bring-up converts a silent numerical mismatch — the failure mode of a mis-targeted or mis-quantized artefact — into an explicit error code.
 
-Keep the problem small and the S3 is genuinely fast. A 64-sample autoencoder like the one above — a few thousand parameters — is low single-digit milliseconds per window; effectively free next to a 10-second sample cadence, and cheaper than radioing raw windows upstream. Keyword spotting on audio features lands in the tens of milliseconds; Espressif's esp-sr wake-word stack runs continuously on S3-based products, so that class of workload is proven. Small-image classification runs at hundreds of milliseconds — fine for "photo per minute," not for video.
+## Sizing the workload
 
-Three sharp edges. First, check `operator_support_state.md` in the repo **before** designing your network; an exotic activation or unsupported op stops the export. Second, batch size is fixed at 1 — no batching tricks. Third, memory: by default parameters are copied to RAM for speed, and PSRAM makes life much easier; the `param_copy=false` constructor flag keeps weights in flash at a real latency cost. Quantization accuracy loss on 8-bit was under a percent for my autoencoder, but always validate with `TorchExecutor` on held-out data — and if accuracy craters, esp-ppq's newer AutoQuant tooling searches mixed strategies before you resort to quantization-aware training.
+No published benchmark covers this class of model on the S3, so the sizing below is an ordering of workloads by cost rather than a set of measured figures; the only reliable number is the one obtained by timing the target network on the target part with `esp_timer_get_time()` around `model->run()`.
 
-**Try next:** clone esp-dl and run the `quantize_sin_model` tutorial end-to-end — train, quantize with `espdl_quantize_onnx`, flash to an S3, and confirm `model->test()` returns `ESP_OK` — before trying it with your own sensor data.
+A 64-sample autoencoder of a few thousand parameters, as above, is dominated by a handful of small GEMMs and is inexpensive relative to a sampling cadence measured in seconds — and cheaper in energy than transmitting the raw window over Wi-Fi. Keyword spotting on audio features is heavier by roughly the ratio of multiply-accumulates involved, but is demonstrated in shipping hardware: Espressif's esp-sr wake-word stack runs continuously on S3-based products. Image classification is heavier again, and the practical question is whether the per-inference time fits inside the duty cycle, not whether it runs at all.
+
+Accuracy loss from 8-bit post-training quantization is model-specific and must be measured against a validation set rather than assumed. Where it degrades badly, esp-ppq supports raising sensitive layers to 16-bit rather than quantizing the whole graph to 8, which is a lower-effort step than retraining under quantization-aware training.
+
+## Pitfalls
+
+- **An unsupported operator fails at export, after the network is already trained.** ESP-DL implements a fixed operator set; an exotic activation function has no kernel. Consult `operator_support_state.md` in the repository during network design rather than after.
+- **A model quantized for one target returns wrong numbers on another, not an error.** The S3 and P4 use different quantization schemes, and a mismatch surfaces as wrong output rather than a load failure. Re-run `espdl_quantize_onnx` per target.
+- **Batching does not exist.** `input_shape` fixes the batch dimension at 1; a design that assumes amortization of per-inference overhead across a batch has no path to it.
+- **Parameters are copied into RAM by default.** On a part without pseudo-static RAM (PSRAM) a model that fits in flash can still exhaust the heap at construction. The `param_copy=false` constructor flag leaves weights in flash and pays a per-access latency penalty instead.
+- **Calibration consumes only `calib_steps` batches, not the whole loader.** Activation ranges are derived from that subset, so a loader whose first batches are unrepresentative of production data yields scales that clip real inputs. The accuracy loss surfaces only after deployment unless `TorchExecutor` is run on held-out data first.

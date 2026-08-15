@@ -1,9 +1,9 @@
 ---
-title: "Talking CAN bus from an ESP32 with the built-in TWAI controller"
+title: "CAN bus on the ESP32 through the built-in TWAI controller"
 date: 2026-07-31
 track: iot-embedded
-summary: "The ESP32 has a CAN 2.0 controller on-chip — Espressif calls it TWAI for trademark reasons. All you add is a cheap transceiver. Here's the wiring, the bit-timing that trips everyone up, and a minimal send/receive so you can pull live data off a vehicle or wire a robust multi-drop sensor bus."
-reading_time: 5
+summary: "The ESP32 carries an on-chip CAN 2.0 controller, named TWAI in Espressif documentation. Only an external transceiver is added. This covers the wiring, the bit-timing agreement the bus depends on, and a minimal transmit/receive path."
+reading_time: 6
 tags: [esp32, twai, can-bus, esp-idf, transceiver, sensors]
 sources:
   - title: "ESP-IDF Programming Guide — Two-Wire Automotive Interface (TWAI), v6.0"
@@ -18,11 +18,13 @@ sources:
     url: "https://github.com/espressif/esp-idf/tree/master/examples/peripherals/twai/twai_self_test"
 ---
 
-CAN bus is the quiet workhorse of anything with wheels or a factory floor: two wires, differential signalling, arbitration built into the protocol so nodes never corrupt each other, and it shrugs off electrical noise that would wreck I2C over any real distance. If you have an air-quality node in a garage, a robot with limbs, or you want to sniff a car's OBD-II port, CAN is the right bus. The good news is the ESP32 already has a CAN 2.0 controller inside it. Espressif can't call it "CAN" (trademark), so in the docs it's the **TWAI** — Two-Wire Automotive Interface. Same thing.
+**Gist.** A multi-drop sensor or vehicle bus needs collision-free media access and immunity to electrical noise over metres of cable, which single-ended buses such as I2C do not provide. Controller Area Network (CAN) supplies both: a differential pair carries the signal, and non-destructive bitwise arbitration on the frame identifier resolves simultaneous transmissions without corrupting either frame. The cost is a payload ceiling of **eight bytes per classic CAN 2.0 data frame**, a bitrate every node must share exactly, and an external transceiver the ESP32 does not integrate.
 
-## The one part you must add: a transceiver
+Espressif documents the ESP32's on-chip CAN 2.0 controller as the **Two-Wire Automotive Interface (TWAI)**; the peripheral implements the CAN protocol described in the Bosch CAN Specification 2.0.
 
-The ESP32's TWAI controller speaks the CAN *protocol*, but its pins are plain 3.3 V logic. A CAN bus runs a differential pair (CAN_H / CAN_L) at higher swing. So **you need an external transceiver** between the ESP32 and the bus — there is no on-chip one. The standard choice for 3.3 V is the **TI SN65HVD230** (or the MCP2551 if you level-shift). Wiring:
+## The transceiver is a required part
+
+The TWAI controller emits and samples plain 3.3 V logic on two pins, TX and RX. The bus itself is a differential pair, CAN_H and CAN_L, driven at a larger swing. **No transceiver is integrated on the ESP32**, so an external one converts between the two domains. The **TI SN65HVD230** is a 3.3 V-supply part that pairs directly; the MCP2551 is a 5 V part and requires level shifting on the receive path.
 
 ```
 ESP32 GPIO21 (TX) ----> transceiver TXD
@@ -31,11 +33,11 @@ transceiver CANH/CANL --> the two-wire bus
 120 Ω termination resistor at EACH physical end of the bus
 ```
 
-The two `120 Ω` terminators are not optional. Miss them and you'll get reflections and random bit errors that look like software bugs but aren't.
+The two `120 Ω` terminators are load-bearing. **Termination at both physical ends only** — not at intermediate nodes, and not a single resistor — matches the cable impedance; without it the driven edge reflects off the unterminated end and returns to corrupt the sample point, producing intermittent bit errors whose symptom (frames failing checksum, error counters climbing) resembles a firmware fault.
 
-## Bit timing is where projects die
+## Bit timing, and why a mismatch produces silence rather than noise
 
-Every node on a CAN bus must agree on the bitrate *exactly*, and TWAI configures this through three structs. ESP-IDF ships convenience macros so you don't hand-calculate the segments:
+CAN has no separate clock line. Receivers recover timing from edges in the bit stream, which the transmitter guarantees by **bit stuffing**: after five consecutive bits of the same polarity, a complementary bit is inserted. Every node therefore has to divide its own clock into the same nominal bit time and place its sample point compatibly. ESP-IDF supplies timing macros so the segment values are not hand-computed:
 
 ```c
 #include "driver/twai.h"
@@ -47,9 +49,9 @@ twai_timing_config_t  t = TWAI_TIMING_CONFIG_500KBITS();   // 500 kbit/s
 twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL(); // no HW filtering
 ```
 
-`500 kbit/s` is the common OBD-II rate; the macro family also gives you `_250KBITS`, `_1MBITS`, etc. The rule that catches everyone: **the whole bus must use one bitrate.** A node set to 250k on a 500k bus doesn't get garbled data — it gets *nothing*, because it never sees a valid frame boundary. Check this first when a node goes silent.
+`500 kbit/s` is the common OBD-II rate; the macro family also provides `_250KBITS` and `_1MBITS`, among others. **The entire bus must run one bitrate.** A node configured for 250 kbit/s on a 500 kbit/s bus does not deliver garbled payloads to the application — it delivers no frames at all, while its receive path registers bit, stuff and form errors and its error counters climb. In normal mode those errors are signalled on the bus as error frames, so a mis-timed node also disturbs the traffic between the nodes that agree. A node that has gone silent is worth checking against this before any protocol-level debugging.
 
-## Install, start, send, receive
+## Install, start, transmit, receive
 
 ```c
 void app_main(void) {
@@ -75,11 +77,17 @@ void app_main(void) {
 }
 ```
 
-A CAN data frame carries at most **8 bytes** (`data_length_code` 0–8) — that limit is fundamental to classic CAN 2.0, and it shapes how you design messages: pack a couple of sensor readings per frame, don't try to stream. The 11-bit **identifier** doubles as the arbitration priority: **lower ID wins the bus**, so put your urgent messages on low IDs. (Extended 29-bit IDs exist via `.extd = 1` when 2048 standard IDs aren't enough.)
+`twai_transmit` enqueues the frame; the timeout bounds how long the call blocks when the transmit queue is full, not how long the frame takes to win arbitration. A driver install takes three separate configuration structures — general (pins, mode, queue depths), timing, and acceptance filter — and all three are fixed at install time.
 
-## Reading the bus health, and a safety valve
+### The identifier is the priority
 
-TWAI implements CAN's error-confinement automatically: a node that keeps failing to transmit climbs its error counters and eventually drops to **bus-off**, going silent to protect the bus. Watch for it and recover:
+A classic CAN 2.0 data frame carries **at most 8 bytes**, encoded in `data_length_code` (0–8). The limit is a property of the frame format, so a design that needs to move more than 8 bytes must fragment across frames at the application layer; packing a small number of sensor readings per frame fits the format, streaming does not.
+
+The 11-bit standard **identifier doubles as the arbitration key**. Arbitration is bitwise and non-destructive: nodes transmit the identifier while monitoring the bus, and a node that sends a recessive bit but reads a dominant one loses and stops, leaving the winner's frame intact and uninterrupted. Because dominant bits win, **the numerically lower identifier takes the bus**, so latency-critical messages belong on low identifiers. Setting `.extd = 1` selects the 29-bit extended identifier format when the 11-bit space is insufficient.
+
+## Error confinement and the listen-only escape hatch
+
+TWAI implements CAN's error confinement without application involvement. Each node maintains transmit and receive error counters; repeated transmit failures drive the counters up, and past the confinement thresholds the node reaches **bus-off**, where it stops participating entirely so that one faulty node cannot hold the bus down. Bus-off is not self-clearing from the application's point of view — recovery is requested explicitly:
 
 ```c
 twai_status_info_t s;
@@ -89,6 +97,18 @@ if (s.state == TWAI_STATE_BUS_OFF) {
 }
 ```
 
-If you're just *listening* to a car and never want to perturb the bus, install with `TWAI_MODE_LISTEN_ONLY` — the controller ACKs nothing and can't transmit, so you can sniff OBD-II traffic with zero risk of injecting a frame. (Newer ESP-IDF v6 also ships a redesigned node-style driver in `esp_twai.h`; the `driver/twai.h` API shown here remains supported and is what the Arduino core wraps.)
+Recovery moves the driver toward `TWAI_STATE_STOPPED`; the driver is then restarted to rejoin the bus. Firmware that never polls `twai_get_status_info` observes a node that has silently stopped transmitting with no error returned by later calls.
 
-**Try next:** wire one ESP32 + SN65HVD230 to itself in `TWAI_MODE_NO_ACK` and run the `twai_self_test` example — it transmits and receives its own frames with no second node, proving your timing and transceiver wiring before you ever touch a real bus. Then bump to two boards at 500k and send a fake "PM2.5" reading from one to the other; you now have a noise-immune multi-drop sensor bus.
+For passive observation of a vehicle bus, installing with `TWAI_MODE_LISTEN_ONLY` prevents the controller from transmitting and from acknowledging received frames, so a sniffer cannot inject a frame or alter the acknowledgement of another node's frame. Recent ESP-IDF releases additionally ship a redesigned node-style driver in `esp_twai.h`; the `driver/twai.h` API shown here is the older one, and is the API the Arduino core wraps.
+
+The `twai_self_test` example validates timing and transceiver wiring before a second node exists: in `TWAI_MODE_NO_ACK` a single board transmits and receives its own frames, because that mode does not require an acknowledgement from another node.
+
+## Pitfalls
+
+- **A node delivers no frames at all rather than corrupted data.** Its bitrate differs from the bus bitrate, so reception fails outright and the error counters climb; a mismatch never degrades gracefully.
+- **Intermittent bit errors that move when the cable is touched.** Missing or misplaced `120 Ω` termination — terminators belong at the two physical ends of the bus only, and adding a third at a stub node is as damaging as omitting one.
+- **A node stops transmitting and no API call reports an error.** Error confinement has driven it to `TWAI_STATE_BUS_OFF`; without polling `twai_get_status_info` and calling `twai_initiate_recovery`, it stays silent for the life of the process.
+- **Recovery appears to complete but traffic never resumes.** `twai_initiate_recovery` leaves the driver stopped; the restart step is separate.
+- **A sniffer perturbs the bus it is observing.** Installing in `TWAI_MODE_NORMAL` makes the controller acknowledge every well-formed frame it receives, which is a transmission onto the bus; `TWAI_MODE_LISTEN_ONLY` suppresses it.
+- **A self-test in `TWAI_MODE_NORMAL` fails with no second node present.** Normal mode requires an acknowledgement from another node; `TWAI_MODE_NO_ACK` is what makes the single-board loopback complete.
+- **An 8-byte payload assumption breaks on a larger reading.** `data_length_code` is capped at 8 by the classic CAN 2.0 frame format, so oversized messages must be fragmented in application code rather than configured away.

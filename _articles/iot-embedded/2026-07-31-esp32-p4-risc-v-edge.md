@@ -1,9 +1,9 @@
 ---
-title: "The ESP32-P4: a RISC-V Application Processor That Brings Its Own Wi-Fi (Sort Of)"
+title: "The ESP32-P4: a RISC-V Application Processor Without a Radio"
 date: 2026-07-31
 track: iot-embedded
-summary: "Espressif's ESP32-P4 is a dual-core 400 MHz RISC-V SoC with a vector AI extension, MIPI display and camera interfaces, USB 2.0 High-Speed, and an H.264 encoder — but no radio. Here's what the silicon actually offers and how you get Wi-Fi and MQTT onto it by pairing it with an ESP32-C6."
-reading_time: 5
+summary: "Espressif's ESP32-P4 is a dual-core 400 MHz RISC-V SoC with a vector extension, MIPI display and camera interfaces, USB 2.0 High-Speed, and an H.264 encoder — but no radio. What the silicon offers, and how esp_hosted and esp_wifi_remote restore Wi-Fi and MQTT by pairing it with an ESP32-C6."
+reading_time: 6
 tags: [esp32, esp32-p4, risc-v, edge-ai, mipi, esp-idf]
 sources:
   - title: "ESP32-P4 High-performance SoC — product page (Espressif)"
@@ -18,37 +18,50 @@ sources:
     url: "https://github.com/espressif/esp-hosted-mcu/blob/main/docs/esp32_p4_function_ev_board.md"
 ---
 
-For years "ESP32" meant "a microcontroller with Wi-Fi baked in." The **ESP32-P4** breaks that assumption in both directions: it's Espressif's most capable application processor to date, and it has *no radio at all*. Announced in January 2023 and now shipping on dev boards, it's aimed at the jobs the classic ESP32 always struggled with — driving a real display, ingesting a camera, running edge vision — while leaving connectivity to a companion chip.
+**Gist.** The ESP32 family has, until now, equated "system-on-chip (SoC)" with "microcontroller that carries its own radio"; the ESP32-P4 is an application processor and carries no radio at all. The mechanism that restores connectivity is a two-chip split: a wireless companion SoC — an ESP32-C6 or ESP32-C5 — runs the radio and the Wi-Fi driver, while `esp_hosted` transports the driver's calls across a Secure Digital Input Output (SDIO), Serial Peripheral Interface (SPI) or Universal Asynchronous Receiver/Transmitter (UART) link and `esp_wifi_remote` re-exports the ordinary `esp_wifi_*` API on the application side. The cost is a second processor to power, provision and keep in firmware lockstep, plus a network stack whose data path now crosses a physical bus.
 
-## What's actually on the die
+## What is on the die
 
-The headline compute is a **dual-core 32-bit RISC-V high-performance core running up to 400 MHz** (RV32IMAFC with a single-precision FPU), plus a **third low-power RISC-V core at up to 40 MHz** for the always-on, sip-power duties. For signal and AI work there's a custom **128-bit vector (SIMD) extension** — complex multiply, add/sub, shift, compare — which is what makes on-device inference and DSP practical rather than aspirational.
+The ESP32-P4 was announced on 5 January 2023 and ships on development boards today. Its compute is a **dual-core 32-bit RISC-V high-performance core running at up to 400 MHz**, implementing RV32IMAFC with a single-precision floating-point unit (FPU), alongside a **third low-power RISC-V core at up to 40 MHz** for always-on duties. For digital signal processing (DSP) and inference work the high-performance cores carry a **custom vector (single instruction, multiple data, SIMD) instruction extension**.
 
-Around the cores, the P4 is built for interfaces the S3 never had:
+The peripheral set is where the P4 departs from the ESP32-S3 rather than merely outrunning it:
 
-- **MIPI-DSI, 2 data lanes** and **MIPI-CSI, 2 data lanes with an integrated ISP**, both handling up to 1080p — a real display *and* a real camera, not a bit-banged parallel LCD.
-- **USB 2.0 High-Speed OTG** at 480 Mbps.
-- An **H.264 hardware encoder** (up to 1080p at 30 fps per Espressif's product page), so a P4 can compress video on the fly instead of shipping raw frames.
-- **768 KB of high-performance L2 SRAM** plus 32 KB LP SRAM, and in-package **PSRAM options of 16 MB or 32 MB** — the Waveshare P4-Nano ships with 32 MB.
+- **Mobile Industry Processor Interface Display Serial Interface (MIPI-DSI) with 2 data lanes** and **MIPI-CSI (Camera Serial Interface) with 2 data lanes and an integrated image signal processor (ISP)**, both rated up to 1080p. This is a dedicated serial display and camera path rather than a parallel LCD bus driven from general-purpose I/O.
+- **USB 2.0 High-Speed On-The-Go (OTG)** at 480 Mbit/s.
+- An **H.264 hardware encoder**, so compressed video can leave the chip in place of raw frames.
+- **768 KB of high-performance L2 static RAM (SRAM)** plus 32 KB of low-power SRAM, and in-package **pseudo-static RAM (PSRAM) options up to 32 MB**. The Waveshare P4-Nano board ships a 32 MB part.
 
-That's a chip you'd reach for to build a smart display, a doorbell camera, or an air-quality station with a live graphing UI and on-device anomaly detection — the kind of thing that used to mean adding a Linux SBC.
+Those interfaces define the class of device the part addresses: a smart display, a camera doorbell, or an instrument with a live graphing user interface and on-device anomaly detection — work that previously implied a Linux single-board computer next to the microcontroller.
 
-## The missing radio, and how you fill it
+## The absent radio and the hosted architecture
 
-Here's the design tax: **no native Wi-Fi or Bluetooth.** Espressif's intended architecture is to pair the P4 with a wireless *companion* — an **ESP32-C6** (Wi-Fi 6 + BLE 5) or C5 — connected over SDIO, SPI, or UART. The reference boards (the ESP32-P4-Function-EV-Board and the Waveshare P4-Nano) wire a C6 to the P4 over SDIO and pre-flash it with hosted-slave firmware.
+The P4 has **no native Wi-Fi and no native Bluetooth**. Espressif's documented architecture pairs it with a wireless companion — the **ESP32-C6 (Wi-Fi 6 and Bluetooth Low Energy 5)** or the ESP32-C5 — over SDIO, SPI or UART. The reference hardware, the ESP32-P4-Function-EV-Board and the Waveshare P4-Nano, wires a C6 to the P4 over SDIO and pre-flashes the C6 with hosted-slave firmware.
 
-The software that makes this ergonomic is two layers: `esp_hosted` (the transport driver on both chips) and `esp_wifi_remote` (a shim so the ordinary `esp_wifi_*` and `esp-netif` calls you already know are forwarded transparently to the companion). The practical upshot is you write standard networking code and it "just works" over the link:
+Two software layers make the split usable. **`esp_hosted`** is the transport driver, present on both chips: the slave side runs the actual Wi-Fi driver and radio, the host side packages requests and carries network frames across the bus. **`esp_wifi_remote`** sits above it and re-exports the familiar `esp_wifi_*` and `esp-netif` surface on the P4, forwarding each call to the companion. The **property that carries the split is API compatibility**: application code that compiles against the ordinary ESP-IDF Wi-Fi and network interface API compiles unchanged, and the bus crossing is not visible in the source.
+
+A P4 project therefore configures the companion rather than the radio:
 
 ```bash
 idf.py set-target esp32p4
 idf.py add-dependency "espressif/esp_wifi_remote"
 idf.py add-dependency "espressif/esp_hosted"
-idf.py menuconfig       # pick the ESP32-C6 slave + SDIO transport
+idf.py menuconfig       # select the ESP32-C6 slave and the SDIO transport
 idf.py build flash monitor
 ```
 
-Because `esp_wifi_remote` intercepts the normal Wi-Fi API, you can then build the stock ESP-IDF examples unchanged — point `examples/protocols/mqtt` at your broker and it connects through the C6 as if the radio were on the P4 itself. Target support has been in mainline ESP-IDF since the v5.3 line, with current stable docs on the v6.0.x series.
+With that configuration in place the stock ESP-IDF protocol examples build as they stand: `examples/protocols/mqtt` pointed at a broker connects through the C6 as though the radio sat on the P4. Target support for the P4 arrived in the mainline ESP-IDF v5.3 line.
 
-The mental model shift is worth stating plainly: the P4 turns "ESP32 project" into a *two-chip* project, a fast application core plus a small wireless coprocessor, which is exactly the split you'd design at the board level for anything doing serious local compute anyway.
+The consequence for board design is that an "ESP32 project" becomes a **two-chip project** — an application core plus a wireless coprocessor — with a bus, a pin budget, two flash images and two power domains to account for.
 
-**Try next:** If you have a P4 dev board with an onboard C6, flash the `esp_hosted` slave firmware to the C6, then build and run the unmodified `examples/protocols/mqtt/tcp` on the P4 with `esp_wifi_remote` configured — publish a sensor reading to a public test broker and confirm it lands, all without a single line of P4-specific radio code. Then try the MIPI-CSI camera example to see the ISP path light up.
+### Where the boundary shows
+
+The abstraction is source-level, not behavioural. Every frame the P4 sends or receives traverses the host-to-slave link, so the SDIO, SPI or UART channel is the **throughput and latency ceiling of the whole network path**, independent of what the radio negotiates over the air. UART in particular is a far narrower channel than SDIO; the reference boards use SDIO. Likewise, the Wi-Fi state machine — scan, association, disconnection, reconnection — runs on the companion, and the P4 observes it only through events relayed across the transport. When the link stalls, the application sees a Wi-Fi API that stops answering rather than a bus that stopped moving bytes.
+
+## Pitfalls
+
+- **Selecting `esp32p4` and calling `esp_wifi_init()` without the hosted components fails to link or fails at runtime**, because the P4 has no radio driver of its own; the symbols come from `esp_wifi_remote`, which must be added as a dependency and configured for a specific slave and transport.
+- **Host and slave firmware are a matched pair.** Flashing a new `esp_hosted` host build onto the P4 while leaving stale slave firmware on the C6 produces a link that enumerates but then misbehaves on the protocol layer, not an obvious version error.
+- **Wi-Fi throughput measured on the P4 measures the transport, not the air interface.** A result well below the negotiated Wi-Fi rate is explained by the SDIO, SPI or UART channel and by the transport chosen in `menuconfig`, not by radio conditions.
+- **A UART transport chosen for pin economy silently caps the network.** The pin saving is real, and so is the bandwidth ceiling it imposes on every socket on the device.
+- **The low-power core and the companion are separate power problems.** Keeping the 40 MHz low-power RISC-V core awake for always-on duties does nothing to reduce the companion's draw; the C6 has its own power state, and an always-associated radio is an always-powered second chip.
+- **MIPI-DSI and MIPI-CSI are two-lane interfaces.** A panel or sensor requiring more than 2 data lanes does not attach to the P4's interface regardless of resolution headroom.

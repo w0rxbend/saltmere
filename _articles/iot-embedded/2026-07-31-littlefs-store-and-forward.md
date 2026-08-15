@@ -1,9 +1,9 @@
 ---
-title: "Store-and-forward on the ESP32: don't lose readings to a dropped network"
+title: "Store-and-forward on the ESP32 with LittleFS"
 date: 2026-07-31
 track: iot-embedded
-summary: "A field air-quality node that drops its samples every time Wi-Fi hiccups is worse than useless — the gaps are exactly when something interesting happened. LittleFS gives you a power-loss-safe log on flash; here's a buffer-and-replay design that survives outages and reboots."
-reading_time: 6
+summary: "A field air-quality node that discards samples whenever Wi-Fi drops loses precisely the interval of interest. LittleFS provides a power-loss-resilient log on flash; this article develops a buffer-and-replay design that survives outages and resets."
+reading_time: 7
 tags: [esp32, littlefs, mqtt, resilience, flash, esp-idf]
 sources:
   - title: "Creating an environmental logger, Part 1 — Espressif Developer Portal (Jul 2026)"
@@ -14,13 +14,13 @@ sources:
     url: "https://github.com/littlefs-project/littlefs"
 ---
 
-Your node reads a sensor every few seconds and publishes over MQTT. That works right up until the Wi-Fi drops, the broker restarts, or the uplink browns out — and now every reading taken during the gap is gone. For an air-quality node the outage window is often the *most* interesting data, so "publish or discard" is the wrong policy. The fix is store-and-forward: write every reading to local flash first, publish opportunistically, and replay whatever hasn't been acknowledged when the link returns.
+**Gist.** A sensor node that publishes each reading directly over Message Queuing Telemetry Transport (MQTT) loses every sample taken while the link is down, and on an air-quality node the outage interval is often the interval worth keeping. Store-and-forward inverts the order: each reading is appended to a local log on flash first, published opportunistically, and replayed from a persisted cursor once the link returns. The cost is bounded flash capacity, a retention policy that must decide explicitly what to discard when the backlog exceeds it, and duplicate deliveries that the consumer must absorb.
 
-## Why LittleFS for the buffer
+## Why LittleFS holds the buffer
 
-LittleFS is a **log-structured, power-loss-resilient** filesystem with built-in wear leveling — designed exactly for microcontrollers that can lose power mid-write. That last property matters: a battery node *will* reset at the worst possible moment, and LittleFS is built so a half-finished write can't corrupt the whole filesystem the way FAT can. On ESP-IDF it's a drop-in VFS via the `joltwallet/littlefs` component (Espressif's July 2026 logger tutorial uses it directly).
+LittleFS is a **log-structured, power-loss-resilient** filesystem with wear levelling, written for microcontrollers that can lose power mid-write. The relevant property for a battery node is that an interrupted write does not leave the filesystem in an inconsistent state the way a partially written File Allocation Table (FAT) directory entry can: LittleFS commits metadata changes atomically, so an unexpected reset yields either the state before the commit or the state after it. On ESP-IDF (Espressif IoT Development Framework) it is available as a Virtual File System (VFS) driver through the `joltwallet/littlefs` component, which the Espressif environmental-logger tutorial of July 2026 uses directly.
 
-Declare a partition and register the filesystem:
+A dedicated data partition is declared in the partition table, then mounted:
 
 ```
 # partitions.csv
@@ -36,20 +36,22 @@ esp_vfs_littlefs_conf_t conf = {
 ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
 ```
 
-From there it's plain POSIX — `fopen`, `fprintf`, `fread`.
+Note that `format_if_mount_failed` converts an unmountable partition into an empty one. That is convenient during development and destructive in the field: a transient mount failure erases the entire backlog. Production firmware should distinguish first boot from a mount error and report the latter.
 
-## The design: append-only log + a persisted checkpoint
+After registration the interface is ordinary Portable Operating System Interface (POSIX) file input/output — `fopen`, `fprintf`, `fgets`, `fseek` — through the VFS layer.
 
-Keep it dead simple. Append each reading as one newline-delimited JSON record, and separately persist a single integer — the byte offset up to which records have been **acknowledged** by the broker. The log is the queue; the offset is the read cursor.
+## Design: append-only log plus a persisted cursor
+
+The whole mechanism is two objects. **The log** is a single file of newline-delimited JavaScript Object Notation (NDJSON) records, one record per reading, only ever appended to. **The cursor** is a small separate file holding one integer: the byte offset up to which records have been acknowledged by the broker. The log is the queue; the cursor is the read position. No index, no per-record state flags, and therefore no way for the two to disagree beyond a bounded suffix.
 
 ```c
-// 1) On every sample: append. This never blocks on the network.
+// 1) On every sample: append. This path never blocks on the network.
 FILE *f = fopen("/lfs/queue.ndjson", "a");
 fprintf(f, "{\"ts\":%lld,\"pm25\":%.1f,\"pm10\":%.1f}\n", now_ms(), pm25, pm10);
-fclose(f);                         // fclose flushes; LittleFS keeps it crash-safe
+fclose(f);                         // flushes the buffered record to the filesystem
 
 // 2) When online: replay from the saved offset, publish, advance the cursor.
-long sent = load_offset();         // read a small "/lfs/offset" file, default 0
+long sent = load_offset();         // read "/lfs/offset"; absent file means 0
 FILE *q = fopen("/lfs/queue.ndjson", "r");
 fseek(q, sent, SEEK_SET);
 char line[192];
@@ -57,17 +59,50 @@ while (fgets(line, sizeof line, q)) {
     long pos = ftell(q);
     if (mqtt_publish_qos1(line) != OK) break;   // QoS 1 = broker acknowledged
     sent = pos;
-    save_offset(sent);             // only advance AFTER the ack
+    save_offset(sent);             // advance only after the acknowledgement
 }
 fclose(q);
 ```
 
-The rule that makes this correct: **advance the cursor only after the broker acknowledges (QoS 1).** If the node reboots after publishing but before saving the offset, it re-sends a few records — so make the consumer idempotent (a `ts` + device-id key deduplicates cheaply). At-least-once delivery plus a dedup key beats at-most-once-and-lose-data every time for telemetry.
+### The invariant
 
-## Keeping flash from filling up
+**Every record at a byte offset below `sent` has been acknowledged by the broker.** The cursor is written after the acknowledgement and never before, which makes the invariant one-sided: `sent` may lag behind what has been delivered, but it can never run ahead of it. All the correctness of the scheme follows from that asymmetry.
 
-Because it's append-only, the file grows forever unless you reclaim space. Two safe strategies. **Compaction:** once `sent` passes a threshold (say the file is >64 KB and fully drained), rewrite `queue.ndjson` to contain only the un-acked tail, then reset the offset to 0. **Segment rotation** is even simpler and gentler on flash: roll to `queue.0001.ndjson`, `queue.0002.ndjson`, … and `remove()` a segment the instant its last record is acknowledged — no rewriting, which means fewer erase cycles. On a small storage partition, rotation is usually the better call.
+`mqtt_publish_qos1` in the sketch stands for a call that returns only once the `PUBACK` for that message has arrived, and no such call exists in ESP-IDF. `esp_mqtt_client_publish` hands the message to the client task and returns a message identifier; the acknowledgement surfaces later as an `MQTT_EVENT_PUBLISHED` event carrying the same identifier. Firmware has to correlate the two itself, because **treating the return of the publish call as the acknowledgement moves the cursor at enqueue time and converts the scheme into at-most-once.**
 
-One more guard: if the outage outlives your flash budget, decide the drop policy on purpose. Dropping the *oldest* segment (and logging that you did) is almost always right for air-quality trends — you'd rather keep the recent picture than choke on ancient backlog. Silent overflow is the one outcome to avoid.
+The three states of the system are: *draining* (cursor behind end-of-file, link up), *drained* (cursor at end-of-file), and *accumulating* (link down, appends continuing). A publish failure exits the replay loop without advancing the cursor, so the transition from draining to accumulating loses nothing. `fgets` truncates at `sizeof line`; a record longer than the buffer is split across two iterations and published as two malformed fragments, so the buffer must exceed the maximum record length by construction.
 
-**Try next:** flash this, then pull the antenna / block the broker for ten minutes while the node keeps sampling. Reconnect and confirm the gap fills in from `queue.ndjson` with no missing timestamps — then yank power mid-replay and confirm it resumes from the saved offset instead of double-sending everything.
+### The failure mode the invariant admits
+
+If the node resets after `mqtt_publish_qos1` returns but before `save_offset` completes, the record is delivered again on the next replay. The window is one record wide per reset, and it is the deliberate price of the one-sided invariant. The system therefore provides **at-least-once delivery**, and **the consumer must be idempotent**: a primary key of device identifier plus record timestamp deduplicates on insert. Reversing the order — persisting the cursor first, publishing second — would give at-most-once delivery and silently drop the record instead, which for telemetry is the worse of the two errors because it is undetectable downstream.
+
+Note what QoS 1 does and does not mean. The acknowledgement (`PUBACK`) confirms that the broker took responsibility for the message, not that any subscriber consumed it. Loss beyond the broker is outside what this cursor can protect against.
+
+## Reclaiming flash
+
+An append-only log grows without bound, so space must be reclaimed. Two strategies fit the design.
+
+**Compaction** rewrites `queue.ndjson` to contain only the unacknowledged tail once the file exceeds a size threshold, then resets the cursor to 0. It keeps a single file, at the cost of rewriting live data and consuming erase cycles proportional to the retained tail.
+
+**Segment rotation** writes to `queue.0001.ndjson`, `queue.0002.ndjson`, and so on, and calls `remove()` on a segment as soon as its final record is acknowledged. Nothing is rewritten, so the erase cost is lower, and the cursor becomes a pair — segment identifier plus offset within it. The trade is more filesystem objects to enumerate at boot against fewer rewritten bytes; no published measurement separates the two on a specific partition size.
+
+Compaction has a reset hazard that rotation does not: between rewriting the file and resetting the cursor, the two objects describe different logs. A reset in that window leaves a cursor pointing into a file whose contents shifted, and replay resumes at the wrong byte. Writing the compacted log to a temporary path and renaming it after the cursor is reset to 0 narrows the window to the rename itself: a reset before the rename leaves a cursor of 0 against the *old*, still-complete log, which replays everything the consumer must already deduplicate. The scheme depends on the rename replacing the old file in one commit rather than as a delete followed by a create, so firmware that relies on it should verify that behaviour on its own LittleFS version rather than assume it.
+
+## Overflow policy
+
+When an outage outlasts the flash budget, something is discarded, and the choice belongs in the code rather than in whatever the allocator happens to do. Discarding the **oldest** segment preserves the recent picture, which for air-quality trend monitoring is the more useful half; discarding the newest preserves the start of the incident. Either is defensible. The outcome to exclude is silent overflow, in which the gap is neither recorded nor visible: emitting a counter of dropped records lets the consumer distinguish "no readings because nothing was sampled" from "no readings because the buffer overflowed".
+
+## Verification
+
+The design is exercised by two deliberate faults. Blocking the broker for ten minutes while sampling continues tests the accumulating state, and reconnection should fill the gap from `queue.ndjson` with no missing timestamps. Removing power during replay tests the cursor: the node must resume from the saved offset and re-send at most the records after it, rather than restarting the log from the beginning.
+
+## Pitfalls
+
+- `format_if_mount_failed = true` erases the backlog on any mount error, not only on first boot; a partition that fails to mount because of a transient fault comes back empty and the buffered readings are gone.
+- Advancing the cursor before the broker acknowledges converts at-least-once into at-most-once: a reset between the two writes drops the record permanently, and nothing downstream reports the loss.
+- A record longer than the `fgets` buffer is split mid-line and published as two invalid JavaScript Object Notation fragments; the consumer sees parse errors rather than a truncation warning.
+- `esp_mqtt_client_publish` returns as soon as the message is queued, so a cursor advanced on its return value records readings the broker may never have acknowledged; the `PUBACK` is reported separately as `MQTT_EVENT_PUBLISHED`.
+- QoS 1 acknowledges broker receipt only. A broker that loses the message before delivering it leaves the cursor advanced past a record no subscriber ever saw.
+- Compacting the log and resetting the cursor as two separate writes leaves a window in which a reset makes the cursor point into shifted data, and replay resumes mid-record.
+- Without an idempotency key on the consumer, the duplicate records that at-least-once delivery guarantees appear as spurious repeated measurements in the time series.
+- Silent overflow is indistinguishable from a sensor outage after the fact; without a dropped-record counter, a gap in the data has no attributable cause.

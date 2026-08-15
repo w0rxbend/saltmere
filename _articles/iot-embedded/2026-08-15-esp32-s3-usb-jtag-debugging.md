@@ -1,8 +1,8 @@
 ---
-title: "Debugging an ESP32-S3 Over Its Built-in USB-JTAG: GDB, OpenOCD, and Breakpoints in Your Sensor Loop"
+title: "Debugging an ESP32-S3 Over Its Built-in USB-JTAG: GDB, OpenOCD, and Breakpoints in a Sensor Loop"
 date: 2026-08-15
 track: iot-embedded
-summary: "The ESP32-S3 has a USB-Serial-JTAG peripheral on-die — no FT2232 probe, no wiring beyond the USB D+/D- pins on GPIO19/GPIO20. This walks the idf.py openocd + idf.py gdb workflow on ESP-IDF v6.0.2: halting a running sensor loop on a hardware breakpoint, watching an I2C variable change, and the caveats — only 2 hardware breakpoints on the S3, and flash encryption that switches JTAG off entirely."
+summary: "The ESP32-S3 carries a USB-Serial-JTAG peripheral on-die — no FT2232 probe, no wiring beyond the USB D+/D- pins on GPIO19/GPIO20. This describes the idf.py openocd + idf.py gdb workflow on ESP-IDF v6.0.2: halting a running sensor loop on a hardware breakpoint, watching an I2C variable change, and the constraints — 2 hardware breakpoints on the S3, and flash encryption that disables JTAG entirely."
 reading_time: 6
 tags: [esp32, esp32-s3, jtag, openocd, gdb, debugging]
 sources:
@@ -16,39 +16,41 @@ sources:
     url: "https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-guides/jtag-debugging/using-debugger.html"
 ---
 
-For years, JTAG on an ESP32 meant buying an FT2232H probe, wiring six jumpers to TMS/TCK/TDI/TDO/GND/pull-ups, and hoping you got the pinout right before you ever set a breakpoint. The ESP32-S3 deletes that whole shopping trip. It has a **USB-Serial-JTAG** controller built into the silicon, so the single USB cable you already use to flash the board is also a full JTAG adapter. No probe, no extra wiring — which means when a sensor loop misbehaves in the field, you can halt it on the bench with nothing but the cable in your pocket. The same peripheral is on the RISC-V ESP32-C3 and C6, so this workflow travels across most of the current line-up.
+**Gist.** Halting a live firmware task to inspect its state has historically required an external Joint Test Action Group (JTAG) probe — an FT2232H adapter and the wired JTAG signals (TMS, TCK, TDI, TDO, plus ground). The ESP32-S3 integrates a **USB-Serial-JTAG** controller on-die, so the same USB cable used for flashing presents a JTAG adapter to OpenOCD and, through it, to GDB. The cost is paid in scarce on-chip debug resources — **2 hardware breakpoints and 2 watchpoints** — and in mutual exclusion with the security fuses and with any other use of the two pins the peripheral owns.
 
-## The wiring is just the USB port
+## The interface is the USB port
 
-There is essentially nothing to wire. The S3's USB-Serial-JTAG uses two fixed pins: **GPIO19 is USB D-** and **GPIO20 is USB D+**, plus 5 V to V_BUS and GND. If your board has a USB connector wired to those pins — every S3 devkit does — you're done. For a bare module, a USB breakout cable on those four lines is the entire hardware setup. On Linux you'll want a udev rule for the device; on Windows the port needs the WinUSB driver bound (the Espressif tooling or Zadig handles it). The one physical gotcha: **those two GPIOs are now the JTAG bus.** If your firmware reconfigures GPIO19/20 for something else, or you're using them for the native USB-OTG stack (TinyUSB), you can't also be debugging over them — the peripheral is shared, so pick one role per pin.
+The S3's USB-Serial-JTAG occupies two fixed pins: **GPIO19 is USB D−** and **GPIO20 is USB D+**, alongside 5 V on V_BUS and ground. Any board whose USB connector is wired to those pins — the case on S3 devkits — needs no further hardware. A bare module requires a USB breakout on those four lines and nothing more. On Linux the device needs a udev rule; on Windows the port must be bound to the WinUSB driver, which the Espressif tooling or Zadig performs.
+
+The consequence of fixed pins is exclusivity. **GPIO19 and GPIO20 are the JTAG bus while debugging.** Firmware that reconfigures those pins for another function, or that drives the native USB On-The-Go (OTG) stack through TinyUSB, contends for the same pads; one role per pin at a time.
 
 ## Launching OpenOCD and GDB
 
-ESP-IDF wraps the whole toolchain in `idf.py`, so you rarely type raw OpenOCD invocations. On current stable **ESP-IDF v6.0.2**, two terminals is the classic setup — OpenOCD as a server, GDB as the client:
+ESP-IDF wraps the toolchain behind `idf.py`, so raw OpenOCD invocations are rarely needed. On **ESP-IDF v6.0.2**, the conventional arrangement is two terminals — OpenOCD as the server holding the JTAG transport, GDB as the client speaking the GDB remote serial protocol to it:
 
 ```bash
-# Terminal 1 — start the on-chip debug server (built-in JTAG config).
+# Terminal 1 — on-chip debug server, built-in JTAG configuration.
 idf.py openocd
 # equivalent to: openocd -f board/esp32s3-builtin.cfg
 
-# Terminal 2 — GDB, pointed at your project's ELF, connected to OpenOCD.
+# Terminal 2 — GDB, pointed at the project's ELF, connected to OpenOCD.
 idf.py gdb
 ```
 
-`idf.py openocd` selects the `esp32s3-builtin.cfg` board file automatically, so you don't specify the interface. `idf.py gdb` loads the built ELF and a FreeRTOS-aware Python extension. If you'd rather not juggle two terminals, chain the actions on one line — `idf.py` runs background actions (OpenOCD) first and interactive ones (GDB) last:
+`idf.py openocd` selects the `esp32s3-builtin.cfg` board file automatically, so no interface argument is required. `idf.py gdb` loads the built ELF and a FreeRTOS-aware Python extension, which is what makes per-task backtraces legible rather than a single undifferentiated stack. The two actions may be chained on one line, because `idf.py` orders background actions (OpenOCD) before interactive ones (GDB):
 
 ```bash
 idf.py openocd gdb
 ```
 
-There are frontends too: `idf.py gdbtui` gives you a split source view, and `idf.py gdbgui` opens a browser debugger.
+Two frontends exist over the same session: `idf.py gdbtui` provides a split source view, and `idf.py gdbgui` opens a browser-based debugger.
 
-## Breakpoints in a running sensor loop
+## Halting inside a running sensor loop
 
-Say your PM2.5 task reads a sample every second and the value occasionally goes garbage. Halt inside the read and inspect it live. This is a real GDB session against a running node:
+Consider a particulate-matter (PM2.5) task that reads a sample each second and intermittently yields an implausible value. The debug session halts inside the read path and inspects the sample in place:
 
 ```gdb
-(gdb) break pm25_task.c:hnd_read_sample
+(gdb) break pm25_task.c:88
 Breakpoint 1 at 0x42012a4c: file pm25_task.c, line 88.
 (gdb) continue
 Continuing.
@@ -63,21 +65,31 @@ Hardware watchpoint 2: raw.pm2p5
 (gdb) continue
 Hardware watchpoint 2: raw.pm2p5
 Old value = 12.4000006
-New value = 998.200012          # there's your glitch
+New value = 998.200012          # the anomalous sample
 (gdb) backtrace
 ```
 
-The `watch` is the star: it's a **hardware watchpoint**, so the CPU traps the moment that memory is written — no polling, no instrumenting your driver — and you catch the exact call stack that produced the bad reading. `print` reads any in-scope variable or struct straight from the halted core.
+The load-bearing instruction is `watch`. It installs a **hardware watchpoint**: the core traps on the write to that address, so the halt occurs at the instruction that produced the value rather than at the next poll of it. The backtrace taken at that halt therefore names the actual writer — a driver path, a shared buffer, or an unrelated task overrunning its allocation — which polling or added logging cannot distinguish, because both observe the value only after the fact. `print` reads any in-scope variable or structure directly from the halted core, no target-side formatting code involved.
 
-## The caveats that will catch you
+## Debug resources are a fixed, small budget
 
-Hardware debug resources on the S3 are scarce, and this is the number to memorize: the ESP32-S3 has **only 2 hardware breakpoints and 2 watchpoints**. Try to set a third of either and GDB errors out. There are up to 64 *software* breakpoints available (in flash and IRAM), which cover most needs, but watchpoints are hardware-only — you get two, full stop. The RISC-V parts are slightly more generous: the **ESP32-C6 has 4 hardware breakpoints and 4 watchpoints**, so if a design needs to watch several variables at once, the chip choice matters.
+The controlling constraint is unit count, not speed. The ESP32-S3 provides **2 hardware breakpoints and 2 watchpoints**. A request for a third of either fails at the point GDB attempts to install it, which is on `continue` rather than at the `break` command, so an over-subscribed session appears to accept the breakpoint and then errors when resumed.
 
-| Chip | Hardware breakpoints | Watchpoints |
-|---|---|---|
-| ESP32-S3 | 2 | 2 |
-| ESP32-C6 | 4 | 4 |
+Breakpoints have an escape hatch that watchpoints do not. Up to **64 software breakpoints** are available in flash and internal RAM (IRAM); a software breakpoint is an instruction rewritten in place, so its supply is bounded by memory rather than by comparator hardware. Watchpoints have no software equivalent here — a data write cannot be trapped without hardware address comparison — so **two is the hard ceiling on simultaneously watched variables**.
 
-The bigger trap is security. **Enabling Flash Encryption and/or Secure Boot disables JTAG debugging** — the peripheral is fused off, by design, so a production node can't be probed. You can override it during development with `CONFIG_SECURE_BOOT_ALLOW_JTAG`, which keeps JTAG alive, but understand you've traded away exactly the physical-attack protection those features exist to provide, so it belongs on dev units only. And a subtle one: with Secure Boot on, a *software* breakpoint rewrites an instruction in flash, which can invalidate the app signature on the next reset — prefer hardware breakpoints (your two) when debugging a secure-boot build. In short: debug freely on an unencrypted dev board, and expect JTAG to go dark the moment you flip on the security fuses for production.
+Other Espressif parts do not all carry the same budget; the per-chip counts are stated in each chip's own version of the tips-and-quirks page, and a design that must observe several variables concurrently is therefore affected by chip selection.
 
-**Try next:** flash any project to an S3 devkit, run `idf.py openocd gdb`, set a hardware `watch` on a sensor variable in your read path, and let it run until the value trips — then compare the caught backtrace against where you *thought* the bad data came from.
+## Interaction with the security fuses
+
+**Enabling Flash Encryption and/or Secure Boot disables JTAG debugging.** The peripheral is fused off, which makes the transition one-way on a given part: a node prepared for production is no longer reachable by the workflow above. `CONFIG_SECURE_BOOT_ALLOW_JTAG` keeps JTAG operational with Secure Boot enabled, at the cost of the physical-access protection those features provide, which confines it to development units.
+
+A second interaction is subtler and follows from what a software breakpoint is. Because it rewrites an instruction in flash, and Secure Boot validates the application image against its signature, **a software breakpoint can invalidate the app signature on the next reset**. Under a Secure Boot build the two hardware breakpoints are the ones that leave the image intact.
+
+## Pitfalls
+
+- Firmware that claims GPIO19/GPIO20 — for general-purpose I/O or for the native USB-OTG stack via TinyUSB — takes the pins away from USB-Serial-JTAG; the symptom is a debug session that cannot attach or drops once that firmware initialises, because the peripheral and the reassigned function share the same pads.
+- A third hardware breakpoint or a third watchpoint is refused when GDB installs it on resume, not when the command is typed; the symptom is an error on `continue` that appears unrelated to the last command entered.
+- Watchpoints have no software fallback: exhausting the two on an S3 cannot be worked around by trading them for software breakpoints, since only breakpoints have a software form.
+- Enabling Flash Encryption or Secure Boot fuses JTAG off, so a board that debugged correctly before provisioning stops responding to OpenOCD afterwards, with no firmware change to explain it.
+- On a Secure Boot build, a software breakpoint modifies an instruction in flash; the symptom is a boot failure after reset, caused by the application signature no longer matching the modified image.
+- On Windows an unbound port presents as an enumerated device that OpenOCD will not open; the cause is the missing WinUSB driver binding rather than a wiring or configuration fault.

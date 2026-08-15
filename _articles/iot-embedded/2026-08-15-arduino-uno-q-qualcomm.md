@@ -1,9 +1,9 @@
 ---
-title: "Arduino Uno Q and Arduino Under Qualcomm: What Changed for Makers"
+title: "Arduino UNO Q Under Qualcomm: Hardware, Bridge, and Terms"
 date: 2026-08-15
 track: iot-embedded
-summary: "Qualcomm announced its acquisition of Arduino in October 2025 and led with a new flagship: the UNO Q, a 'dual-brain' board pairing a Dragonwing QRB2210 Linux SoC with an STM32U585 MCU in the classic UNO footprint. Ten months on, here's what's real — the hardware, the App Lab workflow and its MessagePack-RPC bridge, the July 2026 price hike, the terms-of-service backlash — and how it stacks up against a Raspberry Pi 5 plus a Pico."
-reading_time: 5
+summary: "Qualcomm announced its acquisition of Arduino in October 2025 alongside the UNO Q, a 'dual-brain' board pairing a Dragonwing QRB2210 Linux system-on-chip with an STM32U585 microcontroller in the UNO footprint. Ten months on: the hardware, the App Lab workflow and its MessagePack-RPC bridge, the July 2026 price increase, the terms-of-service revision, and the comparison against a Raspberry Pi 5 paired with a Pico."
+reading_time: 6
 tags: [arduino, uno-q, qualcomm, stm32, linux, sbc, maker]
 sources:
   - title: "Arduino UNO Q — official documentation"
@@ -18,11 +18,11 @@ sources:
     url: "https://www.tomshardware.com/raspberry-pi/arduino-uno-q-review"
 ---
 
-In October 2025, Qualcomm announced it was acquiring Arduino — the company behind the board most of us learned on — and on the same day Arduino launched the **UNO Q**, a board that is very deliberately not just another UNO. Ten months later the dust has settled enough to assess what actually changed for people who build things.
+**Gist.** Projects that need both a Linux-class application processor (for cameras, Python, and machine-learning models) and a microcontroller unit (MCU) with deterministic pin timing have conventionally been built from two boards joined by a hand-written serial protocol. The Arduino UNO Q places both processors on one UNO-footprint board and supplies a remote procedure call (RPC) layer over MessagePack so the two sides exchange named function calls instead of parsed serial text. The cost is a fixed, soldered configuration — one system-on-chip (SoC), one MCU, non-removable storage — at a price that rose from $44 to $59 for the entry variant in July 2026, and a platform whose roadmap now sits inside a silicon vendor.
 
-## The hardware: two brains in an UNO footprint
+## The hardware: two processors in an UNO footprint
 
-The UNO Q's pitch is "dual brain": a Linux application processor and a real-time MCU on one board, in the classic UNO form factor with shield headers and a Qwiic connector.
+The board carries a Linux application processor and a real-time MCU behind the classic UNO shield headers, plus a Qwiic connector.
 
 | | Linux side | MCU side |
 |---|---|---|
@@ -31,24 +31,32 @@ The UNO Q's pitch is "dual brain": a Linux application processor and a real-time
 | Memory | 2 GB/16 GB or 4 GB/32 GB eMMC | 2 MB flash, 786 KB SRAM |
 | Runs | Debian Linux | Arduino sketches (Zephyr-based core) |
 
-Radio is Wi-Fi 5 plus Bluetooth 5.1, and the bottom carries high-speed connectors for MIPI-CSI cameras and a MIPI-DSI display — the QRB2210's ISP can handle 13 MP cameras, which is the "AI vision" angle. Storage is soldered eMMC, not an SD card: less flexible, but it boots fast and won't corrupt the way SD cards do.
+Radio support is Wi-Fi 5 and Bluetooth 5.1. The underside carries high-speed connectors for a MIPI-CSI camera and a MIPI-DSI display; **the QRB2210 image signal processor accepts sensors up to 13 megapixels**, which is the basis of the board's vision positioning.
 
-Pricing is the sore point. The board launched at **$44 (2 GB) / $59 (4 GB)** — aggressive, clearly aimed at Raspberry Pi. In June 2026 Arduino announced that memory costs (more than doubled by AI-driven DRAM demand) forced a hike to **$59 / $79** from July 6. Still competitive, but the headline "Pi-killer at $44" era lasted about eight months.
+Storage is **soldered embedded MultiMediaCard (eMMC), not a removable SD card**. The practical consequence is asymmetric: soldered storage removes the mechanical failure modes of a card in a socket — contact wear, vibration, accidental ejection — and it removes the recovery path in which a corrupted card is reimaged on another machine. A bricked root filesystem is repaired over the board's own interfaces or not at all.
 
-## App Lab and the bridge: the actual new idea
+The division of labour is the point of the architecture. The Cortex-A53 cluster runs a general-purpose scheduler under Linux, so any latency guarantee it offers is statistical; the Cortex-M33 executes a single sketch with interrupt latency bounded by the hardware. Work whose deadline is measured in microseconds — step generation, pulse-width capture, bit-banged protocols — belongs on the MCU regardless of how much headroom the A53 cores appear to have.
 
-The genuinely new part isn't the silicon, it's the workflow. **Arduino App Lab** treats an "app" as one project containing a Python program (Linux side), an Arduino sketch (MCU side), and optionally an AI model, deployed together. The two sides talk over **MessagePack-RPC** through a router service — the sketch registers functions, Python calls them by name (and the reverse works too):
+Pricing is the contested part. The board launched at **$44 (2 GB) / $59 (4 GB)**. In June 2026 Arduino stated that memory costs, driven by demand for dynamic random-access memory (DRAM) in artificial-intelligence systems, had more than doubled, and announced an increase to **$59 / $79 effective 6 July 2026**.
+
+## App Lab and the bridge
+
+The novel element is the workflow rather than the silicon. **Arduino App Lab** defines an "app" as a single project containing a Python program for the Linux side, an Arduino sketch for the MCU side, and optionally a machine-learning model, deployed together as one unit.
+
+The two sides communicate by **MessagePack-RPC through a router service**. MessagePack is a binary serialisation format; MessagePack-RPC layers request/response semantics on top of it, so a call carries a function name and typed arguments rather than a line of text that the receiver must re-parse. The sketch registers named functions; the Python program invokes them by name, and the direction reverses equally.
+
+A minimal pair of endpoints:
 
 ```cpp
 // MCU side (sketch): expose a function the Linux side can call
-#include "Arduino_RouterBridge.h"
+#include <Arduino_RouterBridge.h>
 
 void set_led(bool on) { digitalWrite(LED_BUILTIN, on); }
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  Bridge.provide_safe("set_led", set_led);   // register before begin()
   Bridge.begin();
+  Bridge.provide("set_led", set_led);   // bound to the name, not the symbol
 }
 void loop() {}
 ```
@@ -59,20 +67,31 @@ from arduino.app_utils import *
 import time
 
 def loop():
-    Bridge.call("set_led", True);  time.sleep(0.5)
-    Bridge.call("set_led", False); time.sleep(0.5)
+    Bridge.call("set_led", True)
+    time.sleep(0.5)
+    Bridge.call("set_led", False)
+    time.sleep(0.5)
 
 App.run(user_loop=loop)
 ```
 
-If you've ever duct-taped a Pi to a microcontroller with pyserial and a hand-rolled framing protocol, this is that — done properly, with one IDE, one deploy step, and typed RPC instead of `Serial.parseInt()`. That's the real answer to "why not a Pi 5 and a Pico?" A Pi 5 has far more compute, a vastly bigger ecosystem, and swappable storage; a Pico is a more than capable MCU; together they're cheaper than $79. But you own the integration: two boards, a cable or UART link, your own protocol, your own provisioning. The UNO Q makes the hybrid architecture a first-class, single-board target — and keeps shield compatibility for the drawer of hardware you already have.
+**The coupling between the two programs is a string, checked at run time.** The sketch and the Python program are compiled and interpreted separately, so a name that is misspelled on one side, or never registered at all, produces no compile error and no boot failure: the sketch links and runs, and the fault appears as a failed call at the moment the peer first invokes that name. Argument types are likewise resolved by the serialisation format rather than by a shared header.
+
+The comparison against a Raspberry Pi 5 plus a Raspberry Pi Pico remains open on the merits. The Pi 5 offers substantially more compute, a larger software ecosystem, and removable storage; the Pico is a capable MCU; the pair costs less than $79. What the pair does not supply is the integration: two boards, a physical link, a framing and error-handling protocol written by hand, and two separate provisioning paths. The UNO Q makes the split-processor architecture a single deployable target while retaining shield compatibility.
 
 ## The Qualcomm question
 
-The community's reaction to the acquisition itself was wary but calm — Qualcomm committed to keeping the open-source model and the existing product line. The flashpoint came a month later, when Arduino published **rewritten Terms of Service**. Adafruit's widely shared analysis flagged perpetual licenses on user-uploaded content, AI-related data monitoring, and reverse-engineering restrictions, reading it as Arduino shifting "from an open community platform into a tightly controlled corporate service." Arduino responded quickly and in writing: **"anything that was open, stays open"** — hardware remains open-source, reverse engineering your own devices stays legitimate, users keep ownership of their creations, and the legal language was revised.
+Reaction to the acquisition was cautious rather than hostile; Qualcomm stated a commitment to the open-source model and the existing product line. The dispute arrived with **rewritten Terms of Service**. Adafruit's analysis identified perpetual licences over user-uploaded content, data monitoring related to artificial intelligence, and reverse-engineering restrictions, characterising the change as a shift "from an open community platform into a tightly controlled corporate service." Arduino responded in writing that **"anything that was open, stays open"**: hardware remains open source, reverse engineering of one's own devices remains legitimate, users retain ownership of their creations, and the legal text was revised.
 
-Where does that leave a maker in mid-2026? The IDE, cores, and hardware design files remain open; UNO Q schematics are published, and the sketches-plus-Python model works offline. The legitimate open questions are structural: App Lab's nicest flows nudge you toward Arduino Cloud accounts; the QRB2210's GPU/ISP stack involves the usual Qualcomm proprietary blobs (the Debian image handles this, but it's not a fully mainline experience); and long-term product decisions now serve a chip company's edge-AI strategy, not only the classroom. None of that is disqualifying. All of it is worth watching with the same skepticism the ToS episode earned.
+The position as of mid-2026: the integrated development environment, the cores, and the hardware design files remain open; UNO Q schematics are published; the sketch-plus-Python model functions offline. Three structural questions remain open rather than resolved. App Lab's smoothest workflows route through Arduino Cloud accounts. The QRB2210 graphics and image-signal stack depends on Qualcomm proprietary binaries — the supplied Debian image incorporates them, so this is not a mainline-kernel experience. And product direction is now set inside a silicon vendor pursuing an edge-AI strategy.
 
-**Verdict:** the UNO Q is a genuinely good board for the specific shape of project where one box needs both a camera-and-Python brain and hard-real-time pins — robots, smart instruments, vision-plus-actuation. For headless sensor fleets, an ESP32 is still an order of magnitude cheaper and sleeps in microamps; for desktop-class Linux, a Pi 5 still wins.
+The board suits projects that require a camera-and-Python processor and hard-real-time pins inside one enclosure: robots, instrumentation, vision combined with actuation. For headless sensor deployments an ESP32 costs an order of magnitude less and sleeps at microampere currents; for desktop-class Linux the Pi 5 remains the stronger choice.
 
-**Try next:** prototype the split-brain pattern for free on hardware you own — put your existing Pi and any MCU on a MessagePack-RPC link and see how much of your "serial glue" code disappears; then you'll know whether the UNO Q's integrated version is worth $59 to you.
+## Pitfalls
+
+- **Mistyping a bridge function name on either side** produces no compile error and no boot failure; the peer's first call to that name finds no handler, so the fault surfaces as a runtime RPC error far from its cause.
+- **Placing microsecond-deadline work on the Linux side** yields timing that is statistically acceptable and occasionally catastrophic: the Cortex-A53 cluster runs a general-purpose scheduler, so jitter is unbounded in the worst case even when average latency looks adequate.
+- **Assuming SD-card recovery habits transfer** fails on soldered eMMC. A root filesystem corrupted beyond boot cannot be pulled, imaged, and reinserted on another machine.
+- **Budgeting from launch prices** understates cost by $15–$20 per board: the entry configuration moved from $44 to $59 and the 4 GB configuration from $59 to $79 on 6 July 2026.
+- **Treating the Debian image as a stock distribution** breaks when the graphics and image-signal paths are exercised, because those depend on Qualcomm proprietary binaries shipped with the image rather than on mainline kernel drivers.
+- **Reading "anything that was open, stays open" as covering the whole stack** overstates it. The statement addresses hardware openness, reverse engineering, and content ownership; it is not a claim that the QRB2210 multimedia stack is free of proprietary components.

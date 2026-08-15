@@ -1,9 +1,9 @@
 ---
-title: "Making an ESP32 air-quality node live for months on a LiPo"
+title: "Deep sleep and duty-cycle budgeting for a battery-powered ESP32 sensor node"
 date: 2026-07-26
 track: iot-embedded
-summary: "Deep sleep, RTC memory, and a duty-cycle math worksheet for turning a wake-measure-publish sensor loop into a battery budget you can actually trust."
-reading_time: 5
+summary: "Deep sleep, RTC memory retention, and the duty-cycle arithmetic that turns a wake-measure-publish sensor loop into a defensible battery budget."
+reading_time: 6
 tags: [esp32, deep-sleep, power-management, battery, low-power, rtc-memory]
 sources:
   - title: "Sleep Modes — ESP-IDF Programming Guide"
@@ -18,45 +18,47 @@ sources:
     url: "https://deepbluembedded.com/esp32-sleep-modes-power-consumption/"
 ---
 
-The SEN5x/MQTT node from the earlier article assumed mains power. Put the same sensor on a LiPo pouch cell and the entire firmware design flips: the question stops being "how do I publish a reading" and becomes "how many microamps am I burning while I'm *not* publishing a reading." For a periodic air-quality sensor — wake, sample, publish, sleep, repeat — that idle current dominates the battery math almost completely.
+**Gist.** A periodic air-quality node running from a lithium-polymer (LiPo) cell spends almost all of its life idle, so idle current, not publish current, sets the runtime. Deep sleep removes that idle cost by powering down the central processing unit (CPU), main static RAM (SRAM) and the advanced peripheral bus (APB) clock domain, leaving only the real-time-clock (RTC) controller alive at roughly 10 µA. The cost is that **every wake is a cold boot**: no call stack, no heap, no Wi-Fi association and no Transport Layer Security (TLS) session survive, so each cycle pays the full reconnect time again.
 
-## The four power states
+The SEN5x/MQTT node from the earlier article assumed mains power. On a battery the design question changes from how a reading is published to how much current is drawn while no reading is being published.
 
-The ESP32 datasheet defines four operating modes, each trading away a different subsystem for current:
+## The power states
+
+The ESP32 datasheet defines the following operating modes, each trading a subsystem for current:
 
 | Mode | What stays powered | Typical current | Wake latency |
 |---|---|---|---|
-| Active (Wi-Fi/BT RF) | Everything | 95–380 mA (bursty, TX-dependent) | — |
+| Active (Wi-Fi/BT RF) | Everything | 95–240 mA (bursty, TX-dependent) | — |
 | Modem-sleep | CPU + RAM, RF duty-cycled | 20–68 mA (scales with CPU clock) | ~ms |
-| Light-sleep | RAM + RTC domain, CPU/peripherals clock-gated | ~0.8 mA | <1 ms, state preserved |
-| Deep-sleep | RTC controller, RTC memory, optionally ULP | 10 µA (timer-only) up to 150 µA (ULP active) | 200–500 ms (full reboot) |
+| Light-sleep | RAM + RTC domain, CPU/peripherals clock-gated | ~0.8 mA | resumes in place, state preserved |
+| Deep-sleep | RTC controller, RTC memory, optionally ULP | 10 µA (timer-only) up to 150 µA (ULP active) | full reboot |
 | Hibernation | RTC timer only | ~5 µA | full reboot, RTC memory not guaranteed |
 
-Figures are from Espressif's own ESP32-WROOM-32 datasheet and hold for the bare module — they assume nothing else on the board is drawing current. That caveat matters more than it sounds: a stock dev board's USB-serial bridge, power LED, and AMS1117 linear regulator can add several *milliamps* of constant leakage, swamping a 10 µA deep-sleep budget by three orders of magnitude. If you're designing for battery life, either strip a dev board down (desolder the LED, bypass the onboard LDO) or design your own board around a bare ESP32 module and a low-quiescent regulator.
+Figures come from Espressif's ESP32-WROOM-32 datasheet and describe **the bare module in isolation**; they assume no other component on the board draws current. That caveat is load-bearing. A stock development board's USB-to-serial bridge, power LED and AMS1117 linear regulator can add several *milliamps* of constant leakage, which exceeds a 10 µA sleep budget by two orders of magnitude or more. Battery-oriented designs therefore either strip the development board (remove the LED, bypass the onboard low-dropout regulator) or use a bare module with a low-quiescent-current regulator.
 
-**Modem-sleep** keeps the CPU running and RAM intact; it's what the Wi-Fi stack uses automatically between DTIM beacon intervals to stay associated without listening constantly — useful if you need to stay reachable, not useful for a node that only needs to phone home every few minutes.
+**Modem-sleep** keeps the CPU running and SRAM intact; the Wi-Fi stack uses it between delivery-traffic-indication-message (DTIM) beacons to remain associated without listening continuously. It suits a node that must stay reachable, not one that reports every few minutes.
 
-**Light-sleep** clock-gates the CPU and most peripherals but keeps RAM powered, so execution resumes exactly where it left off. It's the right tool when you need sub-millisecond wake latency and don't want to lose call-stack state — an ADC sampling loop with short gaps between reads, for example.
+**Light-sleep** clock-gates the CPU and most peripherals while keeping SRAM powered, so execution resumes at the instruction after the sleep call. It is the appropriate mode when a reboot cannot be afforded between gaps and call-stack state must survive — an analogue-to-digital-converter (ADC) sampling loop with short gaps, for instance.
 
-**Deep-sleep** is the one that matters for a periodic sensor: it powers off the CPU, most of RAM, and every APB-clocked peripheral. On wake, the chip runs the full boot ROM and startup sequence again — there's no "resume," only "restart with some memory intact."
+**Deep-sleep** powers off the CPU, most of SRAM and every APB-clocked peripheral. On wake the chip re-runs the boot read-only memory (ROM) and the startup sequence. There is no resume path, only a restart with part of memory intact.
 
-**Hibernation** goes one step further and powers down the ULP coprocessor and RTC memory too, leaving only the RTC timer alive. It's the lowest-power option but it means you lose RTC_SLOW/RTC_FAST memory contents — not useful if you need a persistent boot counter or cached calibration data.
+**Hibernation** additionally powers down the ultra-low-power (ULP) coprocessor and RTC memory, leaving the RTC timer alone. It draws the least current and loses RTC_SLOW and RTC_FAST memory contents, which rules it out where a persistent boot counter or cached calibration is required.
 
-## Wake sources
+## Wake sources and the arming invariant
 
-Deep-sleep and light-sleep both wake on one or more configured sources:
+Deep-sleep and light-sleep wake on one or more configured sources:
 
-- **Timer** — `esp_sleep_enable_timer_wakeup(uint64_t time_in_us)`. The obvious choice for "sample every N minutes."
-- **ext0** — `esp_sleep_enable_ext0_wakeup(gpio_num_t gpio_num, int level)`, a single RTC GPIO, level-triggered. Good for a single interrupt line (a PIR sensor, a button).
-- **ext1** — `esp_sleep_enable_ext1_wakeup_io(uint64_t io_mask, esp_sleep_ext1_wakeup_mode_t mode)`, a bitmask of multiple RTC GPIOs, useful when several sensors can independently trigger a wake.
-- **Touch pads** — `esp_sleep_enable_touchpad_wakeup(void)`, for capacitive-touch wake.
-- **ULP coprocessor** — `esp_sleep_enable_ulp_wakeup(void)`. The ULP can poll a sensor over I2C/ADC while the main CPU stays fully off, only waking the CPU when a threshold is crossed — this is how you build a "wake only if PM2.5 spikes" node without burning main-CPU current on every poll.
+- **Timer** — `esp_sleep_enable_timer_wakeup(uint64_t time_in_us)`, the periodic case.
+- **ext0** — `esp_sleep_enable_ext0_wakeup(gpio_num_t gpio_num, int level)`: a single RTC-capable general-purpose input/output (GPIO), level-triggered.
+- **ext1** — `esp_sleep_enable_ext1_wakeup_io(uint64_t io_mask, esp_sleep_ext1_wakeup_mode_t mode)`: a bitmask over several RTC GPIOs, for multiple independent trigger lines.
+- **Touch pads** — `esp_sleep_enable_touchpad_wakeup(void)`.
+- **ULP coprocessor** — `esp_sleep_enable_ulp_wakeup(void)`. The ULP polls a sensor over the inter-integrated-circuit (I2C) bus or the ADC while the main CPU remains off, raising a wake only when a threshold is crossed.
 
-Multiple sources can be armed simultaneously; `esp_sleep_get_wakeup_cause()` after boot tells you which one fired.
+The invariant that governs correctness here: **a source that is not armed before `esp_deep_sleep_start()` cannot wake the chip**, and since the wake path restarts `app_main()` from the top, arming must be re-executed on every cycle rather than once at first boot. Multiple sources may be armed simultaneously; `esp_sleep_get_wakeup_cause()` after boot reports which one fired.
 
-## What survives, what doesn't
+## What survives the sleep boundary
 
-Main SRAM is powered off in deep-sleep, so ordinary globals and the call stack are gone — every deep-sleep wake is a cold boot of `app_main()`/`setup()`. What survives is the RTC memory domain: 8 KB of RTC_SLOW memory plus RTC_FAST memory, which stay powered whenever anything is tagged with the `RTC_DATA_ATTR` attribute. Use it for a boot counter, a rolling calibration offset, or the last-known sensor reading you want to compare against on the next wake — anything you need across the sleep boundary that doesn't justify a flash write (which costs both wear and time).
+Main SRAM is unpowered in deep-sleep, so ordinary globals and the call stack are lost — every deep-sleep wake is a cold entry into `app_main()`. The surviving domain is RTC memory: **8 KB of RTC_SLOW memory plus RTC_FAST memory**, retained for objects tagged with the `RTC_DATA_ATTR` attribute. Such objects are zero-initialised on power-on reset but not on a deep-sleep wake, which makes them suitable for a boot counter, a rolling calibration offset, or the previous reading used for comparison — state that must cross the boundary but does not justify a flash write, which costs both wear and time.
 
 ## The wake-measure-sleep loop
 
@@ -79,25 +81,26 @@ void app_main(void) {
            boot_count, esp_sleep_get_wakeup_cause(), last_pm25);
 
     // ... init I2C, read SEN5x, connect Wi-Fi, publish MQTT ...
-    float pm25 = read_pm25_and_publish();   // your existing sensor/MQTT code
+    float pm25 = read_pm25_and_publish();
     last_pm25 = pm25;
 
+    // Re-armed on every wake: the previous arming did not survive the reboot.
     esp_sleep_enable_timer_wakeup(SAMPLE_INTERVAL_S * uS_TO_S_FACTOR);
     printf("Entering deep sleep for %ds\n", SAMPLE_INTERVAL_S);
     esp_deep_sleep_start();   // never returns
 }
 ```
 
-`esp_deep_sleep_start()` doesn't return — the next line of code that runs is the top of `app_main()` after the reboot, with `boot_count` and `last_pm25` intact because they're RTC-attributed. Everything else — Wi-Fi state, TLS session, heap contents — is gone and must be rebuilt from scratch, which is the dominant cost in the active-time budget below.
+`esp_deep_sleep_start()` does not return. The next instruction executed is the top of `app_main()` after the reboot, with `boot_count` and `last_pm25` intact because they are RTC-attributed. Wi-Fi state, TLS session and heap contents are gone and must be rebuilt, which is the dominant term in the active-time budget below.
 
-## Battery-life math, worked
+## Battery-life arithmetic
 
-Take the air-quality node: wake every 10 minutes, spend ~2.2 seconds active (sensor read + Wi-Fi connect/publish, dominated by the Wi-Fi association and TX burst), then deep-sleep the rest on timer wakeup only.
+Take the air-quality node: wake every 10 minutes, remain active for about 2.2 s (sensor read plus Wi-Fi association and publish), then deep-sleep on timer wakeup only.
 
 Assumptions:
-- Active current during the 2.2 s window: 150 mA average (blends boot, sensor I2C read, and Wi-Fi connect+publish bursts)
+- Active current during the 2.2 s window: 150 mA average, blending boot, the I2C sensor read, and the Wi-Fi connect and transmit bursts
 - Deep-sleep current: 10 µA (0.01 mA), timer wakeup only, no ULP
-- Cycle length: 600 s (10 minutes)
+- Cycle length: 600 s
 - Battery: 2000 mAh LiPo pouch cell, 3.7 V nominal, ignoring self-discharge and regulator losses
 
 Average current over one cycle:
@@ -117,10 +120,13 @@ days  = 3570 / 24 ≈ 149 days
 months ≈ 4.9 months
 ```
 
-Two levers dominate this number, in order of impact: **active duration** (Wi-Fi connect/TLS handshake is usually the biggest single cost — caching credentials and using a fast broker reconnect shaves this hard) and **sample interval** (doubling the interval to 20 minutes roughly halves average current and doubles runtime, since sleep current is already near-zero). Sleep current itself only matters once you've already gotten active time down — going from 10 µA to 100 µA barely moves the total here, but it dominates if you enable ULP sensor polling between wakes.
+The structure of the expression explains which levers matter. The active term contributes 330 mA·s per cycle against 5.978 mA·s from sleep, a ratio of roughly 55:1, so **active duration dominates** — the Wi-Fi association and TLS handshake are typically its largest component. **Sample interval** is the second lever: doubling it to 20 minutes roughly halves average current, because the sleep term is small enough that stretching it adds little. Sleep current itself only becomes significant once active time has been reduced; raising it from 10 µA to 100 µA moves the average from 0.56 mA to roughly 0.65 mA, a change of about a sixth, against the halving available from doubling the interval. It becomes the leading term only once active time is short or the ULP polls a sensor between wakes.
 
-## Try it against your own board
+## Pitfalls
 
-The numbers above are datasheet-typical for the bare module; measure your actual board with a current-limited bench supply or an inline shunt before trusting a runtime estimate; dev-board leakage from USB bridges and status LEDs routinely adds low-single-digit milliamps that a 10 µA sleep budget can't hide from.
-
-**Try next:** wire an ext1 wakeup on the SEN5x's fan-fault or interrupt pin alongside the timer wakeup, so the node samples on schedule but also wakes early on a hardware fault — then check `esp_sleep_get_wakeup_cause()` to branch firmware behavior per wake reason.
+- **Datasheet sleep current measured on an unmodified development board.** Symptom: measured idle current of several milliamps against a 10 µA budget, and a runtime an order of magnitude short of the estimate. Cause: the USB-to-serial bridge, power LED and linear regulator draw current independently of the module's sleep state.
+- **Wake source armed only on first boot.** Symptom: the node sleeps once and never wakes. Cause: deep-sleep wake restarts `app_main()`, so any arming call placed outside the per-cycle path is not re-executed.
+- **State held in ordinary globals across sleep.** Symptom: a boot counter reads 1 on every wake and comparisons against the previous sample never fire. Cause: main SRAM is unpowered in deep-sleep; only `RTC_DATA_ATTR` objects are retained.
+- **Hibernation chosen for its lower current while relying on retained state.** Symptom: the boot counter and cached calibration are lost. Cause: hibernation powers down RTC memory, whose contents are not guaranteed across the transition.
+- **Optimising sleep current before active duration.** Symptom: substantial effort on leakage yields a negligible runtime change. Cause: with a 2.2 s active window at 150 mA against 600 s at 10 µA, the active term is roughly 55 times the sleep term.
+- **Treating an ext1 wake as a timer wake.** Symptom: a node that woke early on a hardware fault publishes as though the interval had elapsed. Cause: the branch on `esp_sleep_get_wakeup_cause()` is absent, and both sources enter the same code path.

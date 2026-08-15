@@ -1,9 +1,9 @@
 ---
-title: "Secure Boot v2 and Flash Encryption on the ESP32: a chain of trust you can't un-burn"
+title: "Secure Boot v2 and flash encryption on the ESP32: an un-burnable chain of trust"
 date: 2026-07-30
 track: iot-embedded
-summary: "Secure Boot v2 verifies your bootloader and app against an eFuse-burned public-key digest; flash encryption makes a dumped SPI chip useless. Both are one-way eFuse burns — here's how the chain of trust fits together, the RELEASE vs DEVELOPMENT split, and how to test without bricking a board."
-reading_time: 6
+summary: "Secure Boot v2 verifies bootloader and application against an eFuse-burned public-key digest; flash encryption renders a desoldered SPI chip useless. Both rest on one-way eFuse burns. This article covers the chain of trust, the RELEASE versus DEVELOPMENT split, and how to validate the pipeline without losing a board."
+reading_time: 7
 tags: [esp32, esp-idf, secure-boot, flash-encryption, efuse, security]
 sources:
   - title: "Secure Boot v2 — ESP-IDF Programming Guide (ESP32, stable)"
@@ -18,44 +18,44 @@ sources:
     url: "https://zbotic.in/esp32-secure-boot-and-flash-encryption-protect-your-device/"
 ---
 
-Two threats hit a field-deployed ESP32. Someone reflashes your bootloader with their own code, or someone desolders the flash chip and reads your firmware — API keys, business logic, the lot — straight off the SPI bus. Secure Boot v2 answers the first; flash encryption answers the second. They are separate features, they lean on the same eFuse hardware, and once you commit them in RELEASE mode there is no going back. This article is about wiring them up deliberately.
+**Gist.** A field-deployed ESP32 faces two distinct attacks: substitution of the bootloader or application with attacker-supplied code, and extraction of firmware by reading the external SPI flash chip directly. Secure Boot v2 answers the first by refusing to execute any image whose signature does not verify against a public-key digest burned into electrically programmable fuses (eFuses); flash encryption answers the second by keeping flash contents as ciphertext under a key the firmware cannot read back. The cost is irreversibility — **eFuse bits transition 0 → 1 only, and in RELEASE mode the serial reflash path is permanently closed**, leaving over-the-air (OTA) update as the sole remaining route into the device.
 
 ## The chain of trust
 
-Secure Boot v2 builds a signature chain rooted in silicon. You generate an RSA-3072 keypair. The **private key stays on your build machine forever**; it never touches the device. At build time, ESP-IDF signs the second-stage bootloader and the app with it, appending an RSA-PSS signature block to each image. What goes into the chip is only the **SHA-256 digest of the public key**, burned into eFuse.
+Secure Boot v2 constructs a signature chain rooted in silicon. An RSA-3072 keypair is generated on the build machine. The **private key never reaches the device**. At build time ESP-IDF signs the second-stage bootloader and the application, appending an RSA-PSS signature block to each image. The only key material committed to the chip is the **SHA-256 digest of the public key**, burned into eFuse.
 
-On boot, the immutable first-stage ROM bootloader verifies the second-stage bootloader's signature, which in turn verifies the app, before either runs. The public key travels *inside* the signed image — an attacker can read it, but they can't forge a signature without the private key, and they can't swap in their own key because the ROM checks the embedded key against the burned digest first. Break any link and the chip refuses to boot.
+At reset, the immutable first-stage ROM bootloader verifies the second-stage bootloader's signature; the verified second-stage bootloader then verifies the application before transferring control. The invariant is that **no code executes until the code that will verify it has itself been verified**. The public key travels inside the signed image and is readable by anyone with the flash contents, but a forged signature requires the private key, and substituting a different public key fails because the ROM compares the embedded key against the burned digest before using it. A break at any link stops the boot.
 
-Chip families differ on the crypto and the eFuse layout:
+Chip families differ in signature scheme and eFuse layout:
 
 | Chip | Signature scheme | Digest eFuse | Key slots |
 |------|------------------|--------------|-----------|
 | ESP32 (rev v3.0+) | RSA-3072 (RSA-PSS) | BLK2, `ABS_DONE_1` | 1 |
 | ESP32-S3 / C3 / C6 | RSA-3072 (RSA-PSS) | `BLOCK_KEYx` + `SECURE_BOOT_DIGESTx`, `SECURE_BOOT_EN` | up to 3 |
-| ESP32-C2 | ECDSA-256 (NIST P-256) | `BLOCK_KEY0` | 1 |
+| ESP32-C2 | ECDSA (NIST P-192 or P-256) | `BLOCK_KEY0` | 1 |
 
-The three key slots on the newer RISC-V parts matter: you can burn multiple digests and revoke one with `KEY_REVOKEx` if a signing key leaks, without bricking the fleet. Classic ESP32 gives you exactly one shot.
+The **three digest slots on the newer RISC-V parts** admit key rotation: several digests can be burned, and one revoked via `SECURE_BOOT_KEY_REVOKEx` if the corresponding signing key is disclosed, while images signed by the surviving keys continue to verify. The classic ESP32 holds a single digest, so disclosure of that key has no in-field remedy.
 
 ## Flash encryption
 
-Flash encryption is symmetric. A key is generated (by the device on first boot, or burned by you) into an eFuse key block that firmware cannot read back. The flash controller transparently decrypts on read and encrypts on write, so a dumped image is ciphertext.
+Flash encryption is symmetric and transparent to the application. A key is generated by the device on first boot, or burned externally, into an eFuse key block that firmware cannot read back. The flash controller decrypts on read and encrypts on write, so an image recovered from the SPI bus or a desoldered chip is ciphertext.
 
-- **Classic ESP32** uses AES-256 in a tweaked, block-offset-XORed mode over 32-byte blocks. The enable counter is `FLASH_CRYPT_CNT` (7 bits); an **odd** number of set bits means encryption is on.
-- **ESP32-S3 / C3 / C6** use **XTS-AES** — 256-bit key (XTS-AES-128) in one `BLOCK_KEYx`, or 512-bit (XTS-AES-256) across two, tagged via `KEY_PURPOSE` as `XTS_AES_128_KEY`. The counter is `SPI_BOOT_CRYPT_CNT` (3 bits, odd = enabled).
+- **Classic ESP32** applies AES-256 over 32-byte blocks in a tweaked mode in which the block offset is XORed into the key material. The enable counter is `FLASH_CRYPT_CNT`, 7 bits wide; an **odd** number of set bits means encryption is enabled.
+- **ESP32-S3 / C3 / C6** use **XTS-AES**: a 256-bit key in one `BLOCK_KEYx` for XTS-AES-128, or 512 bits across two blocks for XTS-AES-256, with the block tagged through `KEY_PURPOSE` (for example `XTS_AES_128_KEY`). The counter is `SPI_BOOT_CRYPT_CNT`, 3 bits wide, again odd meaning enabled.
 
-Encryption covers the bootloader, partition table, and any partition marked `encrypted`, including your OTA app slots. The key never leaves the chip, so ciphertext from board A is meaningless on board B.
+Encryption covers the bootloader, the partition table, and every partition marked `encrypted`, which includes the OTA application slots. Because the key never leaves the chip, **ciphertext read from board A cannot be decrypted by board B**.
 
-## DEVELOPMENT vs RELEASE — the distinction that matters
+## DEVELOPMENT versus RELEASE
 
-This is the single most important decision, and it is not reversible.
+This choice is not reversible and determines what remains reachable over the wire.
 
-**DEVELOPMENT mode** keeps the door open. The serial (UART) bootloader can still re-encrypt and reflash plaintext images, so you can iterate over USB. `FLASH_CRYPT_CNT` / `SPI_BOOT_CRYPT_CNT` is left un-write-protected, giving a limited number of reflashes (three on classic ESP32). Perfect for a bench board; useless as production security, because that same serial path is what an attacker uses.
+**DEVELOPMENT mode** leaves the serial path open. The UART bootloader can still encrypt and write plaintext images supplied over the cable, so iteration over USB continues to work. The crypt counter — `FLASH_CRYPT_CNT` or `SPI_BOOT_CRYPT_CNT` — is left without write protection, which permits a bounded number of further reflashes (**three on the classic ESP32**, since each reflash consumes counter bits that only ever increase). That same serial path is available to an attacker with physical access, so DEVELOPMENT mode is a bench configuration, not a security posture.
 
-**RELEASE mode** slams it shut. UART-bootloader decryption is disabled, the crypt counter is write-protected, and the only remaining way to update firmware is OTA. Do this on a device you still need to debug and you have effectively locked yourself out.
+**RELEASE mode** closes it. UART-bootloader decryption is disabled, the crypt counter is write-protected, and OTA becomes the only update mechanism. Applied to a board that still needs debugging, this produces a device that cannot be recovered over the cable.
 
-## Doing it, step by step
+## Enabling the features
 
-Configure both in `idf.py menuconfig` under *Security features*:
+Both are configured in `idf.py menuconfig` under *Security features*:
 
 ```
 CONFIG_SECURE_BOOT=y
@@ -65,41 +65,49 @@ CONFIG_SECURE_FLASH_ENC_ENABLED=y
 CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y   # or ..._RELEASE
 ```
 
-Generate the signing key (keep it out of git, back it up offline):
+The signing key is generated once and kept out of version control, with an offline backup — its loss means no further signed image can be produced for the fleet:
 
 ```
 espsecure.py generate_signing_key --version 2 secure_boot_signing_key.pem
 ```
 
-Build the signed bootloader, then flash. ESP-IDF signs images and burns the eFuses on first boot:
+The signed bootloader is built and flashed; ESP-IDF signs the images and burns the eFuses on first boot:
 
 ```
 idf.py bootloader
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-Before and after, dump the eFuse state so you know exactly what is committed:
+eFuse state is dumped before and after so that what has been committed is known rather than assumed:
 
 ```
 espefuse.py -p /dev/ttyUSB0 summary
 ```
 
-Look for `ABS_DONE_1` / `SECURE_BOOT_EN` and the crypt-count fields flipping to enabled. For a manual, auditable rollout you can also burn the key digest yourself with `espefuse.py burn_key`, but let the build system drive it the first few times.
+The fields to inspect are `ABS_DONE_1` or `SECURE_BOOT_EN`, depending on the part, and the crypt-count field. Burning the key digest manually with `espefuse.py burn_key` gives a more auditable rollout; letting the build system perform the burn is the lower-risk path during initial bring-up.
 
-> **Warning — eFuse burns are permanent.** eFuse bits go 0 → 1 only; there is no erase. Selecting RELEASE mode and flashing will irreversibly disable serial reflashing, and may disable JTAG and ROM download mode. A wrong menuconfig choice here does not throw an error — it produces a board you can only ever update over OTA, or a brick. Never let RELEASE mode near a board you can't afford to lose. Also: do **not** cut power during the first-boot encryption pass — an interrupted pass corrupts flash and forces a full reflash.
+> **eFuse burns are permanent.** eFuse bits go 0 → 1 only; there is no erase operation. Selecting RELEASE mode and flashing irreversibly disables serial reflashing, and may also disable JTAG and ROM download mode. A wrong menuconfig selection produces no error — it produces a board reachable only over OTA, or an unusable one. Power must not be interrupted during the first-boot encryption pass: an interrupted pass corrupts flash and forces a full reflash.
 
-## How this meets OTA
+## Interaction with OTA
 
-Secure Boot and flash encryption change what an OTA update *is*. The [OTA updates article](/articles/iot-embedded/2026-07-26-esp32-ota-updates/) covers `esp_https_ota`, the A/B partition dance, and rollback. Layer security on top and three things follow:
+Secure Boot and flash encryption change the meaning of an OTA update. The [OTA updates article](/articles/iot-embedded/2026-07-26-esp32-ota-updates/) covers `esp_https_ota`, the A/B partition scheme, and rollback. Three consequences follow once security is layered on:
 
-1. **Every OTA image must be signed** with the same private key, or the new slot fails verification and the device stays on the old app. Your build pipeline, not just your bench, needs that key.
-2. **OTA partitions are encrypted per-device.** The incoming image arrives as plaintext ciphertext-for-transit (protect it with HTTPS); the flash driver re-encrypts it with the device's own eFuse key as it writes. You ship one signed binary; each board stores its own ciphertext.
-3. **In RELEASE mode, OTA is the only update path left.** That makes rollback and anti-rollback (`CONFIG_APP_ROLLBACK_ENABLE`, the `esp_ota_mark_app_valid_cancel_rollback` self-test) load-bearing — a bad push you can't fix over serial is a truck roll or a dead node.
+1. **Every OTA image must carry a valid signature** from the same private key, otherwise the new slot fails verification and the device continues running the previous application. The signing key must therefore be available to the build pipeline, not only to a developer workstation.
+2. **OTA partitions are encrypted per device.** The image is transported unencrypted at the flash-encryption layer — transport confidentiality is the responsibility of HTTPS — and the flash driver encrypts it with the device's own eFuse key as it is written. One signed binary is distributed; each board stores a distinct ciphertext.
+3. **In RELEASE mode OTA is the only remaining update path**, which makes rollback and anti-rollback load-bearing: `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` together with the `esp_ota_mark_app_valid_cancel_rollback` self-test determines whether a faulty push can be undone without physical access.
 
-Secure Boot and anti-rollback also compose: a signed-but-old image with a revoked security version is rejected, closing the downgrade-to-a-known-vuln attack.
+Secure Boot and anti-rollback compose: an image that is correctly signed but carries a revoked security version is rejected, which closes the downgrade-to-a-known-vulnerability path.
 
-## Getting the order right
+## Ordering the rollout
 
-Enable and validate Secure Boot v2 first, confirm signed images boot, then enable flash encryption — debugging an encrypted *and* signed image that won't boot is miserable when you can't tell which layer failed. Keep the two DEVELOPMENT-mode boards on your bench until the signed OTA path works end to end, because the moment you go RELEASE, that bench board becomes a field device you can only reach over the network.
+Secure Boot v2 is enabled and validated first, with signed images confirmed to boot, before flash encryption is enabled. **A board that fails to boot with both features active gives no direct signal about which layer rejected the image**, so separating the two in time separates the diagnosis. DEVELOPMENT-mode boards remain on the bench until the signed OTA path works end to end, because after the RELEASE burn a bench board is reachable only over the network.
 
-**Try next:** Flash Secure Boot v2 + flash encryption in **DEVELOPMENT mode** on a sacrificial board, run `espefuse.py summary` before and after to watch the eFuses commit, push one signed OTA update to prove the pipeline, and only then consider RELEASE mode on hardware you're prepared to never touch over USB again.
+## Pitfalls
+
+- **RELEASE mode burned on a debug board.** Symptom: the board no longer responds to `idf.py flash`, and JTAG may be dead as well. Cause: RELEASE disables UART-bootloader decryption and write-protects the crypt counter; the burn cannot be undone.
+- **DEVELOPMENT-mode reflashes exhausted.** Symptom: a previously reflashable classic ESP32 stops accepting new plaintext images after three cycles. Cause: each reflash consumes `FLASH_CRYPT_CNT` bits, and the bits only increase.
+- **Signing key lost or never backed up.** Symptom: no further OTA update verifies on any deployed device. Cause: the burned eFuse digest pins the fleet to one public key, and on the classic ESP32 there is no second slot to rotate into.
+- **Power loss during the first-boot encryption pass.** Symptom: the device does not boot afterwards and requires a full reflash. Cause: the in-place encryption of existing flash contents is interrupted mid-pass, leaving flash partially transformed.
+- **Unsigned image built by a pipeline that lacks the key.** Symptom: OTA completes the download but the device continues to run the old application. Cause: signature verification of the new slot fails, and Secure Boot refuses to hand control to it.
+- **Assuming HTTPS makes the image confidential at rest.** Symptom: an image extracted from a build server or a CDN is readable. Cause: flash encryption applies to the on-device write path; the distributed OTA binary is not encrypted by it.
+- **Partition not marked `encrypted`.** Symptom: data written by the application is recoverable in plaintext from a flash dump. Cause: only the bootloader, the partition table, and partitions explicitly flagged `encrypted` are covered.

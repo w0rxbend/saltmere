@@ -1,9 +1,9 @@
 ---
-title: "MQTT 5 on ESP32 with esp-mqtt: What a Sensor Fleet Actually Gains"
+title: "MQTT 5 on ESP32 with esp-mqtt: What a Sensor Fleet Gains"
 date: 2026-08-10
 track: iot-embedded
-summary: "A practical look at why MQTT 5 beats 3.1.1 for a fleet of ESP32 air-quality sensors — user properties, content-type, topic aliases, request/response, message expiry, and shared subscriptions — with a working ESP-IDF esp-mqtt v5 example."
-reading_time: 6
+summary: "What MQTT 5 adds over 3.1.1 for a fleet of ESP32 air-quality sensors — user properties, content-type, topic aliases, request/response, message expiry, shared subscriptions — and how ESP-IDF's esp-mqtt component exposes them."
+reading_time: 7
 tags:
   - esp32
   - esp-idf
@@ -24,27 +24,29 @@ sources:
     url: "https://www.emqx.com/en/blog/introduction-to-mqtt-5"
 ---
 
-I run a couple hundred ESP32 air-quality nodes: SDS011 and BME680 up front, an SPS30 on the newer boards, all reporting PM2.5, temperature, humidity, and VOC over Wi-Fi to a backend that fans data out to time-series storage and alerting. For years that was plain MQTT 3.1.1, and it worked. But once a fleet crosses a few hundred devices, the gaps in 3.1.1 stop being academic. MQTT 5 closes most of them, and — importantly — ESP-IDF's `esp-mqtt` component has first-class support for it. This is what actually changed for me, and how to wire it up.
+**Gist.** Message Queuing Telemetry Transport (MQTT) version 3.1.1 carries only a topic string and an opaque payload, so a fleet of a few hundred sensor nodes must encode metadata, content type, reply addresses and staleness rules inside the topic or the payload itself. MQTT 5.0, standardised by OASIS, adds a **typed property block to every packet** — user properties, content-type, topic aliases, response topic and correlation data, message expiry — plus shared subscriptions and specific reason codes on acknowledgements. The cost is a per-packet property encoding, a broker that must negotiate limits at CONNECT time, and in ESP-IDF an application-managed property lifecycle: properties are staged for the *next* operation only, and user-property handles are heap-allocated and must be freed explicitly.
 
-## Why MQTT 5, concretely
+The deployment discussed here is a few hundred ESP32 air-quality nodes — SDS011 and BME680 on older boards, SPS30 on newer ones — reporting particulate matter (PM2.5), temperature, humidity and volatile organic compounds (VOC) over Wi-Fi to a backend that fans out to time-series storage and alerting. The original transport was MQTT 3.1.1.
 
-**User properties.** MQTT 3.1.1 gives you a topic and an opaque payload. That's it. Every piece of metadata — firmware version, sensor model, calibration epoch, site ID — has to be smuggled into the topic string or the JSON body. MQTT 5 adds arbitrary key/value string pairs to any packet, so I attach `fw=1.8.2`, `sensor=sps30`, `site=warehouse-3` as headers. My ingest service routes on them without parsing the payload.
+## What MQTT 5 adds
 
-**Per-message content-type.** Some nodes send JSON, the memory-tight ones send a packed binary struct. In 3.1.1 the consumer guesses from the topic. MQTT 5 carries a `content_type` (a MIME string like `application/json`) and a `payload_format_indicator` that flags UTF-8 vs. binary. The decoder just reads the header.
+**User properties.** MQTT 5 permits arbitrary UTF-8 key/value string pairs on most packet types, CONNECT, PUBLISH, SUBSCRIBE, the acknowledgements and DISCONNECT among them. Metadata such as firmware version, sensor model or site identifier travels as `fw=1.8.2`, `sensor=sps30`, `site=warehouse-3` rather than being encoded into the topic hierarchy or the JavaScript Object Notation (JSON) body. An ingest service can route on the properties without parsing the payload.
 
-**Topic aliases (bandwidth).** A topic like `saltmere/sites/warehouse-3/rack-12/node-0a4f/airquality` is ~55 bytes on *every* publish. Over a battery-conscious node reporting every 10 seconds, that adds up. Topic aliases let the client register a topic once, then send a small integer in place of the full string on subsequent messages. On a chatty sensor that is real airtime and real power saved.
+**Payload format and content type.** Two properties describe the payload directly: `payload_format_indicator`, which distinguishes UTF-8 text from unspecified bytes, and `content_type`, a Multipurpose Internet Mail Extensions (MIME) string such as `application/json`. A fleet mixing JSON nodes with memory-constrained nodes sending packed binary structures no longer requires the consumer to infer the encoding from the topic.
 
-**Request/response.** Firmware update checks and calibration pulls are request/response, but 3.1.1 has no notion of it — you invent an ad-hoc reply-topic convention. MQTT 5 standardizes `response_topic` plus `correlation_data`, so a node can publish a query, tell the responder exactly where to reply, and match the response to its request.
+**Topic aliases.** A topic such as `saltmere/sites/warehouse-3/rack-12/node-0a4f/airquality` is 55 bytes and is retransmitted on **every** publish under 3.1.1. A topic alias is a small integer that stands in for the topic string within a single network connection. The **first publish carries both the full topic and the alias mapping; subsequent publishes carry the alias and an empty topic name**. The alias table does not survive the connection: after a reconnect the mapping must be re-established.
 
-**Message expiry.** A "recalibrate now" command that arrives 20 minutes late because a node was offline is worse than useless. `message_expiry_interval` tells the broker to drop a message the node never received once it goes stale — no more zombie commands.
+**Request/response.** MQTT 5 defines `response_topic` and `correlation_data` as protocol-level properties. A node publishing a firmware-check or calibration query names the topic it wants the answer on and attaches an opaque correlation token; the responder echoes the token so the requester can match reply to request. Under 3.1.1 the same pattern requires a private convention agreed between firmware and backend.
 
-**Shared subscriptions.** This one is backend-side but changes fleet architecture. In 3.1.1, every subscriber to `.../airquality` gets every message, so scaling ingest means manual topic sharding. MQTT 5's `$share/{group}/{topic}` load-balances messages across a group of consumers automatically. Add an ingest worker, it joins the group and takes a share.
+**Message expiry.** `message_expiry_interval` gives a publish a lifetime in seconds. A command queued for an offline node whose session is retained is **discarded by the broker once the interval elapses**, rather than being delivered late. For a "recalibrate now" command, late delivery is a correctness problem, not merely a latency one.
 
-**Better reason codes.** 3.1.1 CONNACK gives you a handful of vague return codes and a disconnect is just silence. MQTT 5 attaches specific reason codes to almost every ACK — quota exceeded, packet too large, topic name invalid — so when a node misbehaves you learn *why* instead of watching it silently reconnect-loop.
+**Shared subscriptions.** A subscription to the filter `$share/{group}/{filter}` places the subscriber in a named group; the broker distributes matching messages **across the group's members instead of to all of them**. Adding an ingest worker therefore changes no firmware and requires no manual topic sharding.
+
+**Reason codes.** MQTT 5 attaches a specific reason code to nearly every acknowledgement and to DISCONNECT — quota exceeded, packet too large, topic name invalid — where 3.1.1 offers a short list of CONNACK return codes, a single SUBACK failure value, and silence elsewhere. A node that is being rejected reports a cause rather than entering an unexplained reconnect loop.
 
 ## Enabling MQTT 5 in ESP-IDF
 
-The API lives in the same `esp-mqtt` component you already use (ESP-IDF 5.x — this was verified against the v5.5.4 programming guide and the `mqtt5` example on `master`). You flip the protocol version in the config, then use a family of `esp_mqtt5_*` helpers to stage properties before each publish/subscribe. The key thing to understand about that helper family: properties are set on the client as a **one-time, next-operation** payload. You call the setter, then immediately call the publish/subscribe, and for user properties you allocate and then free a handle around it.
+The functionality lives in the existing `esp-mqtt` component under ESP-IDF 5.x; the API below matches the v5.5.4 programming guide and the `mqtt5` example on `master`. Two properties of the helper family govern correct use. First, the property setters stage a bundle that applies to the **next corresponding operation only**, so they must be called immediately before the publish or subscribe they modify. Second, `esp_mqtt5_client_set_user_property` **allocates** a handle that the application must release.
 
 ```c
 #include "mqtt_client.h"
@@ -58,8 +60,7 @@ static esp_mqtt5_user_property_item_t pub_user_props[] = {
     {"site",   "warehouse-3"},
 };
 
-/* Publish-time MQTT 5 properties. content_type and topic_alias are real
-   fields of esp_mqtt5_publish_property_config_t. */
+/* Publish-time MQTT 5 properties. */
 static esp_mqtt5_publish_property_config_t pub_prop = {
     .payload_format_indicator = 1,          /* payload is UTF-8 text */
     .content_type             = "application/json",
@@ -73,7 +74,8 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
     esp_mqtt_event_handle_t event = event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED: {
-        const char *topic = "saltmere/sites/warehouse-3/node-0a4f/airquality";
+        const char *topic =
+            "saltmere/sites/warehouse-3/rack-12/node-0a4f/airquality";
         const char *payload = "{\"pm25\":7.4,\"voc\":112,\"t\":21.6}";
 
         /* Attach user properties to the publish property handle... */
@@ -83,11 +85,11 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         esp_mqtt5_client_set_publish_property(client, &pub_prop);
         /* ...then publish (QoS 1). */
         esp_mqtt_client_publish(client, topic, payload, 0, 1, 0);
-        /* Free the user-property handle we just allocated. */
+        /* Free the handle allocated above; otherwise it leaks per publish. */
         esp_mqtt5_client_delete_user_property(pub_prop.user_property);
         pub_prop.user_property = NULL;
 
-        /* Subscribe to a shared group so backend/local consumers balance. */
+        /* Shared subscription: the broker balances across group "ingest". */
         esp_mqtt_client_subscribe(client, "$share/ingest/saltmere/cmd/#", 1);
         break;
     }
@@ -115,7 +117,7 @@ void mqtt5_start(void)
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = "mqtt://broker.saltmere.lan",
-        .session.protocol_ver = MQTT_PROTOCOL_V_5,   /* <-- the switch */
+        .session.protocol_ver = MQTT_PROTOCOL_V_5,   /* the opt-in */
     };
 
     client = esp_mqtt_client_init(&cfg);
@@ -126,20 +128,30 @@ void mqtt5_start(void)
 }
 ```
 
-A few things worth calling out, because they trip people up:
+Points that carry the behaviour:
 
-- **`.session.protocol_ver = MQTT_PROTOCOL_V_5`** is the entire opt-in. Leave it out and you get 3.1.1, and none of the `esp_mqtt5_*` setters do anything.
-- The setters (`esp_mqtt5_client_set_publish_property`, `..._set_subscribe_property`) apply to the *next* corresponding call only. Set them inside the event handler, right before you publish or subscribe — not once at startup.
-- `esp_mqtt5_client_set_user_property` **allocates** a handle. Always pair it with `esp_mqtt5_client_delete_user_property` after the operation, or you leak on every publish. On a device that runs for months, that matters.
-- **Topic aliases** need a session budget. Advertise `topic_alias_maximum` in the connection properties; the broker must accept a non-zero value before your `.topic_alias = 1` publishes take effect. The first publish still sends the full topic *and* the alias mapping; later ones send the alias alone.
-- **Shared subscriptions** are just a topic-name convention — `$share/{group}/{filter}`. ESP-IDF also exposes `is_share_subscribe` / `share_name` on the subscribe-property struct if you'd rather set it structurally. The broker handles the load-balancing; your firmware doesn't change.
+- **`.session.protocol_ver = MQTT_PROTOCOL_V_5` is the entire opt-in.** Omitting it selects 3.1.1, under which the `esp_mqtt5_*` setters have no effect.
+- The staged bundle is consumed by one operation. Setting properties once at startup leaves every later publish without them.
+- **Topic aliases require a negotiated budget.** `topic_alias_maximum` is advertised in the connection properties, and the broker's own maximum bounds what the client may use; a zero budget makes `.topic_alias = 1` inoperative.
+- **Shared subscriptions are a topic-filter convention**, `$share/{group}/{filter}`. ESP-IDF additionally exposes `is_share_subscribe` and `share_name` on the subscribe-property structure. The distribution is performed by the broker; firmware is unchanged either way.
+- `maximum_packet_size` is a limit the client declares for packets it is willing to receive. The broker must not send a packet larger than that; an oversized message is dropped at the broker rather than truncated at the client.
 
-## Reading properties on the way back in
+## Reading properties on inbound messages
 
-Inbound `MQTT_EVENT_DATA` events carry the peer's MQTT 5 properties too. The example's `print_user_property` helper walks them: call `esp_mqtt5_client_get_user_property_count` to size a buffer, then `esp_mqtt5_client_get_user_property` to copy the items out — and **free each `key`/`value` and the buffer**, because those are heap-allocated for you. That's how a node reads the `correlation_data` and `response_topic` off an incoming request and knows where to send its reply.
+`MQTT_EVENT_DATA` events carry the peer's MQTT 5 properties. The pattern used by the example's `print_user_property` helper is two-stage: `esp_mqtt5_client_get_user_property_count` sizes a buffer, then `esp_mqtt5_client_get_user_property` copies the items into it. **The copied `key` and `value` strings, and the buffer itself, are heap-allocated and must be freed by the caller.** The same inbound property block carries `response_topic` and `correlation_data`, which is how a node learns where to send a reply and which token to echo.
 
-## Is it worth the migration?
+## Migration shape
 
-For a single hobby node, probably not — 3.1.1 is simpler and lighter. For a fleet, the calculus flips. Topic aliases cut airtime, message expiry kills stale commands, user properties get metadata out of your payload schema, and shared subscriptions let ingest scale horizontally without touching firmware. MQTT 5 is also backward-compatible at the broker, so you can migrate devices in waves rather than flag-day everything. I moved the newest hardware first and left the old SDS011 boards on 3.1.1 until their next OTA.
+MQTT 5 and 3.1.1 clients can be served by the same broker, so a fleet migrates in waves rather than as a flag day; in the deployment described here the newest hardware moved first and older SDS011 boards remained on 3.1.1 until their next over-the-air (OTA) update. For a single node the added property machinery buys little: 3.1.1 is smaller and has no lifecycle to manage. The gains scale with fleet size — alias-compressed topics reduce airtime per publish, expiry bounds command staleness, user properties remove metadata from the payload schema, and shared subscriptions decouple ingest scaling from firmware.
 
-**Try next:** Wire up the request/response path end to end — publish a `calibrate?` request with a `response_topic` and `correlation_data`, have a small consumer reply, and confirm the node matches the response by correlation ID. Then measure the actual byte savings from topic aliases with a packet capture before and after.
+The byte saving from topic aliases is deployment-specific and is best established with a packet capture before and after, since it depends on topic length, publish interval and reconnect frequency.
+
+## Pitfalls
+
+- Calling `esp_mqtt5_client_set_user_property` without a matching `esp_mqtt5_client_delete_user_property` leaks a heap allocation on every publish; on a node running for months the symptom is a slow decline in free heap ending in an allocation failure, not an immediate crash.
+- Staging properties once during startup rather than immediately before each operation produces publishes with no properties at all, because the bundle applies to the next operation only.
+- Setting `.topic_alias` without advertising `topic_alias_maximum`, or beyond the value the broker grants, sends the full topic string on every publish — the expected bandwidth reduction never appears and no error is raised.
+- Topic-alias mappings are scoped to the network connection. After a reconnect, a publish that sends only the alias has no mapping at the broker; the alias must be re-registered with a full-topic publish first.
+- Omitting `.session.protocol_ver = MQTT_PROTOCOL_V_5` silently yields a 3.1.1 session in which every `esp_mqtt5_*` call is inert, so properties disappear with no compile-time or runtime complaint.
+- Reading inbound user properties without freeing each returned `key` and `value` in addition to the buffer leaks per received message, which is the more damaging direction on a command-subscribed node.
+- `message_expiry_interval` bounds how long a broker retains an undelivered message; it does not cause an already-delivered message to be ignored, so a node must still validate command freshness itself if delivery-to-execution latency matters.

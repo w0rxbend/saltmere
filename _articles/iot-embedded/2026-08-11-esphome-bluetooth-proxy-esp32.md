@@ -1,9 +1,9 @@
 ---
-title: "Extend BLE Range into Home Assistant with an ESP32 Bluetooth Proxy"
+title: "Extending BLE Range into Home Assistant with an ESP32 Bluetooth Proxy"
 date: 2026-08-11
 track: iot-embedded
-summary: "Battery BLE sensors scattered around a building are invisible to a Home Assistant host that can't physically hear them. A cheap ESP32 flashed with ESPHome relays those advertisements — and connectable devices — over Wi-Fi. Here's a minimal working proxy config and how to blanket a house with coverage."
-reading_time: 5
+summary: "Battery BLE sensors scattered around a building are invisible to a Home Assistant host that cannot physically hear them. An ESP32 flashed with ESPHome relays those advertisements — and connectable devices — over Wi-Fi. A minimal working proxy configuration, and how coverage is extended across a house."
+reading_time: 6
 tags: [esphome, esp32, bluetooth-proxy, ble, home-assistant, iot]
 sources:
   - title: "Bluetooth Proxy — ESPHome"
@@ -18,23 +18,27 @@ sources:
     url: "https://www.seeedstudio.com/blog/2026/03/11/esphome-bluetooth-proxy/"
 ---
 
-Bluetooth Low Energy was designed for coin-cell devices talking to something a few metres away, not for a house. So the moment you scatter cheap BLE sensors around a building — Xiaomi LYWSD03MMC thermometers reflashed with the ATC firmware, Mi Flora plant probes, a BLE particulate or CO₂ node in the garage — you hit the same wall. Home Assistant runs on one box in one room. Its Bluetooth adapter, if it has one at all, hears the sensors in that room and nothing through two brick walls and a floor. The readings exist; the host just can't listen from where it sits.
+**Gist.** Bluetooth Low Energy (BLE) is a short-range radio protocol, so a Home Assistant host in one room cannot hear coin-cell sensors two walls away; the readings are broadcast but never received. An ESP32 running ESPHome's `bluetooth_proxy` component sits near the sensors and forwards the BLE traffic it hears to Home Assistant over Wi-Fi via the ESPHome native application programming interface (API), where it is presented as an additional Bluetooth adapter. The cost is a dedicated microcontroller per zone: the ESP32 Bluetooth stack consumes a large share of the chip's RAM, and the ESPHome documentation recommends against adding other components to the same device.
 
-A Bluetooth proxy fixes the geometry instead of the radio. You flash a spare ESP32 with ESPHome's `bluetooth_proxy` component, plug it in near the sensors, and it forwards every BLE advertisement it hears over Wi-Fi to Home Assistant using the ESPHome native API. HA treats that remote ESP32 as just another Bluetooth adapter. Put three or four proxies around the house and you have building-wide BLE coverage for the price of a few dev boards.
+## The problem is geometry, not sensitivity
 
-## Passive vs active proxy modes
+Devices such as Xiaomi LYWSD03MMC thermometers reflashed with the ATC firmware, Mi Flora plant probes, or a BLE particulate or carbon-dioxide node in a garage transmit continuously. The failure is that **no receiver is within range**. Increasing the host's transmit power changes nothing, because the limiting direction is inbound. A proxy relocates the receiver rather than improving it: the ESP32 performs the radio work locally and the Wi-Fi link — which already spans the building — carries the result.
 
-There are two things a proxy can do, and they matter for what devices you can reach.
+The relayed unit is the raw advertisement, not a decoded sensor value. Decoding remains in Home Assistant, so a proxy needs no knowledge of any particular sensor's payload format and needs no reconfiguration when a new sensor type is introduced.
 
-**Passive** proxying relays the advertising packets that BLE sensors broadcast unsolicited. Most battery sensors — ATC thermometers, plant sensors, air-quality beacons — publish their readings right in the advertisement, so passive mode is enough to see temperature, humidity, and battery with zero connection overhead and no extra drain on the sensor's cell.
+## Passive and active proxying
 
-**Active** proxying adds the ability to open a real GATT connection through the proxy — the same connectable devices we built by hand in the [ESP32 BLE GATT server article]({{ site.baseurl }}/articles/iot-embedded/2026-07-30-esp32-ble-gatt-nimble/). That's what you need for locks, some Switchbot devices, and any sensor whose data only comes over a connection rather than an advertisement. Active mode also enables *active scanning*, where the proxy sends a scan request to pull the scan-response payload (device names and extra data) that some sensors only reveal when asked.
+Two distinct capabilities are involved, and they determine which devices are reachable.
 
-Active connections are relayed to Home Assistant only when the native API is **encrypted** — an unencrypted API will still pass advertisements but refuses to broker connections. So set an encryption key regardless.
+**Passive** proxying relays the advertising packets that BLE peripherals broadcast unsolicited. Sensors that publish their readings inside the advertisement — ATC thermometers, plant sensors, air-quality beacons — are fully served by passive mode. **No connection is opened, so the sensor's cell incurs no additional drain.**
 
-## A minimal working proxy
+**Active** proxying additionally allows a Generic Attribute Profile (GATT) connection to be opened *through* the proxy, reaching the same class of connectable peripheral built by hand in the [ESP32 BLE GATT server article]({{ site.baseurl }}/articles/iot-embedded/2026-07-30-esp32-ble-gatt-nimble/). This is required for locks, some Switchbot devices, and any sensor whose data is exposed only over a connection. A separate setting on the scanner enables **active scanning**, in which the proxy transmits a scan request to elicit the scan-response payload — device names and additional data that some peripherals reveal only when asked. The two settings are configured independently; the next section separates them.
 
-This is a complete, buildable config for a plain ESP32. It enables active proxying, sets an encryption key, and keeps everything else deliberately light.
+One constraint is absolute: **active connections are relayed only when the native API is encrypted.** An unencrypted API continues to pass advertisements but refuses to broker connections. The practical consequence is a silent partial failure — sensors appear, locks do not — so an encryption key belongs in every proxy configuration regardless of present intent.
+
+## A minimal working configuration
+
+The following is a complete, buildable configuration for a plain ESP32. It enables active proxying, sets an encryption key, and omits everything else.
 
 ```yaml
 esphome:
@@ -59,10 +63,10 @@ wifi:
   password: !secret wifi_password
 
 logger:
-  # Trim BLE log spam once it works; verbose logging costs heap.
+  # Verbose BLE logging costs heap; INFO is the steady-state level.
   level: INFO
 
-# The scanner. Passive scanning is easier on heat and CPU.
+# The scanner. Passive scanning transmits no scan requests.
 esp32_ble_tracker:
   scan_parameters:
     interval: 320ms
@@ -73,23 +77,34 @@ bluetooth_proxy:
   active: true
 ```
 
-Generate the encryption key from **Settings → Devices → ESPHome → new device** in Home Assistant, or with any base64-encoded 32-byte value. Note the split personality of the two `active` flags: `esp32_ble_tracker`'s `active` controls scan requests (leave it `false` to run cooler for advertisement-only sensors), while `bluetooth_proxy`'s `active` controls GATT connections. You can run passive scanning and active connections together, which is a sensible default.
+The encryption key is generated from **Settings → Devices → ESPHome → new device** in Home Assistant, or supplied as any base64-encoded 32-byte value.
 
-## Flashing and adding coverage
+The two `active` keys are unrelated despite the shared name, and conflating them is the most common configuration error. **`esp32_ble_tracker.active` controls scan requests**; leaving it `false` avoids transmitting a scan request for every advertisement seen, which is sufficient where only advertisement-based sensors are in range. **`bluetooth_proxy.active` controls GATT connections.** The combination in the snippet — passive scanning with active connections — is coherent: connections are brokered on demand without the scanner soliciting scan responses.
 
-For the first flash you need USB — the initial build repartitions flash to make room for the BLE stack, so it can't be done purely over the air. Two easy paths:
+The `scan_parameters` pair defines a duty cycle: a **30 ms receive window inside every 320 ms interval**, so the radio listens for roughly one-tenth of the time. A peripheral whose advertising interval is long relative to that window is heard less often, which manifests as delayed rather than absent updates.
+
+## Flashing and extending coverage
+
+The first flash requires universal serial bus (USB) cabling: a factory-fresh board carries no ESPHome firmware, so there is nothing yet listening for an over-the-air update.
 
 | Method | When to use |
 | --- | --- |
-| [web.esphome.io](https://web.esphome.io) | No install; flash straight from Chrome/Edge over USB. Good for the first device. |
-| ESPHome dashboard (HA add-on) | Manages secrets, OTA, and rebuilds for a fleet of proxies. |
+| [web.esphome.io](https://web.esphome.io) | No installation; flashes over USB from Chrome or Edge. Suitable for the first device. |
+| ESPHome dashboard (Home Assistant add-on) | Manages secrets, over-the-air (OTA) updates and rebuilds across a fleet of proxies. |
 
-After the first cable flash, every later change goes over the air via the `ota:` block. Home Assistant auto-discovers the device; confirm the encryption key and the Bluetooth integration immediately lists the proxy as a remote adapter. Drop a second and third board in the far corners of the house and HA merges their coverage automatically, preferring whichever adapter hears a given sensor best.
+Every subsequent change is delivered over the air through the `ota:` block. Home Assistant auto-discovers the device; once the encryption key is confirmed, the Bluetooth integration lists the proxy as a remote adapter. Additional boards placed at the far corners of a building have their coverage merged automatically, with Home Assistant preferring whichever adapter hears a given sensor best.
 
-## Keep it lean
+## Resource budget
 
-BLE proxying is genuinely resource-hungry. The ESP32 Bluetooth stack eats a large slice of RAM, and relaying scan traffic while juggling connection slots keeps the CPU busy. The ESPHome docs are blunt about it: pile on too many components and the device will crash. So a proxy should be *just* a proxy. Resist the urge to bolt a display, voice assistant, or a stack of I²C sensors onto the same board — if you want an environmental node too, build a dedicated one following the [ESPHome DIY air-quality node]({{ site.baseurl }}/articles/iot-embedded/2026-07-31-esphome-diy-air-quality-node/) and let this ESP32 do one job well.
+BLE proxying is resource-hungry. The ESP32 Bluetooth stack occupies a large portion of available RAM, and relaying scan traffic while maintaining connection slots keeps the processor busy. **A proxy should therefore run no other workload.** A display, a voice assistant, or a set of Inter-Integrated Circuit (I²C) sensors on the same board competes for the same heap; an environmental node belongs on separate hardware, as in the [ESPHome DIY air-quality node]({{ site.baseurl }}/articles/iot-embedded/2026-07-31-esphome-diy-air-quality-node/).
 
-Classic ESP32 and the ESP32-S3 are the comfortable choices, with two cores and enough headroom for several connection slots. Single-core parts like the ESP32-C3 work fine for passive advertisement relaying but have less slack, so keep the config minimal and expect fewer simultaneous active connections. If you plan to reach connectable devices, tune `bluetooth_proxy`'s `connection_slots` (1–9) to match how many locks or Switchbots live in that zone — each slot costs heap.
+The classic ESP32 and the ESP32-S3 are the comfortable choices: two cores and sufficient headroom for several connection slots. Single-core parts such as the ESP32-C3 handle passive advertisement relaying but carry less slack, so configurations there should stay minimal and fewer simultaneous active connections should be expected. Where connectable devices are in scope, `bluetooth_proxy`'s **`connection_slots` (range 1–9)** is set to the number of locks or Switchbots in that zone; **each slot costs heap**, so over-provisioning trades stability for capacity that is never used.
 
-**Try next:** flash a second proxy at the opposite end of the building, then watch **Settings → System → Repairs → Bluetooth** in Home Assistant to see which adapter each sensor binds to as you move a thermometer between rooms.
+## Pitfalls
+
+- **Locks and Switchbots never appear while thermometers do.** The native API is unencrypted, so advertisements pass but connection brokering is refused.
+- **`active: true` set on `esp32_ble_tracker` instead of `bluetooth_proxy`.** Scan requests are transmitted — raising radio activity and heat — while GATT connections remain unavailable, which is the opposite of the intended effect.
+- **The device reboots or crashes after adding components.** The BLE stack's RAM footprint leaves little margin, which is why ESPHome recommends running no other components on a proxy device.
+- **An initial flash attempted over the air fails.** A board with no ESPHome firmware on it has no OTA endpoint to receive the image; the first flash is over USB.
+- **`connection_slots` raised speculatively.** Each slot consumes heap whether or not a device occupies it, reducing the margin available to the scanner.
+- **Verbose logging left enabled after commissioning.** Log output consumes heap on a device that has little to spare.

@@ -2,8 +2,8 @@
 title: "Driving the Sensirion SPS30 particulate sensor over I2C on an ESP32"
 date: 2026-08-07
 track: iot-embedded
-summary: "The SPS30 is a laser-scattering PM1.0/2.5/4/10 sensor that speaks the familiar Sensirion I2C dialect — but with two twists: it caps out at 100 kHz with no clock stretching, and each reading is a big-endian IEEE-754 float spread across two CRC-guarded I2C words. Here is the protocol, a correct ESP32 decode, and why you should schedule a weekly fan clean."
-reading_time: 6
+summary: "The SPS30 is a laser-scattering PM1.0/2.5/4/10 sensor speaking the Sensirion I2C dialect, with two constraints: a 100 kHz ceiling with no clock stretching, and readings delivered as big-endian IEEE-754 floats split across two CRC-guarded I2C words. The protocol, a correct ESP32 decode, and why the fan-cleaning cycle needs external scheduling."
+reading_time: 7
 tags: [sps30, sensirion, air-quality, i2c, esp32, particulate-matter]
 sources:
   - title: "Datasheet SPS30 (Version 2.0, June 2023) — Sensirion"
@@ -18,23 +18,56 @@ sources:
     url: "https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/i2c.html"
 ---
 
-The SPS30 is Sensirion's standalone particulate-matter sensor: a laser diode fires across a small airflow, particles scatter light onto a photodetector, and an on-board DSP turns the scattering signal into mass concentrations for four size bins. Unlike the Plantower PMS5003 — which streams a fixed frame over UART whether you asked for it or not — the SPS30 is a proper I2C peripheral you command and poll. It also exposes far more: number concentrations and a typical-particle-size estimate the PMS5003 never reports. If you have already wired a SEN5x or an SCD41, most of this will feel familiar, because the SPS30 shares the same 16-bit-command, CRC-per-word protocol. But it has two sharp edges that catch people, and both are worth understanding before you trust a single reading.
+**Gist.** Optical particulate sensing requires a host that can command a laser-scattering
+measurement chamber and retrieve averaged mass and number concentrations without corrupting
+them in transit. The SPS30 solves this with a polled inter-integrated-circuit (I2C) protocol:
+16-bit command codes, a cyclic-redundancy-check (CRC) byte after every two data bytes, and
+IEEE-754 single-precision floats reassembled from consecutive word pairs. The cost is that the
+device imposes a **100 kbit/s bus ceiling with no clock stretching**, so the host — not the
+sensor — is responsible for the delay between command and read, and for validating 20 CRC bytes
+per sample.
 
-## What it actually measures
+## Measured quantities
 
-The SPS30 reports two independent families of values. **Mass concentrations** in µg/m³ for PM1.0, PM2.5, PM4, and PM10 — the numbers you compare against an air-quality index. And **number concentrations** in #/cm³ for PM0.5, PM1.0, PM2.5, PM4, and PM10 — raw particle counts per size bin, useful for spotting a source (a candle, cooking, a 3D printer) before mass climbs. It also emits a **typical particle size** in µm.
+The SPS30 reports two independent families of values. **Mass concentrations** in µg/m³ for
+PM1.0, PM2.5, PM4 and PM10 — the quantities compared against an air-quality index — and
+**number concentrations** in particles per cm³ (#/cm³) for PM0.5, PM1.0, PM2.5, PM4 and PM10.
+Number concentration responds to a source (a candle, cooking, a 3D printer) before mass
+accumulates, because a burst of sub-micron particles contributes many counts and little mass.
+A **typical particle size** in µm is emitted as a tenth value.
 
-The optically resolved size range is 0.3–10 µm; the PM2.5 bin, for instance, is "particles from 0.3 to 2.5 µm." Mass concentration range is 0–1000 µg/m³ and number concentration 0–3000 #/cm³. Accuracy for PM1/PM2.5 is ±(5 µg/m³ + 5%) from 0–100 µg/m³. It provides a fresh averaged value roughly once per second while running, though the fan and optics need several seconds after start to settle before readings are trustworthy.
+The optically resolved size range is **0.3–10 µm**; the PM2.5 bin covers particles from 0.3 to
+2.5 µm. Mass concentration range is **0–1000 µg/m³**, number concentration **0–3000 #/cm³**.
+Mass-concentration accuracy for PM1.0 and PM2.5 is **±10 µg/m³ over 0–100 µg/m³** and ±10% over
+100–1000 µg/m³; the PM4 and PM10 figures are looser. A fresh averaged value
+appears approximately once per second while measurement is running; the fan and optics require
+several seconds after start before readings are trustworthy.
 
-## The I2C interface, and its two twists
+## The I2C interface and its two constraints
 
-Fixed **7-bit address `0x69`**. Every command is a 16-bit code sent MSB-first. So far, standard Sensirion.
+The address is a fixed **7-bit `0x69`**. Every command is a 16-bit code transmitted
+most-significant byte first.
 
-**Twist one: 100 kHz, and no clock stretching.** The SPS30 is a standard-mode I2C device — maximum **100 kbit/s**. Do not call `Wire.setClock(400000)` out of habit; the SEN5x and SCD4x tolerate 400 kHz, the SPS30 does not. And critically, it **does not use clock stretching**, so you cannot lean on the sensor to hold the clock while it prepares data. Instead you must respect the execution-time gap yourself: write the command, wait, then issue a separate read. Merge them and you read stale or garbage bytes with no protocol-level warning.
+**Constraint one: 100 kHz, no clock stretching.** The SPS30 is a standard-mode I2C device with a
+maximum bus rate of **100 kbit/s**. Raising the bus to 400 kHz — tolerated by the SEN5x and
+SCD4x parts — is outside specification here. The device also **does not use clock stretching**,
+the mechanism by which a peripheral holds the clock line low to delay the controller until data
+is ready. Without it there is no in-band back-pressure: the transaction must be split into a
+write of the command, a host-side wait, and a separate read. A combined write-then-repeated-start
+read returns whatever the internal buffer held at that instant, with **no protocol-level error** —
+the CRC is computed over whichever bytes are shifted out, so stale data passes the
+checksum.
 
-**Twist two: readings are big-endian floats spanning two words.** In its default output format each value is an IEEE-754 float — four bytes — but Sensirion's wire format inserts a CRC after *every two data bytes*. So one float arrives as **two I2C words**: `[MSB, MSB-1, CRC][MSB-2, LSB, CRC]`. To rebuild a float you take the two data bytes from each of two consecutive words, concatenate them big-endian, and reinterpret the 32 bits. Get the word boundaries wrong and PM2.5 comes out as `1.4e-41` or similar nonsense.
+**Constraint two: each reading spans two words.** In the default output format each value is an
+IEEE-754 single-precision float, four bytes, but the Sensirion wire format inserts a CRC after
+*every two data bytes*. One float therefore arrives as **two I2C words**:
+`[b31..b24, b23..b16, CRC][b15..b8, b7..b0, CRC]`. Reconstruction takes the two data bytes from
+each of two consecutive words, concatenates them big-endian into a 32-bit quantity, and
+reinterprets those bits as a float. **A one-word misalignment is not detected by any CRC** —
+each word is individually valid — and produces a denormal or absurd magnitude such as `1.4e-41`
+rather than an error.
 
-The commands you need:
+The command set required for a polling loop:
 
 | Command | Code | Notes |
 |---|---|---|
@@ -43,16 +76,27 @@ The commands you need:
 | Read Measured Values | `0x0300` | 60 bytes in float format (10 floats), 30 bytes in uint16 format |
 | Stop Measurement | `0x0104` | back to idle |
 | Sleep / Wake-up | `0x1001` / `0x1103` | low-power idle; wake needs a dummy address byte first |
-| Start Fan Cleaning | `0x5607` | spins the fan to max for ~10 s |
+| Start Fan Cleaning | `0x5607` | spins the fan to maximum for ~10 s |
 | Read/Write Auto-Clean Interval | `0x8004` | 32-bit seconds; default `604800` (1 week) |
 
-## CRC-8: the same family, verify it
+## CRC-8 over each word
 
-Every 2-byte word is followed by a one-byte checksum, and it is the standard Sensirion CRC — **polynomial `0x31` (x⁸ + x⁵ + x⁴ + 1), init `0xFF`, no reflection, no final XOR**, computed over the two data bytes. If you have read the SEN5x or SCD41 pieces this is the identical routine; reuse it verbatim. In float format `Read Measured Values` returns 60 bytes — that is 20 words, so **20 CRC bytes to check**. Skip them and a marginal pull-up turns into a plausible-but-wrong µg/m³ spike buried in months of logs.
+Every 2-byte word is followed by a one-byte checksum computed over those two data bytes with the
+standard Sensirion parameters: **polynomial `0x31` (x⁸ + x⁵ + x⁴ + 1), initial value `0xFF`, no
+input or output reflection, no final XOR**. The routine is identical to the one used by the SEN5x
+and SCD41 parts and can be reused verbatim.
 
-## A correct ESP32 decode
+The scope of the check is what matters. In float format `Read Measured Values` returns 60 bytes —
+**20 words, hence 20 CRC bytes**. Each guards two bytes only; it detects bit corruption within a
+word, and does not detect a word delivered out of order, a truncated transfer that still yields
+whole words, or the stale-buffer case above. Omitting the checks converts a marginal pull-up
+resistor into a plausible-looking µg/m³ excursion indistinguishable from a real event in a
+months-long log.
 
-Plain Arduino `Wire`, no vendor library, so the protocol is fully visible. Note the fixed 100 kHz clock and the two-word float reassembly.
+## An ESP32 decode
+
+Plain Arduino `Wire`, no vendor library, so the protocol remains visible. The fixed 100 kHz clock
+and the two-word float reassembly are the load-bearing parts.
 
 ```cpp
 #include <Wire.h>
@@ -71,18 +115,18 @@ uint8_t crc8(uint8_t msb, uint8_t lsb) {
 void cmd(uint16_t c) {                          // pointer-only command
     Wire.beginTransmission(SPS30);
     Wire.write(c >> 8); Wire.write(c & 0xFF);
-    Wire.endTransmission();
+    Wire.endTransmission();                      // STOP, not a repeated start
 }
 
 void startMeasurement() {                       // 0x0010 + arg word 0x0300 (float)
     Wire.beginTransmission(SPS30);
     Wire.write(0x00); Wire.write(0x10);
     Wire.write(0x03); Wire.write(0x00);         // 0x03 = IEEE754 float format
-    Wire.write(crc8(0x03, 0x00));               // CRC over the 2 data bytes
+    Wire.write(crc8(0x03, 0x00));               // CRC over the argument word only
     Wire.endTransmission();
 }
 
-bool readWords(uint16_t *out, int n) {          // n words, CRC-checked
+bool readWords(uint16_t *out, int n) {          // n words, every CRC checked
     if (Wire.requestFrom(SPS30, n * 3) != n * 3) return false;
     for (int i = 0; i < n; i++) {
         uint8_t msb = Wire.read(), lsb = Wire.read(), crc = Wire.read();
@@ -100,13 +144,13 @@ float wordsToFloat(uint16_t hi, uint16_t lo) {  // big-endian across two words
 void setup() {
     Serial.begin(115200);
     Wire.begin();
-    Wire.setClock(100000);                      // SPS30 is 100 kHz max, no stretching
+    Wire.setClock(100000);                      // 100 kHz max, no clock stretching
     startMeasurement();
-    delay(8000);                                // fan + optics need seconds to settle
+    delay(8000);                                // fan and optics settle over seconds
 }
 
 void loop() {
-    cmd(0x0202); delay(5);                       // read data-ready flag
+    cmd(0x0202); delay(5);                       // data-ready flag; delay replaces stretching
     uint16_t ready;
     if (!readWords(&ready, 1) || ready != 0x0001) { delay(200); return; }
 
@@ -125,19 +169,52 @@ void loop() {
 }
 ```
 
-Words 8–17 hold the five number concentrations (PM0.5, PM1.0, PM2.5, PM4, PM10 in #/cm³) in the same two-word float layout if you want them. On ESP-IDF the shape is identical: an `i2c_master_transmit` for the command, a small `vTaskDelay`, then an `i2c_master_receive` of 60 bytes — the SPS30's lack of clock stretching means the explicit delay is doing real work, not just being polite.
+Words 8–17 hold the five number concentrations (PM0.5, PM1.0, PM2.5, PM4, PM10 in #/cm³) in the
+same two-word float layout. **The full 60-byte block must be read even when only mass is wanted**,
+since word indices are fixed positions within one transfer.
 
-If your platform's I2C buffer or float handling is awkward — classic AVR is the usual culprit — send `0x0500` instead and read the 30-byte **uint16** block, where each PM value is a plain `uint16` scaled to µg/m³. On an ESP32 you have the RAM and the FPU, so prefer float.
+On ESP-IDF the shape is identical: an `i2c_master_transmit` carrying the command, a
+`vTaskDelay`, then an `i2c_master_receive` of 60 bytes. The absence of clock stretching means
+that delay is a functional requirement, not a courtesy.
 
-## Schedule the fan clean yourself
+Where a platform's I2C buffer or floating-point support is constrained — classic AVR being the
+common case — `0x0500` selects the 30-byte **uint16** block, in which each PM value is an
+unsigned 16-bit integer in µg/m³. The ESP32 has both the RAM for a 60-byte transfer and a
+hardware floating-point unit, so the float format costs nothing there.
 
-The SPS30 auto-runs a fan-cleaning cycle every `604800` seconds — one week — **but only counting continuous run time**. If your logger sleeps at night, deep-sleeps between samples, or power-cycles daily, that counter keeps resetting and the automatic clean may never fire. Dust on the optics slowly biases readings low. The fix is a five-second job: track your own uptime, and once a week issue **Start Fan Cleaning (`0x5607`)**, which spins the fan to full for ~10 s to blow the chamber clear. Do it at a fixed off-hour and discard readings for the following minute while flow re-stabilizes.
+## Fan cleaning and the uptime counter
 
-## Takeaways
+The SPS30 runs an automatic fan-cleaning cycle every `604800` seconds — one week — **counted in
+continuous run time**. The counter does not persist across a stop, a sleep command, or a power
+cycle. A logger that deep-sleeps between samples or powers down overnight therefore accumulates
+run time in fragments, and if no fragment reaches a week the automatic clean never fires.
+Sensirion documents the cleaning cycle as the means of preserving long-term measurement
+stability; without it, dust deposited on the optics **drifts the reported concentrations**, and
+no error flag is attached to that drift.
 
-- Address `0x69`, **100 kHz max, no clock stretching** — respect the write-wait-read gap manually.
-- Start with `0x0010` + `0x0300` for float output, poll `0x0202`, then read 60 bytes from `0x0300`.
-- Each float spans **two CRC-guarded words**; reassemble big-endian and check all 20 CRCs (poly `0x31`, init `0xFF`).
-- The weekly auto-clean counts uptime only — trigger `0x5607` yourself if the sensor ever sleeps.
+The remedy is host-side scheduling: track wall-clock elapsed time independently and issue
+**Start Fan Cleaning (`0x5607`)** on a weekly cadence. The cycle spins the fan to maximum for
+approximately 10 s. Readings taken while flow is re-stabilising afterwards are not comparable
+with the surrounding series and are best discarded.
 
-**Try next:** Log number concentration alongside mass for an evening, then light a candle across the room. Watch the PM0.5 #/cm³ count jump seconds before PM2.5 mass moves — that lead time is exactly what the SPS30 gives you over a mass-only UART sensor like the PMS5003.
+## Pitfalls
+
+- **`Wire.setClock(400000)` carried over from an SEN5x or SCD4x project.** The SPS30 is
+  standard-mode only at 100 kbit/s; exceeding it puts the bus outside the device specification.
+- **Command and read merged into one transaction with a repeated start.** With no clock
+  stretching the device cannot delay the controller, so the read returns buffer contents from
+  before the command was processed — and those bytes carry valid CRCs.
+- **Float reassembled from the wrong word pair.** Every individual word passes its CRC, so the
+  only symptom is a value such as `1.4e-41` or a magnitude far outside 0–1000 µg/m³.
+- **CRC bytes skipped to save cycles.** A marginal pull-up or a long cable produces corrupted
+  words that decode into plausible concentrations, indistinguishable from real excursions after
+  the fact.
+- **Reading fewer than 60 bytes in float format.** Word offsets are positions in a single
+  transfer; a short read shifts every subsequent field.
+- **Relying on the automatic fan clean on a duty-cycled logger.** The interval counts continuous
+  run time only, so a sensor that sleeps nightly may never reach the threshold, and the resulting
+  optical fouling drifts readings without raising any flag.
+- **Reading immediately after Start Measurement.** The fan and optics need seconds to settle;
+  early samples are not representative and carry no indication of that.
+- **Wake-up issued without the preceding dummy address byte.** The device remains in sleep and
+  the subsequent command is not acknowledged.

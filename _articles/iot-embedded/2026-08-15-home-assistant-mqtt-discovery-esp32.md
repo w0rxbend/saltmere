@@ -1,9 +1,9 @@
 ---
-title: "Home Assistant MQTT Discovery From a Bare ESP32: One Retained JSON and Your Sensor Just Appears"
+title: "Home Assistant MQTT Discovery From a Bare ESP32: One Retained JSON Config Creates the Entity"
 date: 2026-08-15
+summary: "ESPHome and Zigbee2MQTT obtain auto-discovery from the integration; hand-written ESP-IDF or Arduino firmware can speak the same convention. The discovery topic layout, the device-based single-message form, last-will availability, and the role of unique_id plus a device block in grouping five sensors under one device."
 track: iot-embedded
-summary: "ESPHome and Zigbee2MQTT get auto-discovery for free — your hand-rolled ESP-IDF or Arduino firmware can too. The discovery topic convention, the newer single-message device-based discovery, LWT availability, and why unique_id plus a device block is what makes five sensors show up as one device."
-reading_time: 5
+reading_time: 6
 tags: [home-assistant, mqtt, discovery, esp32, arduino, co2]
 sources:
   - title: "MQTT integration — MQTT Discovery (Home Assistant docs)"
@@ -18,7 +18,9 @@ sources:
     url: "https://github.com/plapointe6/HAMqttDevice"
 ---
 
-The [ESPHome node](/articles/iot-embedded/2026-07-31-esphome-diy-air-quality-node/) appears in Home Assistant by magic; the node running your own firmware sits invisible until someone hand-writes YAML for every entity. The magic is not ESPHome — it's **MQTT Discovery**, a plain convention any firmware can speak: publish one retained JSON config to the right topic and Home Assistant creates the entity, icon, units and device page for you. The broker mechanics (esp-mqtt client, QoS, sessions) are covered in the [MQTT 5 article](/articles/iot-embedded/2026-08-10-esp32-mqtt5-esp-mqtt/); this is purely about what to publish.
+**Gist.** A node running custom firmware publishes readings to a broker, but Home Assistant has no way to know what those readings mean, so every entity must otherwise be declared by hand in YAML. MQTT Discovery replaces that with a convention: the firmware publishes one retained JavaScript Object Notation (JSON) configuration message to a well-known topic, and Home Assistant creates the entity, its unit, device class and device page from it. The cost is that the broker now holds authoritative configuration state — a wiped retained message removes the entities, and a duplicated identifier silently drops one of them.
+
+The [ESPHome node](/articles/iot-embedded/2026-07-31-esphome-diy-air-quality-node/) appears automatically because ESPHome speaks this convention, not because of anything internal to it. Broker mechanics — the esp-mqtt client, quality of service (QoS), session handling — are covered in the [MQTT 5 article](/articles/iot-embedded/2026-08-10-esp32-mqtt5-esp-mqtt/); what follows concerns only the payloads.
 
 ## The topic convention
 
@@ -28,19 +30,21 @@ Per-entity discovery uses:
 <discovery_prefix>/<component>/[<node_id>/]<object_id>/config
 ```
 
-`discovery_prefix` defaults to `homeassistant`, `component` is the entity platform (`sensor`, `binary_sensor`, `switch`, …), and `node_id`/`object_id` are yours to choose from `[a-zA-Z0-9_-]`. So a CO2 reading lives at `homeassistant/sensor/aqnode01/co2/config`. The payload is JSON describing the entity: where its state is published, units, device class. Publish it **retained** so a restarted Home Assistant replays it from the broker; publish an empty retained payload to the same topic to delete the entity.
+`discovery_prefix` defaults to `homeassistant`, `component` is the entity platform (`sensor`, `binary_sensor`, `switch`, …), and `node_id`/`object_id` are chosen by the publisher from the character set `[a-zA-Z0-9_-]`. A carbon dioxide (CO2) reading therefore lives at `homeassistant/sensor/aqnode01/co2/config`. The payload is JSON describing the entity: where its state is published, its units, its device class.
 
-Since Home Assistant **2024.11** there is a better shape for multi-sensor nodes: **device-based discovery**. One message at
+Two retention rules define the lifecycle. The configuration message is published **retained**, so a restarted Home Assistant receives it again from the broker on resubscription rather than waiting for the node to reboot. Publishing an **empty retained payload to the same topic deletes the entity** — the topic that creates the entity is the one that clears it.
+
+Since Home Assistant **2024.11** a second form exists for multi-sensor nodes: **device-based discovery**, a single message at
 
 ```
 homeassistant/device/<object_id>/config
 ```
 
-describes the whole node — a `dev` (device) block, an `o` (origin) block naming your firmware, and a `cmps` map with one entry per component, each carrying a `p` (platform) key. One publish instead of five, and the device/entity relationship is explicit instead of reassembled from matching `device.identifiers`.
+describing the whole node. It carries a `dev` (device) block, an `o` (origin) block naming the firmware, and a `cmps` map with one entry per component, each entry carrying a `p` (platform) key. One publish replaces one message per entity, and the device-to-entity relationship is stated directly rather than reconstructed by matching `device.identifiers` across separate messages.
 
 ## The payload for a CO2 node
 
-Here is a device-based payload for an SCD41 node (the sensor itself is the [true-CO2 article](/articles/iot-embedded/2026-07-31-scd41-true-co2-i2c-esp32/)'s territory):
+A device-based payload for an SCD41 node (the sensor itself belongs to the [true-CO2 article](/articles/iot-embedded/2026-07-31-scd41-true-co2-i2c-esp32/)):
 
 ```json
 {
@@ -66,25 +70,25 @@ Here is a device-based payload for an SCD41 node (the sensor itself is the [true
 }
 ```
 
-The abbreviations (`avty_t` = `availability_topic`, `stat_t` = `state_topic`, `uniq_id` = `unique_id`, `dev_cla` = `device_class`) are official and worth using on a microcontroller — payloads shrink by half.
+The abbreviated keys (`avty_t` for `availability_topic`, `stat_t` for `state_topic`, `uniq_id` for `unique_id`, `dev_cla` for `device_class`) are documented aliases, not shorthand invented here, and reduce payload size — which matters on a microcontroller where the client buffer is a fixed allocation.
 
-Three fields do the heavy lifting:
+Three fields are load-bearing:
 
-- **`unique_id`** — without it the entity is ephemeral: no entity registry entry, no renaming, no area assignment. With it, plus the `dev` block, all components group under one device page. Derive it from something stable like the MAC (`aqnode-%02x%02x%02x`), never from anything that changes across reboots.
-- **`expire_after`** — seconds until a stale state flips the entity to `unavailable` (default 0 = never). Set it to 2–3× your publish interval; a crashed node then *shows* as dead instead of freezing its last reading on the dashboard forever.
-- **`avty_t`** — availability, next.
+- **`unique_id`** — without it the entity has no entry in the entity registry, and therefore cannot be renamed or assigned to an area; it exists only as long as its state does. With it, together with the `dev` block, every component collapses onto one device page. It must be derived from something **stable across reboots**, such as the media access control (MAC) address (`aqnode-%02x%02x%02x`).
+- **`expire_after`** — seconds after the last state message before the entity is marked `unavailable`. The **default is 0, meaning never expire**, so an unset value leaves a crashed node displaying its final reading indefinitely. A value comfortably larger than the publish interval makes the crash visible without flagging a single missed reading.
+- **`avty_t`** — the availability topic, described next.
 
-## Availability, LWT, and the birth message
+## Availability, last will, and the birth message
 
-Register a Last Will when connecting: topic `aqnode01/status`, payload `offline`, retained. After connecting, publish `online` (retained) to the same topic. The broker publishes the will for you when the node drops off — so availability is truthful even when the firmware never gets a chance to say goodbye. The defaults Home Assistant expects are literally `online`/`offline` (`payload_available`/`payload_not_available`).
+Availability rests on a broker-side mechanism rather than on the firmware. The client registers a **Last Will and Testament (LWT)** at connect time: topic `aqnode01/status`, payload `offline`, retained. Immediately after the connection succeeds the firmware publishes `online`, retained, to the same topic. The invariant is that **the topic is written either by the node when it is alive or by the broker when the session ends**, so it stays truthful across a power cut, a crash, or a Wi-Fi drop where the firmware never executes a shutdown path. The payloads Home Assistant expects by default are the literal strings `online` and `offline` (`payload_available` / `payload_not_available`).
 
-The reverse direction matters too: when Home Assistant itself restarts it publishes a **birth message** to `homeassistant/status`. Retained discovery configs cover the restart case, but subscribing to the birth topic and re-publishing discovery on `online` is cheap insurance against a wiped broker.
+The reverse direction also has a hook: on its own restart Home Assistant publishes a **birth message** to `homeassistant/status`. Retained discovery configurations already cover a plain restart, so subscribing to the birth topic and republishing discovery on `online` matters in the case where the broker's retained store has been cleared — a broker reinstall or a purge — and the retained configuration no longer exists to replay.
 
-Retain rules of thumb: discovery configs **retained**, availability **retained**, state — retained only if a stale-looking value at HA startup is acceptable; with `expire_after` set, retained state is safe and gives instant dashboards.
+Retention then divides cleanly: discovery configurations retained, availability retained, state retained only where a stale value shown at Home Assistant startup is acceptable. With `expire_after` set, retained state carries a bounded staleness rather than an unbounded one.
 
-## Arduino: publish discovery + state
+## Arduino: publishing discovery and state
 
-With `PubSubClient` the one real gotcha is the default 256-byte packet buffer — a device discovery payload will be silently dropped. Call `setBufferSize()` first.
+With `PubSubClient` the packet buffer defaults to 256 bytes, and a publish exceeding it is dropped locally: `publish()` returns `false` and nothing leaves the node. The device discovery payload above is larger than that, so unless the return value is checked the entity never appears and nothing reports why. `setBufferSize()` must be called before connecting.
 
 ```cpp
 #include <WiFi.h>
@@ -117,12 +121,20 @@ void connectMqtt() {
 void publishCo2(uint16_t ppm) {
   char buf[8];
   snprintf(buf, sizeof(buf), "%u", ppm);
-  mqtt.publish("aqnode01/co2", buf, true);       // state, every 60 s
+  mqtt.publish("aqnode01/co2", buf, true);       // retained state; caller sets the cadence
 }
 ```
 
-That's the entire integration: no YAML on the Home Assistant side, and the node appears as one device with a proper CO2 entity, correct icon, `ppm` unit, and long-term statistics (courtesy of `state_class: measurement`). If you'd rather not hand-assemble JSON, the small `HAMqttDevice` Arduino library builds per-entity payloads; on ESP-IDF, `cJSON` is already in the tree.
+That is the complete integration: no YAML on the Home Assistant side, and the node registers as one device with a CO2 entity carrying the `ppm` unit and long-term statistics, the latter following from `state_class: measurement`. Where hand-assembled JSON is unwelcome, the `HAMqttDevice` Arduino library constructs per-entity payloads; on ESP-IDF, `cJSON` is already present in the tree.
 
-The failure modes are all predictable: forgot `retained` on config → entities vanish when HA restarts; duplicated `unique_id` → HA raises an exception and ignores the second entity; no `device.identifiers` → entities scatter instead of grouping; buffer too small → nothing appears and nothing errors.
+A useful check: power-cycle the node while the device page is open. The LWT should mark it unavailable once the broker declares the session dead on keepalive expiry, and `expire_after` covers the distinct case where the network connection survives but the sensor task stops producing readings.
 
-**Try next:** power-cycle the node while watching the device page — LWT should flip it to unavailable within the broker's keepalive, and `expire_after` should catch the case where Wi-Fi stays up but your sensor task wedges.
+## Pitfalls
+
+- Discovery configuration published without the retain flag: entities exist until Home Assistant restarts, then disappear, because there is nothing in the broker to replay.
+- Two entities sharing a `unique_id`: Home Assistant raises an exception and ignores the second entity; the first appears normally, which makes the omission look like a publish failure.
+- No `device.identifiers` (`ids`) in the `dev` block, or differing identifiers across per-entity messages: the entities are created but scatter as unrelated devices instead of grouping.
+- `PubSubClient` buffer left at its 256-byte default: publishes of larger discovery payloads are dropped locally; `publish()` returns `false`, and a sketch that ignores the return value sees no entity and no diagnostic.
+- `expire_after` unset: a crashed node keeps its last reading on the dashboard indefinitely, since the default of 0 disables expiry.
+- LWT registered but no retained `online` published after connect: the retained `offline` from the previous disconnect remains the last value on the availability topic, and the entity stays unavailable while the node is running.
+- `unique_id` derived from a value that changes across reboots: each restart creates a new registry entry, and earlier renames and area assignments are stranded on orphaned entities.

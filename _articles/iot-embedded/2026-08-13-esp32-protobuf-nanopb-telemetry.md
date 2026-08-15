@@ -1,9 +1,9 @@
 ---
-title: "Shrink ESP32 telemetry with Protocol Buffers and nanopb"
+title: "Shrinking ESP32 telemetry with Protocol Buffers and nanopb"
 date: 2026-08-13
 track: iot-embedded
-summary: "JSON is fine until you're paying for every byte over cellular or LoRaWAN. Protobuf plus nanopb gives an ESP32 a schema-versioned binary uplink that's a fraction of the size — no malloc, a few KB of flash — and this shows the .proto, the generated C, and the encode-and-publish path over MQTT."
-reading_time: 6
+summary: "Field names dominate a small JSON telemetry frame. Protocol Buffers replaces them with integer tags and varints, and nanopb encodes the result on an ESP32 with static allocation and a few kilobytes of flash. This walks the .proto, the generated C, the wire-size derivation, and the MQTT publish path."
+reading_time: 7
 tags: [esp32, protobuf, nanopb, mqtt, telemetry]
 sources:
   - title: "nanopb — protocol buffers with small code size"
@@ -18,17 +18,25 @@ sources:
     url: "https://mosquitto.org/"
 ---
 
-A JSON air-quality reading like `{"pm25":12.4,"co2":812,"ts":1723560000}` is ~40 bytes on the wire and more once you add field names to every message. Multiply by a fleet publishing every few seconds over metered cellular or a duty-cycle-limited LoRaWAN link and the field-name overhead becomes the payload. Protocol Buffers drops the names entirely — fields are identified by integer tags — and **nanopb** is the implementation built for microcontrollers: static allocation, no STL, a couple of KB of code, and no heap if you constrain your fields.
+**Gist.** A JSON air-quality frame such as `{"pm25":12.4,"co2":812,"ts":1723560000}` occupies roughly 40 bytes, of which the field names and punctuation are a large fraction and are retransmitted on every message; over a metered cellular link or a duty-cycle-limited LoRaWAN uplink that overhead is the dominant cost. Protocol Buffers removes the names from the wire entirely — **fields are identified by an integer tag, and integers are length-varying (varint) encoded** — and nanopb implements the encoder for microcontrollers with static allocation, no dynamic memory, and a few kilobytes of code. The cost is that the payload is no longer self-describing: **both ends must hold the same `.proto` schema**, and a byte stream cannot be read without it.
 
-## Why protobuf beats JSON on a constrained uplink
+## Where the bytes go
 
-- **Size.** Varint-encoded integers and tag-based fields typically cut payloads 3–5x versus JSON. A reading like the one above lands in ~15 bytes.
-- **Schema evolution.** Add a field with a new tag number and old and new firmware still interoperate — new fields are ignored by old readers, missing fields read as defaults. No fragile "if key exists" JSON parsing on the backend.
-- **Determinism.** No float-to-string ambiguity, no locale, fixed parsing cost — good for a backend ingesting millions of messages.
+Protocol Buffers encodes each present field as a **key byte followed by a value**. The key is `(field_number << 3) | wire_type`, itself a varint, so **field numbers 1 through 15 cost a single key byte** while 16 and above cost two. The wire type selects how the value is read: varint (type 0) for `uint32`, `int32`, `sint32` and `bool`; fixed 32-bit (type 5) for `float` and `fixed32`; length-delimited (type 2) for strings, bytes and nested messages.
 
-The tradeoff: payloads aren't human-readable, and both ends must share the `.proto`. For fleet telemetry that's a feature, not a cost.
+A varint stores seven payload bits per byte, using the top bit as a continuation flag. Small magnitudes are therefore cheap and large ones are not: a value below 128 occupies one byte, one below 16 384 occupies two, and a Unix-seconds timestamp such as `1723560000` — which exceeds 2^28 — occupies five.
 
-## Define the message
+That is enough to derive the size of the three-field reading rather than assert it:
+
+- `ts` — key 1 byte, varint 5 bytes → **6 bytes**
+- `pm25` — key 1 byte, fixed 32-bit float 4 bytes → **5 bytes**
+- `co2` = 812 — key 1 byte, varint 2 bytes → **3 bytes**
+
+**14 bytes total**, against roughly 40 for the JSON form. The saving is not a fixed ratio; it scales with how verbose the field names are and how small the numbers are.
+
+Signed values need care. In the proto3 encoding a negative `int32` is sign-extended to 64 bits before varint encoding, so **any negative `int32` always occupies ten bytes**. The `sint32` type instead applies zigzag mapping, `n → (n << 1) XOR (n >> 31)`, which interleaves negatives with positives so that −1 becomes 1 and −2 becomes 3. Small magnitudes of either sign then stay in one or two bytes.
+
+## The schema
 
 ```protobuf
 syntax = "proto3";
@@ -42,24 +50,30 @@ message SensorReading {
 }
 ```
 
-Use `sint32` for values that go negative (zigzag encoding keeps small magnitudes small). Scaling temperature to deci-degrees as an int avoids shipping a float where you don't need one.
+Temperature is scaled to deci-degrees and carried as `sint32` rather than as a `float`: a float is unconditionally five bytes on the wire including its key, whereas a zigzagged deci-degree reading in the range ±6 400 fits in a two-byte varint plus its key.
 
-## Generate C with nanopb
+**Schema evolution rests on the tag numbers, not the names.** Adding `uint32 battery_mv = 6;` is backward compatible in both directions: an old decoder encounters an unrecognised field number and skips it using the wire type embedded in the key, and a new decoder reading an old message finds field 6 absent. Renaming a field changes nothing on the wire. **Renumbering or reusing a tag is the operation that silently corrupts data**, because a decoder will interpret the old bytes under the new field's meaning whenever the wire types happen to agree.
 
-Grab nanopb (current stable **0.4.9.1**, released 1 Dec 2024) — it bundles a `protoc` plugin. The generator reads an optional `.options` file that pins field sizes so nothing is dynamically allocated:
+The corresponding proto3 rule is that **a scalar field equal to its default — zero, `false`, the empty string — is not emitted at all**. Absence and zero are indistinguishable after decoding. A `co2` of 0 ppm and a `co2` that was never set both arrive as 0.
+
+## Generating C with nanopb
+
+nanopb (**0.4** series) ships a `protoc` plugin. It reads an optional `.options` file alongside the `.proto`, whose purpose is to **bind every variable-length field to a compile-time maximum** so that the generated struct is fixed-size:
 
 ```bash
 # sensor.options — no malloc, fixed buffers only
-# (only needed if you add string/bytes fields, e.g.:)
+# (only needed for string/bytes/repeated fields, e.g.:)
 # SensorReading.fw_version  max_size:16
 
-python -m nanopb.generator sensor.proto
+nanopb_generator.py sensor.proto
 # -> sensor.pb.h and sensor.pb.c
 ```
 
-Add `sensor.pb.c`, `pb_encode.c`, `pb_decode.c`, and `pb_common.c` to your build. With only scalar fields, the generated struct is a flat, fixed-size C struct — safe to put on the stack.
+With `max_size` set, a `string fw_version` becomes a `char fw_version[16]` member. Without it the generator emits a pointer or callback field and the caller must supply the storage or a callback, which reintroduces dynamic allocation. **A message whose fields are all scalars needs no `.options` at all**: the generated struct is flat and fixed-size and is safe to place on the stack.
 
-## Encode and publish over MQTT
+The build needs `sensor.pb.c` plus the three runtime translation units `pb_encode.c`, `pb_decode.c` and `pb_common.c`. A firmware that only uplinks can omit `pb_decode.c`.
+
+## Encoding and publishing over MQTT
 
 ```cpp
 #include <pb_encode.h>
@@ -82,21 +96,34 @@ bool publishReading(uint32_t id, float pm25, uint32_t co2, int32_t tC10) {
     Serial.printf("encode failed: %s\n", PB_GET_ERROR(&os));
     return false;
   }
-  // os.bytes_written is the exact payload length — publish raw bytes
+  // os.bytes_written is the exact payload length — protobuf is not fixed-width
   return mqtt.publish("fleet/node-kitchen-01/tele", buf, os.bytes_written, false);
 }
 ```
 
-`pb_ostream_from_buffer` writes into a stack buffer; `os.bytes_written` is the true length (protobuf is not fixed-width). Publish that slice as a binary MQTT payload — don't `String`-ify it. Retain stays `false` for telemetry.
+`SensorReading_init_zero` is the generated initialiser that clears the struct; omitting it leaves stack garbage in unassigned members, which proto3 will then encode as though the values were deliberate. `pb_ostream_from_buffer` wraps a caller-owned buffer, so **the encoder performs no allocation and cannot exceed the array**: on overflow `pb_encode` returns `false` and `PB_GET_ERROR` yields a diagnostic string, leaving the buffer partially written and unusable.
+
+Because the encoded length varies with the values, `os.bytes_written` — not `sizeof(buf)` — is the payload length. The three-argument `PubSubClient::publish` overload taking a `const uint8_t*` and a length is the one to use; the `const char*` overload stops at the first zero byte, and **a protobuf payload contains zero bytes routinely** (any varint byte or float byte may be 0x00). The final argument is the retain flag, left `false` so the broker does not replay a stale reading to new subscribers.
+
+Where the buffer size must be chosen rather than guessed, nanopb generates a `SensorReading_size` constant giving the worst-case encoded length for messages with no unbounded fields, and `pb_get_encoded_size` computes the exact length of a specific message without writing it.
 
 | | JSON | protobuf (nanopb) |
 |---|---|---|
-| Wire size (this reading) | ~40 B | ~15 B |
+| Wire size (three-field reading) | ~40 B | 14 B |
 | Names on wire | every message | never (tags only) |
-| Add a field | ad-hoc parsing | tag N, back-compatible |
-| Heap on ESP32 | via String/ArduinoJson | none (static) |
-| Debuggability | reads in a terminal | needs the `.proto` |
+| Adding a field | ad-hoc parsing on both ends | new tag, compatible both ways |
+| Heap on ESP32 | via `String`/ArduinoJson | none with fixed-size fields |
+| Readability | reads in a terminal | requires the `.proto` |
 
-On the backend, decode with the same `.proto` compiled for Go/Python/Rust — one schema, every language. Keep the `.proto` in a shared repo and version the tags, never renumber them.
+On the ingest side the same `.proto` compiles for Go, Python or Rust, so one schema definition serves every consumer. Keeping that file in a shared repository, and treating tag numbers as immutable once deployed to a device that may never be reflashed, is what makes the compatibility guarantee real.
 
-**Try next:** point `mosquitto_sub -t 'fleet/#' -v` at your broker, publish one reading, and confirm the payload is ~15 raw bytes; then add a `uint32 battery_mv = 6;` field, reflash one node, and watch old and new firmware coexist without the backend changing.
+## Pitfalls
+
+- **A zero-valued field vanishes.** proto3 omits scalars equal to their default, so a genuine `co2` of 0 and an unset `co2` decode identically. Distinguishing them requires an explicit presence marker, such as `optional` or a separate validity field.
+- **Reusing a retired tag number corrupts history.** A decoder matches on the integer only; if the old and new fields share a wire type, stale messages decode without error into the wrong field. Reserve retired numbers instead.
+- **`int32` for a quantity that goes negative costs ten bytes.** Negative `int32` values are sign-extended to 64 bits before varint encoding. `sint32` with zigzag mapping keeps small negative magnitudes small.
+- **Publishing the payload as a C string truncates it.** Protobuf output contains 0x00 bytes as ordinary data; the `const char*` publish overload treats the first one as the end of the message.
+- **Sizing the buffer from `sizeof(buf)` sends trailing garbage.** The encoded length is `os.bytes_written`; the remainder of the stack buffer is uninitialised.
+- **Omitting `_init_zero` encodes stack garbage.** Unassigned members hold whatever was previously on the stack, and any non-default value is emitted as if it were a real reading.
+- **String or bytes fields without a `max_size` in `.options` are not statically allocated.** The generator falls back to pointer or callback fields, and the "no heap" property is lost without a compile error to signal it.
+- **A message larger than the client's buffer fails at publish, not at encode.** PubSubClient enforces a maximum packet size and returns `false`; the encode step succeeded, so the failure surfaces only in the return value.

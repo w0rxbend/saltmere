@@ -1,8 +1,8 @@
 ---
-title: "HLK-LD2410 mmWave Presence on the ESP32: Seeing a Still Human"
+title: "HLK-LD2410 mmWave Presence on the ESP32: Detecting a Motionless Human"
 date: 2026-08-15
+summary: "Passive infrared sensors stop reporting once a body holds still; the HLK-LD2410's 24 GHz FMCW radar continues to report from breathing-scale motion. Covers the gate model (nine 0.75 m gates, roughly 6 m range), the 256000-baud UART protocol with its F4 F3 F2 F1 data frames, an Arduino-core parser, per-gate sensitivity tuning through engineering mode, the ESPHome ld2410 component, and where the LD2412 and multi-target LD2450 fit."
 track: iot-embedded
-summary: "PIR sensors go blind the moment you sit still; the HLK-LD2410's 24 GHz FMCW radar keeps seeing you from breathing motion alone. The module's gate model (nine 0.75 m gates, ~6 m range), the 256000-baud UART protocol with its F4 F3 F2 F1 data frames, an Arduino parser, per-gate sensitivity tuning via engineering mode, and the ESPHome ld2410 component as the sane default. Plus where the LD2412 and multi-target LD2450 fit."
 reading_time: 6
 tags: [ld2410, mmwave, presence-detection, esp32, uart, esphome, home-assistant]
 sources:
@@ -16,19 +16,27 @@ sources:
     url: "https://github.com/mgiesen/LD2410"
 ---
 
-Every PIR-based "occupancy" automation has the same failure mode: you sit down to read, stop waving your arms, and three minutes later the lights go out. A **PIR** sensor is a pyroelectric element that only responds to *change* in infrared — a warm body holding still is indistinguishable from an empty room. The **HLK-LD2410** takes the opposite approach: it's a **24 GHz FMCW radar** (frequency-modulated continuous wave) that measures Doppler shifts down to the millimetre scale of a chest rising and falling. A sleeping human is still a detected human. At around $3–5 for the bare module, it has become the default answer to "how do I know the room is actually occupied," and it talks plain UART to an ESP32.
+**Gist.** A **passive infrared (PIR)** sensor is a pyroelectric element that responds only to *change* in incident infrared, so a warm body holding still becomes indistinguishable from an empty room and occupancy automations time out on a seated reader. The **HLK-LD2410** replaces that measurement with a **24 GHz frequency-modulated continuous-wave (FMCW) radar** that resolves Doppler shifts down to the chest movement of breathing, and reports presence per distance gate over a plain UART link. The cost is that radar detects *motion in space*, not people: fans, curtains and the room on the far side of a drywall partition all produce energy, so every deployment turns into a per-gate threshold and placement exercise.
 
 ## Gates, and two kinds of energy
 
-The LD2410 divides the space in front of it into **distance gates** of **0.75 m** each, nine gates (0–8) for a maximum range of about **6 m**. For every gate it continuously computes two values: **moving energy** (large Doppler shifts — walking, gesturing) and **static energy** (micro-motion — breathing, small posture shifts). Each gate has an independent sensitivity threshold from 0–100 for each energy type; a target is reported when a gate's energy exceeds its threshold. Detection ends only after a configurable **"no-one" duration** (0–65535 s, default 5 s) with nothing above threshold — this is the debounce that keeps a bedroom sensor from flapping.
+The LD2410 partitions the space in front of it into **distance gates of 0.75 m each, gates 0–8**, for a maximum range of approximately **6 m**. For each gate the module continuously computes two quantities: **moving energy**, from large Doppler shifts such as walking or gesturing, and **static energy**, from micro-motion such as breathing and small posture shifts. **Each gate carries an independent sensitivity threshold in the range 0–100 for each of the two energy types**, and a target is reported when a gate's energy exceeds that gate's threshold.
 
-This per-gate model is the whole tuning story. Gate 0–1 thresholds handle the desk right in front of the sensor; gate 7–8 thresholds decide whether the hallway beyond the door counts. A fan at 3 m is a gate-4 problem you solve with a gate-4 threshold, not by desensitising the whole device.
+The reported state does not clear at the instant energy drops. Detection ends only after a configurable **"no-one" duration (0–65535 s, default 5 s)** has elapsed with nothing above threshold. That timer is the debounce that prevents a bedroom sensor from flapping between occupied and empty on marginal energy.
+
+The per-gate model is the entire tuning surface. **Gate 0 and gate 1 thresholds govern the desk directly in front of the module; gate 7 and gate 8 thresholds decide whether the hallway beyond the door registers.** A fan at 3 m falls in gate 4 and is addressed by raising the gate-4 threshold rather than desensitising the whole device.
 
 ## Wiring and the UART protocol
 
-The module wants **5 V** on VCC (there's an onboard regulator) but its TX/RX are **3.3 V TTL** — safe to wire directly to any ESP32 UART. Default serial settings are **256000 baud, 8N1**, which is why softserial on older MCUs struggles and the ESP32's hardware UARTs don't care.
+VCC expects **5 V** while TX and RX are **3.3 V TTL**, which permits direct connection to any ESP32 UART without level shifting. Default serial settings are **256000 baud, 8N1**. That rate is why a bit-banged software serial port on slower microcontrollers is marginal and why the ESP32's hardware UARTs are the appropriate consumer.
 
-Two frame families flow over that link. **Command frames** (host → module, and their ACKs) are bracketed by header `FD FC FB FA` and tail `04 03 02 01`, with a 2-byte little-endian length and a command word — `0x0060` sets max gates and the no-one duration, `0x0064` sets per-gate sensitivity (gate `0xFFFF` means "all gates"). **Data frames** (module → host, ~10 Hz) use header `F4 F3 F2 F1` and tail `F8 F7 F6 F5`. The payload starts with `0xAA`, then a **target state** byte — `0x00` none, `0x01` moving, `0x02` stationary, `0x03` both — followed by little-endian 16-bit moving-target distance (cm) and energy, static-target distance and energy, and overall detection distance, ending `55 00`.
+Two frame families travel over the link.
+
+**Command frames** (host to module, and their acknowledgements) are bracketed by header `FD FC FB FA` and tail `04 03 02 01`, carrying a 2-byte little-endian length and a command word. `0x0060` sets the maximum gate count and the no-one duration; `0x0064` sets per-gate sensitivity, where **gate value `0xFFFF` addresses all gates at once**.
+
+**Data frames** (module to host, emitted continuously without being polled) use header `F4 F3 F2 F1` and tail `F8 F7 F6 F5`. The payload opens with `0xAA`, then a **target-state byte**: `0x00` no target, `0x01` moving target, `0x02` stationary target, `0x03` both. The state byte is followed by little-endian 16-bit moving-target distance in centimetres and its energy, stationary-target distance and its energy, and an overall detection distance, terminating with `55 00`.
+
+The load-bearing consequence for a parser is that **the tail sequence, not a length field, is the reliable resynchronisation point**: a parser that scans for `F8 F7 F6 F5`, then validates the header and the expected offsets, recovers from a truncated frame within one frame period.
 
 A minimal Arduino-core parser for the basic frame:
 
@@ -55,22 +63,26 @@ void loop() {
         Serial.printf("state=%u move=%ucm(%u) still=%ucm(%u)\n",
                       state, move_cm, move_energy, still_cm, still_energy);
       }
-      n = 0;
+      n = 0;                                              // resync on tail
     }
-    if (n == sizeof(buf)) n = 0;
+    if (n == sizeof(buf)) n = 0;                          // drop oversized garbage
   }
 }
 ```
 
-Once frames parse, publishing `state != 0` as an occupancy topic is the same retained-JSON exercise as any other sensor — see the [MQTT discovery article](/articles/iot-embedded/2026-08-15-home-assistant-mqtt-discovery-esp32/) for making it appear in Home Assistant unaided. The framing-and-checksum discipline is the same habit as [parsing the PMS5003](/articles/iot-embedded/2026-07-31-pms5003-pm25-uart-esp32/), just with a different magic header.
+The byte at offset 6 is the data type, and the check `buf[6] == 0x02` is load-bearing: **an engineering-mode frame carries a different data type and inserts the per-gate energies before the tail**, so this parser silently discards every frame once engineering mode is enabled. A consumer that wants those energies must accept the engineering data type and read the gate array at its own offsets.
 
-## Tuning: engineering mode and the app
+Once frames parse, publishing `state != 0` as an occupancy topic is the same retained-JSON exercise as any other sensor — see the [MQTT discovery article](/articles/iot-embedded/2026-08-15-home-assistant-mqtt-discovery-esp32/) for making the entity appear in Home Assistant without manual configuration. The framing-and-validation discipline matches [parsing the PMS5003](/articles/iot-embedded/2026-07-31-pms5003-pm25-uart-esp32/) with a different header sequence.
 
-Blind threshold-guessing is miserable; use **engineering mode** (command `0x0062`), which extends each data frame with the live energy value of *every* gate. Watch the numbers with the room empty, note which gates the ceiling fan or curtain lights up, and set those gates' thresholds just above the noise. The **B** variant carries a Bluetooth radio and works with Hi-Link's **HLKRadarTool** phone app, which is exactly this workflow with sliders — tune over BLE, then let the UART consumer just read results. Config persists in the module's flash.
+## Tuning through engineering mode
 
-## The easy path: ESPHome
+Threshold selection without observation is guesswork. **Engineering mode, entered with command `0x0062`, extends each data frame with the live energy value of every gate.** The procedure is to observe those values with the room unoccupied, identify which gates a ceiling fan or a moving curtain excites, and set those gates' thresholds above the observed idle noise.
 
-If the node's only job is presence, skip the parser entirely. ESPHome has a native `ld2410` component covering the full protocol including engineering mode and runtime tuning from the Home Assistant UI:
+The **B** variant carries a Bluetooth radio and works with Hi-Link's **HLKRadarTool** phone application, which exposes the same per-gate thresholds as sliders; tuning happens over Bluetooth Low Energy while the UART consumer reads only results. **Configuration persists in the module's flash**, so a tuned module retains its thresholds across power cycles and across reflashes of the host microcontroller.
+
+## The ESPHome path
+
+Where a node's only function is presence, the hand-written parser is unnecessary. ESPHome provides a native `ld2410` component covering the protocol including engineering mode and runtime tuning from the Home Assistant interface:
 
 ```yaml
 uart:
@@ -97,22 +109,30 @@ sensor:
       name: Still Energy
 ```
 
-The component also exposes `number:` entities for every gate threshold and the timeout — tunable live, no reflash. It slots straight into the same node pattern as the [ESPHome air-quality build](/articles/iot-embedded/2026-07-31-esphome-diy-air-quality-node/).
+The component also exposes `number:` entities for every gate threshold and for the timeout, which makes tuning a runtime operation rather than a reflash. It follows the same node pattern as the [ESPHome air-quality build](/articles/iot-embedded/2026-07-31-esphome-diy-air-quality-node/).
 
-## Placement is half the battle
+## Placement
 
-Radar sees motion, not humans. The classic false-positive sources: **fans** (huge moving energy — mask those gates or aim away), **curtains** near HVAC vents, oscillating monitors, and pets. More surprising: 24 GHz penetrates drywall, so a sensor on a shared wall happily detects the neighbouring room — through-wall detection is a feature for hiding the sensor behind a plastic plate and a bug for everything else. Mount at 1.5–2 m height, tilted slightly down, with the beam (roughly ±60° horizontal) covering the seating area and *not* covering the doorway to the hallway. Never behind metal.
+Radar detects motion, not humans, and the distinction drives siting. Recurring false-positive sources are **fans**, which produce large moving energy and are best handled by masking their gates or aiming away; curtains near heating, ventilation and air-conditioning (HVAC) vents; oscillating displays; and pets. Less intuitively, **24 GHz penetrates drywall**, so a module mounted on a shared wall detects activity in the adjoining room — the same property that permits concealment behind a plastic plate. Mounting at roughly torso height and tilting slightly downward, with the beam of roughly **±60°** covering the seating area and excluding the doorway, addresses most of these. Metal in front of the module blocks it.
 
 ## The family
 
 | Module | Range | Targets | Notes |
 |---|---|---|---|
 | LD2410 | ~6 m | 1 | Bare module, UART only |
-| LD2410B | ~6 m | 1 | Adds BLE + app tuning; the one to buy |
+| LD2410B | ~6 m | 1 | Adds BLE and app tuning |
 | LD2410C | ~6 m | 1 | Smaller pinout/form factor, BLE |
-| LD2412 | ~9 m | 1 | Longer range, wider beam, newer firmware |
-| LD2450 | ~6 m | up to 3 | Multi-target *tracking*: X/Y position, speed per target |
+| LD2412 | longer than the LD2410 | 1 | More distance gates, separate protocol revision |
+| LD2450 | ~6 m | up to 3 | Multi-target tracking: X/Y position and speed per target |
 
-The **LD2450** is the interesting sibling: instead of presence-plus-distance it streams X/Y coordinates and velocity for up to three targets, enabling zone-based logic ("someone is at the desk" vs "someone walked past"). ESPHome supports it too, as `ld2450`.
+The **LD2450** differs in kind rather than degree: instead of presence plus a single distance it streams X/Y coordinates and velocity for up to three targets, which supports zone-based logic — distinguishing a target stationary at a desk from one traversing the room. ESPHome supports it as `ld2450`.
 
-**Try next:** wire an LD2410B to a spare ESP32, flash the ESPHome config above with engineering mode enabled, and spend ten minutes watching per-gate energies with the room empty — then set each gate's still threshold ~10 points above its idle noise and see how long a motionless you stays detected from the far side of the room.
+## Pitfalls
+
+- **Lights extinguish on a seated occupant even with the LD2410 installed.** The still-energy thresholds for the relevant gates are set above the breathing signal at that distance; only the moving-target path is firing.
+- **Occupancy never clears.** A gate covering a fan, a curtain over a vent, or the neighbouring room through drywall exceeds its threshold continuously, so the no-one timer never starts.
+- **The parser reports nothing after enabling engineering mode.** Engineering-mode frames carry a different data-type byte and a different payload layout; a parser that accepts only the basic data type discards all of them.
+- **A hallway sensor triggers on people who never enter.** Gates 7 and 8 extend to roughly 6 m and see through the doorway; the beam of about ±60° is wider than the intended zone.
+- **Software serial produces corrupted frames.** The default rate is 256000 baud, above what bit-banged serial sustains reliably; a hardware UART is required.
+- **Retuned thresholds survive a reflash unexpectedly.** Configuration persists in the module's flash, so a module tuned for a previous room carries those thresholds into the next deployment until they are rewritten.
+- **Detection appears blocked at short range.** Metal in the beam path reflects rather than transmits; the module must not be mounted behind a metal plate.
