@@ -1,12 +1,12 @@
 ---
-title: "JetStream: Persistence Without the Kafka Tax"
+title: "JetStream: Persistence Inside the NATS Server"
 date: 2026-08-04
 track: microservices
-summary: "NATS JetStream turns a single 20MB Go binary into a persistent event broker — streams, durable pull consumers, at-least-once acks, message dedup, and replay. Verified against NATS Server 2.14.2 and the modern nats.go jetstream API."
-reading_time: 5
+summary: "NATS JetStream turns a single Go binary into a persistent event broker — streams, durable pull consumers, at-least-once acknowledgement, publisher deduplication, and replay. Written against the current NATS Server 2.x line and the modern nats.go jetstream API."
+reading_time: 6
 tags: [nats, jetstream, event-driven, messaging, iot, go]
 sources:
-  - title: "NATS Server 2.14.2 release (nats-io/nats-server)"
+  - title: "NATS Server releases (nats-io/nats-server)"
     url: "https://github.com/nats-io/nats-server/releases"
   - title: "JetStream Walkthrough | NATS Docs"
     url: "https://docs.nats.io/nats-concepts/jetstream/js_walkthrough"
@@ -18,27 +18,27 @@ sources:
     url: "https://timderzhavets.com/blog/nats-jetstream-in-practice-persistent-messaging-and/"
 ---
 
-Core NATS is a fire-and-forget message bus: if a subscriber isn't connected when a message is published, that message is gone. That's fine for RPC and ephemeral fan-out, useless for an event broker. **JetStream** — the persistence layer built into the NATS server since 2.2 and enabled with a single `-js` flag — closes the gap. It gives you durable, replayable streams with acknowledgements, without bolting on a second system. Everything below is verified against **NATS Server 2.14.2** (June 2026 release, built with Go 1.26) and the modern `nats.go` `jetstream` package.
+**Gist.** Core NATS delivers at most once: a message published while a subscriber is disconnected is discarded, which rules the plain bus out as an event broker. **JetStream**, the persistence layer built into the NATS server since 2.2 and enabled with the `-js` flag, retains matching messages in an ordered, sequence-numbered stream and tracks per-consumer acknowledgement state, yielding at-least-once delivery and replay. The cost is the state itself: a file or memory store to size and retain, a redelivery window during which duplicates are visible to the application, and consumer cursors that must be administered as first-class server objects.
 
-I run IoT backends, so the thing that keeps pulling me back to JetStream is the footprint: one statically-linked Go binary, no ZooKeeper, no KRaft controllers, no JVM. The same `nats-server` runs on a developer laptop, a Kubernetes StatefulSet, and a fanless gateway box at the edge of a factory network. Persistence is a config toggle, not an architecture.
+Everything below describes the **NATS Server 2.x** line and the `jetstream` package of `nats.go`. The operational profile is a single statically linked Go binary — no external coordination service, no JVM — so the same `nats-server` process runs on a laptop, in a Kubernetes StatefulSet, and on a constrained gateway at the edge of a factory network. Persistence is a configuration toggle rather than a second system.
 
 ## What JetStream adds on top of core NATS
 
-Core NATS gives you subjects and at-most-once delivery. JetStream layers on four things: **persistence** (messages written to a file or memory store), **streams** (server-side retention of those messages), **consumers** (stateful cursors that track delivery and acks), and **flow control** with acknowledgement. The result is at-least-once delivery by default, and effectively-once processing when you combine publisher dedup with idempotent consumers.
+Core NATS provides subjects and at-most-once delivery. JetStream layers on four mechanisms: **persistence** (messages written to a file or memory store), **streams** (server-side retention of those messages), **consumers** (stateful cursors recording delivery and acknowledgement), and **flow control** tied to acknowledgement. The composite guarantee is at-least-once delivery; effectively-once *processing* requires publisher deduplication plus an idempotent consumer, and is built by the application rather than promised by the server.
 
 ## Streams, subjects, and consumers
 
-These three concepts trip people up because they map loosely onto Kafka but aren't the same thing.
+The three concepts map loosely onto Kafka's vocabulary without being equivalent, which is the usual source of confusion.
 
-A **subject** is the NATS address space — hierarchical, wildcarded tokens like `orders.eu.created`. Publishers never know or care that persistence exists; they publish to a subject exactly as in core NATS.
+A **subject** is the NATS address space — hierarchical, wildcarded tokens such as `orders.eu.created`. Publishers are unaware that persistence exists; they publish to a subject exactly as in core NATS.
 
-A **stream** is a named, server-managed store that *captures* one or more subjects. You declare `Subjects: ["orders.>"]` and the stream persists every matching message, in order, with a monotonic sequence number. Retention is configurable: keep messages by age, by count, by total bytes, or with `WorkQueue`/`Interest` policies that delete a message once it's been consumed. One stream, many subjects — that's the key inversion from Kafka's topic-is-the-unit model.
+A **stream** is a named, server-managed store that *captures* one or more subjects. Declaring `Subjects: ["orders.>"]` causes the stream to persist every matching message, in order, under a **monotonic sequence number**. Retention is configurable by age, by message count, by total bytes, or via the `WorkQueue` and `Interest` policies, which delete a message once it has been consumed. **One stream captures many subjects** — the inversion of Kafka's topic-as-unit model, and the reason routing granularity is a subject filter rather than a partition count.
 
-A **consumer** is a stateful view over a stream. It remembers which sequence you've acknowledged, so it survives restarts. Consumers come in two flavours: **push** (server streams messages at you) and **pull** (you ask for batches). For microservices you almost always want a **durable pull consumer** — it's back-pressure-friendly, scales horizontally (run N workers against the same durable and they load-balance), and doesn't lose its place when a pod cycles.
+A **consumer** is a stateful view over a stream. It records which sequence has been acknowledged, so it survives restarts. Consumers are **push** (the server streams messages to the client) or **pull** (the client requests batches). A **durable pull consumer** is the usual choice for microservices: the client controls batch size, so back-pressure is inherent; multiple workers bound to the same durable share the batches; and the cursor is server-side, so it is not lost when a pod cycles.
 
 ## Creating a stream and a durable pull consumer
 
-The `nats` CLI is the fastest way to model this. Start a server with JetStream on, then:
+The `nats` command-line interface models this most directly.
 
 ```shell
 # start a JetStream-enabled server
@@ -63,16 +63,16 @@ nats consumer add ORDERS order-workers \
   --defaults
 ```
 
-`--dupe-window 2m` is the message-dedup window (more below). `--ack explicit` means every message must be individually acked. `--max-deliver 5` caps redelivery attempts before the message is considered dead. Inspect it all with `nats stream info ORDERS` and `nats consumer info ORDERS order-workers`. Publish a test event and pull it back:
+`--dupe-window 2m` sets the deduplication window described below. `--ack explicit` requires every message to be acknowledged individually. `--max-deliver 5` caps redelivery attempts before the message is no longer redelivered. `--wait 30s` is `AckWait`: the interval after delivery within which an acknowledgement must arrive, and therefore the latency floor for recovering from a crashed worker. Current state is readable with `nats stream info ORDERS` and `nats consumer info ORDERS order-workers`. A round trip through the stream needs two more commands:
 
 ```shell
 nats pub orders.eu.created '{"id":"A-100"}' -H "Nats-Msg-Id:A-100"
 nats consumer next ORDERS order-workers --count 1
 ```
 
-## Publishing and consuming with acks (Go)
+## Publishing and consuming with acknowledgement (Go)
 
-The current `nats.go` API lives in the `jetstream` package (the older `JetStreamContext` still works but is legacy). Note the context-aware, batch-oriented shape:
+The current `nats.go` API lives in the `jetstream` package; the older `JetStreamContext` remains functional but is legacy. The shape is context-aware and batch-oriented.
 
 ```go
 import (
@@ -103,18 +103,26 @@ cc, _ := cons.Consume(func(msg jetstream.Msg) {
 defer cc.Stop()
 ```
 
-`Ack()` confirms success and moves the cursor. `Nak()` triggers redelivery; `InProgress()` extends the ack deadline for slow work; `Term()` permanently drops a poison message without waiting out `MaxDeliver`. If a worker crashes before acking, the message reappears after `AckWait` — that's the at-least-once guarantee in action.
+A delivered message admits four responses. `Ack()` confirms success and advances the cursor. `Nak()` requests redelivery without waiting out the deadline. `InProgress()` extends the acknowledgement deadline for work that outlives `AckWait`. `Term()` drops a poison message permanently without consuming the remaining `MaxDeliver` attempts. **A worker that crashes before acknowledging leaves the message unacknowledged until `AckWait` expires, after which it is redelivered** — the at-least-once guarantee, and the exact window in which the application must tolerate a duplicate.
 
-## Ack policies, dedup, and replay
+## Acknowledgement policies, deduplication, and replay
 
-Three **ack policies** exist: `explicit` (ack each message — the only sane choice for a work queue), `all` (acking sequence N implicitly acks everything before it — cheap for ordered batch processing), and `none` (fire-and-forget, effectively back to core NATS semantics).
+Three **acknowledgement policies** exist. `explicit` requires an acknowledgement per message and is the policy a work queue depends on. `all` treats an acknowledgement of sequence *N* as acknowledging every earlier sequence, which is cheaper for strictly ordered batch processing but discards the ability to acknowledge out of order. `none` acknowledges nothing, returning delivery semantics to those of core NATS.
 
-**Dedup** is what gets you toward exactly-once. Set a `dupe-window` on the stream and attach a `Nats-Msg-Id` header to each publish. Within that window the server rejects a second message with the same ID, so a publisher retry after an ambiguous network failure doesn't create a duplicate event. Combine that with an idempotent consumer and you have effectively-once end to end — JetStream doesn't promise magic exactly-once, it gives you the two primitives you need to build it.
+**Deduplication** operates on the publish path. With a `dupe-window` configured on the stream and a `Nats-Msg-Id` header attached to each publish, the server rejects a second message carrying an identifier it has already seen within that window, so a publisher retry following an ambiguous network failure does not append a second copy. The window is finite: **a retry that arrives after the window has elapsed is accepted as a new message**. Deduplication therefore removes publisher-side duplicates only; consumer-side duplicates from redelivery remain, and an idempotent handler is required for effectively-once processing end to end.
 
-**Replay** falls out of the stream being a retained log. A new consumer with `--deliver all` reprocesses history from sequence 1; `--deliver new` starts at the tip; and you can pin a start point by sequence or by timestamp (`--start-time`). Because the consumer is a separate object from the stream, you can spin up a throwaway consumer to reprocess a day of events into a rebuilt read model, then delete it — the stream is untouched.
+**Replay** follows from the stream being a retained log. A consumer created with `--deliver all` reprocesses from the oldest message the stream still retains; `--deliver new` begins at the tip; a start point can also be pinned by sequence or by timestamp (`--start-time`). Because the consumer is a separate server object from the stream, a throwaway consumer can reprocess a range of history into a rebuilt read model and then be deleted, leaving the stream and every other consumer's cursor untouched.
 
-## When you'd reach for it instead of Kafka
+## Positioning relative to Kafka
 
-Kafka is the right call for very high sustained throughput, large partition fan-out, and a mature stream-processing ecosystem (Flink, Kafka Streams, Connect). JetStream wins on operational simplicity: no external coordination service, subject-level routing instead of rigid partition math, and a single small binary that clusters with Raft when you need HA. For edge and IoT — thousands of intermittently-connected devices, constrained gateways, leaf-node topologies that sync to a central cluster — the small footprint and built-in persistence make it the more natural fit. You get an event broker without operating a distributed log platform.
+Kafka suits very high sustained throughput, large partition fan-out, and a mature stream-processing ecosystem (Flink, Kafka Streams, Connect). JetStream's distinguishing properties are operational: no external coordination service, subject-filter routing rather than a fixed partition count, and a single binary that clusters with Raft for high availability. For edge and Internet-of-Things (IoT) deployments — many intermittently connected devices, constrained gateways, leaf-node topologies syncing to a central cluster — the small footprint and built-in persistence are the deciding factors.
 
-**Try next:** Add a second durable pull consumer to the same `ORDERS` stream with `--deliver new`, run three worker instances against it, and watch JetStream load-balance batches across them — then kill one mid-batch and confirm the un-acked messages redeliver to the survivors after `AckWait`.
+## Pitfalls
+
+- **A handler that takes longer than `AckWait` is redelivered while it is still running**, producing concurrent duplicate processing; the cause is that the server tracks only the deadline, not liveness, so long work must call `InProgress()` to extend it.
+- **A publisher retry arriving after `dupe-window` has elapsed appends a duplicate message**, because the deduplication table only covers that window; a `Nats-Msg-Id` alone guarantees nothing about older retries.
+- **Publishing without a `Nats-Msg-Id` header bypasses deduplication entirely**, since the server has no identifier to compare, and the `dupe-window` setting appears configured while having no effect.
+- **Under `ack all`, acknowledging a message that was processed out of order silently acknowledges every earlier unprocessed sequence**, permanently advancing the cursor past messages that were never handled.
+- **A message exhausting `MaxDeliver` stops being redelivered and is not routed anywhere by default**, so a persistently failing handler loses events unless the advisory for exhausted deliveries is consumed.
+- **A `WorkQueue` retention stream deletes a message once it is consumed**, which makes later replay impossible; the retention policy, not the consumer, decides whether history exists.
+- **Memory-backed storage discards the entire stream on server restart**, defeating the durability the durable consumer implies; `--storage file` is what makes the log survive a process exit.

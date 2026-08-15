@@ -1,8 +1,8 @@
 ---
-title: "The Gateway API: Ingress grew up and split into three roles"
+title: "The Gateway API: Ingress split into three role-owned resources"
 date: 2026-08-03
 track: microservices
-summary: "Ingress crammed routing, TLS, and vendor knobs into annotations owned by nobody. The Kubernetes Gateway API replaces it with three role-oriented resources — GatewayClass, Gateway, HTTPRoute — that split infra from app concerns. Current as of v1.6.1 (July 2026), with GAMMA for east-west mesh and a 2025 Inference Extension for LLM routing."
+summary: "Ingress crammed routing, TLS, and vendor knobs into annotations owned by nobody. The Kubernetes Gateway API replaces it with three role-oriented resources — GatewayClass, Gateway, HTTPRoute — that separate infrastructure concerns from application concerns. Current as of v1.6.0, with GAMMA for east-west mesh traffic and the Inference Extension for model serving."
 reading_time: 6
 tags: [kubernetes, gateway-api, ingress, networking, service-mesh, gamma]
 sources:
@@ -18,21 +18,29 @@ sources:
     url: "https://kubernetes.io/blog/2025/06/05/introducing-gateway-api-inference-extension/"
 ---
 
-Ingress had one resource and a fatal flaw: everything that mattered lived in annotations. Path rewrites, canary weights, TLS policy, timeout tuning — all of it went into `nginx.ingress.kubernetes.io/*` or `alb.ingress.kubernetes.io/*` strings that were vendor-specific, unvalidated, and owned by whoever happened to `kubectl apply` last. There was no seam between "the platform team runs the load balancer" and "the app team owns their routes." One `Ingress` object mixed both, so both teams edited the same YAML and hoped.
+**Gist.** The Kubernetes `Ingress` resource expressed everything beyond host-and-path matching as vendor-prefixed annotations — free-form strings that the API server does not validate and that no single team owns. The Gateway API replaces the single resource with three typed custom resources, **GatewayClass, Gateway and HTTPRoute**, each intended for a different owner, joined by explicit reference fields (`parentRefs`, `ReferenceGrant`) rather than by co-editing one object. The cost is a larger surface: several custom resource definitions (CRDs), a controller that must be installed separately, a two-channel release process whose feature set varies by implementation, and a cross-namespace permission model that has to be configured before routes bind.
 
-The Kubernetes **Gateway API** is the official successor, and its whole design premise is that north-south traffic (client-to-cluster) has *three* audiences, not one. It splits Ingress into three resources with three owners.
+## Why annotations failed as an extension point
 
-## GatewayClass, Gateway, HTTPRoute — one resource per role
+Under `Ingress`, path rewriting, canary weights, timeout tuning and TLS policy were carried in keys such as `nginx.ingress.kubernetes.io/*` or `alb.ingress.kubernetes.io/*`. Three properties follow from that encoding. The keys are **vendor-specific**, so the object is not portable between controllers. They are **unvalidated**: annotation values are opaque strings to the API server, so a typo is accepted at admission and fails — or silently does nothing — in the data plane. And they are **co-located with the routing rules**, so the team that operates the load balancer and the team that owns the application edit the same object. `Ingress` offers no field that expresses "this listener exists, and these namespaces may attach to it".
 
-- **GatewayClass** — installed by the *infrastructure provider* (the controller/vendor: Istio, Envoy Gateway, Cilium, NGINX, a cloud LB). It's the cluster-scoped template that says "Gateways of this class are backed by *this* implementation." Think `StorageClass`, but for load balancers.
-- **Gateway** — created by the *cluster operator / platform team*. It requests an actual data-plane instance: "give me a listener on 443 with this TLS cert, in this namespace." This is the infra concern — addresses, ports, certificates.
-- **HTTPRoute** — created by the *application developer*. It attaches to a Gateway via `parentRefs` and describes matching and forwarding rules: hostnames, path prefixes, header matches, weighted backends, filters. This is the app concern, and it can live in the app's own namespace.
+## One resource per role
 
-The seam is `parentRefs` (route → gateway) plus `ReferenceGrant` for cross-namespace permission. A platform team runs one hardened Gateway; dozens of app teams attach HTTPRoutes to it without ever touching the listener config or fighting over annotations. Everything is a typed, versioned CRD field, so `kubectl` and admission control actually validate it. There are sibling routes for other protocols — `GRPCRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` — following the same attachment model.
+- **GatewayClass** — cluster-scoped, installed by the infrastructure provider (the controller implementation: Istio, Envoy Gateway, Cilium, NGINX, a cloud load balancer). It declares that Gateways naming this class are reconciled by that implementation. The structural analogue is `StorageClass`.
+- **Gateway** — created by the cluster operator. It requests a data-plane instance and describes the infrastructure-facing properties: **addresses, listeners, ports, protocols, TLS certificates**, and — through `allowedRoutes` — which namespaces may attach routes to each listener.
+- **HTTPRoute** — created by the application team, in the application's own namespace. It carries matching and forwarding rules: hostnames, path and header matches, filters, and weighted `backendRefs`.
 
-## A real Gateway + HTTPRoute
+The join between the last two is `parentRefs` on the route, naming a Gateway. Because the route may live in a different namespace from the Gateway, and its backends may live elsewhere again, cross-namespace references are gated by **`ReferenceGrant`**, a resource created in the *target* namespace that names the permitted source kind and namespace. **The default is denial**: without an `allowedRoutes` selector that admits the route's namespace, and without a `ReferenceGrant` for cross-namespace backend or secret references, the reference is not resolved.
 
-Platform team owns the Gateway (namespace `infra`), app team owns the route (namespace `shop`):
+Every field is part of a versioned CRD schema, so the API server validates structure at admission rather than deferring the error to the controller. Sibling route kinds — `GRPCRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` — use the same attachment model.
+
+## Status conditions are the observable contract
+
+Attachment is not a synchronous operation. A route is written, a controller reconciles it, and the result appears in `status`, per parent reference. Two conditions carry the outcome: **`Accepted`**, meaning the parent Gateway admitted the route (namespace permitted by `allowedRoutes`, hostname intersecting the listener's), and **`ResolvedRefs`**, meaning every `backendRef` and secret reference named by the route resolved to an existing, permitted object. A route can be `Accepted: True` and `ResolvedRefs: False` — admitted at the listener, but forwarding to a backend that does not exist or is not granted. This is the failure mode that most resembles the old annotation problem, except that it is now reported in a field rather than inferred from traffic.
+
+## A Gateway and an attached route
+
+The platform team owns the Gateway in namespace `infra`; the application team owns the route in namespace `shop`.
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -41,7 +49,7 @@ metadata:
   name: prod-gateway
   namespace: infra
 spec:
-  gatewayClassName: envoy          # points at an installed GatewayClass
+  gatewayClassName: envoy          # names an installed GatewayClass
   listeners:
     - name: https
       protocol: HTTPS
@@ -54,7 +62,7 @@ spec:
             name: example-com-tls
       allowedRoutes:
         namespaces:
-          from: Selector           # only namespaces the operator permits
+          from: Selector           # not `All` — attachment is opt-in
           selector:
             matchLabels: { gateway-access: "true" }
 ---
@@ -68,7 +76,7 @@ spec:
     - name: prod-gateway
       namespace: infra
   hostnames:
-    - "shop.example.com"
+    - "shop.example.com"           # must intersect the listener hostname
   rules:
     - matches:
         - path: { type: PathPrefix, value: /checkout }
@@ -82,25 +90,30 @@ spec:
           weight: 90
         - name: checkout-v1
           port: 8080
-          weight: 10          # 90/10 canary, no annotations required
+          weight: 10               # 90/10 split as typed fields
 ```
 
-The canary split, header injection, and TLS all sit in first-class fields. `allowedRoutes` is the guardrail that lets the operator decide *which* namespaces may bind to this Gateway — the governance that Ingress never had.
+Two properties of this listing are load-bearing. The traffic split, the header injection and the TLS termination are **typed fields subject to schema validation**, not annotation strings. And the namespace `shop` binds to the listener only because it carries the label `gateway-access: "true"`; the selector is the operator's admission control over which teams may attach.
 
-## Where the spec is right now (mid-2026)
+## Release state as of mid-2026
 
-The core resources — GatewayClass, Gateway, HTTPRoute — have been GA (`v1`) since v1.0 in late 2023. Since then the project has shipped on a roughly quarterly cadence, moving features up the **Standard** (GA) vs **Experimental** channel ladder.
+The three core resources reached general availability at `v1` in Gateway API v1.0, released in late 2023. Features advance through two channels, **Experimental** and **Standard**. As of v1.5 the project ships on a release-train model: whatever has reached feature freeze — and has its documentation complete — goes out together in the next release.
 
-The **latest release is v1.6.1, published July 16, 2026** (a patch on top of **v1.6.0, June 29, 2026**). v1.6.0's headline change was graduating **TCPRoute and UDPRoute to GA** at `v1`. The prior minor, **v1.5** (v1.5.0 on February 27, 2026; announced on the Kubernetes blog as "Moving features to Stable"), promoted six long-requested features to the Standard channel: **ListenerSet, TLSRoute, the HTTPRoute CORS filter, client certificate validation, certificate selection for Gateway TLS, and origination ReferenceGrant**. (Note the announcement blog post is dated later than the tag — cite the tag date for the release itself.) A large conformance program lets implementations declare exactly which features they support, so "does my controller do X" has an answerable, tested answer rather than a vendor's word.
+The **v1.6.0** release graduated **TCPRoute and UDPRoute to `v1`**, tightened HTTPRoute retry validation (retry codes must be unique, attempts at least 1) and raised the ceiling on certificate-authority references from 8 to 16. The preceding minor, **v1.5.0 of 27 February 2026**, promoted six features to the Standard channel: **ListenerSet** (listeners defined separately and merged onto a target Gateway, which lifts the limit of 64 listeners per Gateway), **TLSRoute**, the **HTTPRoute cross-origin resource sharing (CORS) filter**, **client certificate validation**, **certificate selection for Gateway TLS origination**, and **`ReferenceGrant`**. A conformance program lets an implementation declare which features it supports, so support for a given feature is a tested claim rather than a vendor assertion.
 
-## GAMMA: the same API for east-west mesh traffic
+## GAMMA: the same route kind for east-west traffic
 
-Gateway API started as north-south (edge ingress), but the **GAMMA** initiative — Gateway API for Mesh Management and Administration — extends the *same* HTTPRoute to east-west, service-to-service traffic inside a mesh. The trick is elegant: instead of a route's `parentRefs` pointing at a Gateway, it points at a **Service**. That reparents the route from "the edge" to "everyone who calls this service," and the mesh data plane (Istio, Linkerd, Cilium, Kuma) enforces it. So a service owner writes one kind of HTTPRoute whether they're shaping ingress or in-mesh traffic. This is the throughline connecting Gateway API to sidecarless meshes like Istio ambient — the routing vocabulary is shared, only the enforcement point differs.
+The **GAMMA** initiative — Gateway API for Mesh Management and Administration — applies the same `HTTPRoute` kind to service-to-service traffic inside a mesh. The mechanism is a change of parent: rather than `parentRefs` naming a Gateway, it names a **Service**. The route then governs traffic addressed to that Service by any in-mesh client, and the mesh data plane (Istio, Linkerd, Cilium, Kuma) enforces it. The route vocabulary is identical for ingress and in-mesh traffic; the enforcement point differs.
 
-## The 2025 trend: the Inference Extension
+## The Inference Extension
 
-The genuinely new direction is the **Gateway API Inference Extension**, introduced on the Kubernetes blog in June 2025. It turns a Gateway-API-compatible proxy into an **inference gateway** for self-hosted generative models, using Envoy's external processing (`ext_proc`) plus new CRDs (an `InferencePool` of model-serving endpoints) to do routing that a normal L7 balancer can't: **KV-cache-aware and request-cost-aware scheduling, LoRA-adapter routing, and model-level traffic splitting**. It reached GA and now ships productized as GKE Inference Gateway and via Istio's inference support. If you're serving LLMs on Kubernetes, this is where round-robin stops being good enough and the Gateway API gives you a standard place to plug in smarter scheduling.
+The **Gateway API Inference Extension** was introduced on the Kubernetes blog in June 2025. It makes a Gateway API-conformant proxy act as an inference gateway for self-hosted generative models, using an external processing callout together with two new CRDs: **`InferencePool`**, a platform-owned pool of model-serving pods on shared accelerator compute, and **`InferenceModel`**, a workload-owned mapping from a public model name to the models served by a pool, including traffic splitting between them. The routing decisions its Endpoint Selection Extension adds are ones a general layer-7 balancer does not make: **model-aware endpoint selection, per-request criticality** (an interactive chat request outranking a batch job), and **load balancing on real-time model-server metrics** rather than connection counts. The blog introducing it describes the project as alpha; the status at any later date is a question for the project's own release notes.
 
-The practical takeaway: if you're still on Ingress, the migration path is real and the roles finally match your org chart. Start with a single Gateway owned by the platform team, and let app teams bring their own HTTPRoutes.
+## Pitfalls
 
-**Try next:** Install a conformant controller (Envoy Gateway or Istio), apply the Gateway + HTTPRoute above, then port one real Ingress — move its host/path rules into an HTTPRoute and its TLS into the Gateway listener — and check `kubectl get httproute -o wide` for the `Accepted`/`ResolvedRefs` status conditions.
+- **A route is `Accepted: False` with no traffic error to observe.** The listener's `allowedRoutes.namespaces.from: Selector` does not match the route's namespace labels, so the Gateway never admitted it; requests fall through to whatever else matches.
+- **`ResolvedRefs: False` while the route is admitted.** A `backendRef` names a Service in another namespace, or `certificateRefs` names a Secret in another namespace, and no `ReferenceGrant` exists in that target namespace permitting the reference.
+- **The route attaches but never matches.** The route's `hostnames` do not intersect the listener's `hostname`; the intersection, not the route's list alone, determines which requests reach the rules.
+- **Weighted `backendRefs` distribute nothing.** A weight of 0 on one backend removes it from selection entirely rather than sending a small share, and weights are relative within a single rule, not percentages across rules.
+- **A feature present in the CRDs is rejected by the controller.** The Experimental channel installs fields that a Standard-channel implementation does not implement; conformance reports, not CRD presence, indicate support.
+- **Deleting the Gateway leaves orphaned routes.** HTTPRoutes referencing a removed parent persist as objects with unsatisfied `parentRefs`, so `kubectl get httproute` still lists routes that serve no traffic.

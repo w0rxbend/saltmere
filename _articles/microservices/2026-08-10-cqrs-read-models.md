@@ -1,9 +1,9 @@
 ---
-title: 'CQRS: when one model can''t serve both the write and the read'
+title: 'CQRS: when one model cannot serve both the write and the read'
 date: 2026-08-10
 track: microservices
-summary: 'A normalized write model optimized for validation is a poor fit for complex, denormalized read views — and the two scale differently. CQRS splits them: commands change state, queries read purpose-built projections. The catch you must name in an interview is eventual consistency.'
-reading_time: 6
+summary: 'A normalized write model optimized for validation is a poor fit for complex, denormalized read views, and the two scale differently. CQRS splits them: commands change state, queries read purpose-built projections. The cost is eventual consistency between the two sides.'
+reading_time: 8
 tags:
 - cqrs
 - read-models
@@ -29,105 +29,102 @@ sources:
   url: https://udidahan.com/2009/12/09/clarified-cqrs/
 ---
 
-## One model, two jobs, both done badly
+**Gist.** A single domain model must simultaneously enforce transactional invariants on writes and answer denormalized, screen-shaped queries; the two goals push the schema in opposite directions, and the two workloads scale independently. Command Query Responsibility Segregation (CQRS) resolves the conflict by using one model to change state and a different model — often a separate store maintained by an event-driven projection — to answer queries. The cost is that the read side lags the write side: a consistency property previously supplied by the database becomes an application concern.
 
-Most systems start with a single model that serves everything. The same `Order` entity that you validate and mutate is the same one you join, aggregate, and paginate to render a dashboard. For a while this is fine — it's the default, and the default is usually right.
+## One model, two jobs
 
-It stops being fine when the two jobs pull in opposite directions. A **write model** wants to be normalized and behavior-rich: it enforces invariants, guards transitions ("you can't ship a cancelled order"), and keeps a clean transactional shape. A **read model** wants the opposite: denormalized, pre-joined, shaped exactly like the screen that consumes it. Serving a "customer order history with line items, shipping status, and loyalty tier" from a normalized schema means five joins and a query planner you're now fighting. Optimize the schema for that read and your writes get awkward; optimize for writes and every read pays a join tax.
+The default design uses one `Order` entity for validation, mutation, joining, aggregation and pagination. That default is correct for most systems and stops being correct when the two jobs diverge.
 
-CQRS — **Command Query Responsibility Segregation** — is the observation that you don't have to pick. Martin Fowler frames it as "the notion that you can use a different model to update information than the model you use to read information." Commands go through one model; queries come from another.
+A **write model** is normalized and behaviour-rich: it enforces invariants, guards state transitions (a cancelled order cannot be shipped), and keeps a shape that fits a single local transaction. A **read model** wants the opposite: denormalized, pre-joined, shaped exactly like the view that consumes it. Serving "customer order history with line items, shipping status and loyalty tier" from a normalized schema costs a multi-way join per request. Reshaping the schema to make that join cheap — wider tables, duplicated columns, added indexes — makes writes more expensive; keeping the schema normalized makes every read pay the join.
 
-## Commands and queries are different shapes
+CQRS is the observation that one model need not serve both. Martin Fowler frames it as the notion that a different model may be used to update information than the model used to read it.
 
-Split your operations cleanly:
+## Commands and queries have different shapes
 
-- **Commands** change state and express intent in domain terms — `PlaceOrder`, `CancelReservation`, `RateProduct`. Microsoft's guidance is worth internalizing: model commands as tasks ("Book hotel room"), not as data mutations ("set `ReservationStatus` to `Reserved`"). A command is validated, may be rejected, and either succeeds or fails as a unit.
-- **Queries** return data and never mutate it. They hand back DTOs or view objects with no domain behavior attached — just the fields the caller needs.
+- **Commands** change state and express intent in domain terms: `PlaceOrder`, `CancelReservation`, `RateProduct`. Microsoft's guidance is to model a command as a task ("Book hotel room") rather than a data mutation ("set `ReservationStatus` to `Reserved`"). A command is validated, may be rejected, and **succeeds or fails as a unit**.
+- **Queries** return data and never mutate it. They return data-transfer objects with no domain behaviour attached — the fields the caller needs and nothing else.
 
-This is a segregation of *responsibility*, and it comes in two strengths. The mild version keeps one database but uses separate models on top of it. The strong version — the one worth discussing at scale — uses **separate stores**: a relational store optimized for transactional writes, and one or more read stores (often a document or search store) holding denormalized views. Chris Richardson describes the read side as "a view database, which is a read-only 'replica' designed specifically to support that query," kept current by subscribing to events the write side publishes.
+The segregation comes in two strengths. The mild form keeps a single database and places separate models over it. The strong form uses **separate stores**: a store tuned for transactional writes, and one or more read stores holding denormalized views. Chris Richardson describes the read side as a view database: a read-only replica designed to support one query, kept current by subscribing to events the write side publishes.
 
-Two independent benefits fall out. First, each side gets a schema it actually wants. Second — and this is often the real driver — read and write scale independently. Most systems read far more than they write; now you can replicate and fan out the read stores without touching write capacity, and vice versa.
+Two consequences follow. Each side gets the schema its workload wants. And because the stores are distinct, **read and write capacity scale independently** — read replicas can be added without changing write capacity, and the reverse.
 
-## How the read side is built: projections
+## The read side: projections
 
-The write side handles a command: load the aggregate, check invariants, persist the change, and emit an event describing what happened (`OrderPlaced`). The read side is maintained by a **projection** (also called a materialized view or denormalizer) — a consumer that subscribes to those events and updates a denormalized read table shaped for a specific query.
+The write path handles a command by loading the aggregate, checking invariants, persisting the change, and emitting an event describing what happened (`OrderPlaced`). The read side is maintained by a **projection** — also called a materialized view or denormalizer — a consumer that subscribes to that event stream and updates a denormalized table shaped for one specific query.
 
-Here's a command handler plus an async projection that maintains a per-customer order-summary read model:
+The load-bearing property is that **a projection is a fold over the event stream**. Its state at any point is a function of the events consumed so far. That property is what makes a read model rebuildable: a projection that has been corrupted, or a projection added after the fact for a new view, is populated by replaying the stream from the beginning rather than by migrating data.
 
-```python
-# --- WRITE SIDE: command handler ---
-class PlaceOrderHandler:
-    def handle(self, cmd: PlaceOrder) -> None:
-        # 1. Load aggregate, enforce invariants
-        customer = self.customers.get(cmd.customer_id)
-        if not customer.can_order():
-            raise DomainError("customer not eligible to order")
+The second load-bearing property concerns the boundary between the two writes. The state change and the event must be committed **in the same local transaction**; otherwise the process can persist the order and fail before publishing, or publish and fail before persisting. Publishing the event from within that transaction to a table the relay reads later — the [transactional outbox](/articles/microservices/2026-07-26-transactional-outbox-pattern) — closes that hole.
 
-        order = Order.place(cmd.customer_id, cmd.line_items)
+### Implementation sketch (Scala)
 
-        # 2. Persist state change AND the event atomically.
-        #    Same local transaction -> no dual-write hole (see: outbox).
-        with self.uow.begin():
-            self.orders.save(order)
-            self.outbox.append(OrderPlaced(
-                order_id=order.id,
-                customer_id=order.customer_id,
-                total=order.total,
-                item_count=len(order.line_items),
-                placed_at=order.placed_at,
-            ))
-        # Command returns now. The read model is NOT updated yet.
+```scala
+final case class PlaceOrder(customerId: UUID, lines: List[LineItem])
+final case class OrderPlaced(orderId: UUID, customerId: UUID,
+                             total: BigDecimal, placedAt: Instant)
 
+// --- WRITE SIDE ---
+final class PlaceOrderHandler(orders: OrderRepo, outbox: Outbox, uow: UnitOfWork):
+  def handle(cmd: PlaceOrder): Either[DomainError, UUID] =
+    val order = Order.place(cmd.customerId, cmd.lines)
+    order.validate.map { valid =>
+      // One local transaction: a crash mid-way leaves neither the order
+      // nor the outbox row durable, so the stream cannot diverge.
+      uow.transact:
+        orders.save(valid)
+        outbox.append(OrderPlaced(valid.id, valid.customerId,
+                                  valid.total, valid.placedAt))
+      valid.id            // returns before any projection has run
+    }
 
-# --- READ SIDE: async projection ---
-class CustomerOrderSummaryProjection:
-    """Subscribes to the event stream, maintains a denormalized read table.
-    Runs independently of the write path."""
+// --- READ SIDE: a fold over the stream ---
+final case class CustomerSummary(orderCount: Int, lifetimeTotal: BigDecimal,
+                                 lastOrderAt: Instant)
 
-    def on_order_placed(self, e: OrderPlaced) -> None:
-        # Upsert a row shaped exactly like the 'order history' screen.
-        # No joins at query time — the view is pre-computed.
-        self.read_db.execute("""
-            INSERT INTO customer_order_summary
-                (customer_id, order_count, lifetime_total, last_order_at)
-            VALUES (%(cid)s, 1, %(total)s, %(at)s)
-            ON CONFLICT (customer_id) DO UPDATE SET
-                order_count    = customer_order_summary.order_count + 1,
-                lifetime_total = customer_order_summary.lifetime_total + %(total)s,
-                last_order_at  = %(at)s
-        """, {"cid": e.customer_id, "total": e.total, "at": e.placed_at})
+object CustomerSummaryProjection:
+  // A pure fold, so a rebuild replays it. The increment is not idempotent:
+  // a deployed projection commits the consumed offset with the state below.
+  def apply(state: Map[UUID, CustomerSummary], e: OrderPlaced)
+      : Map[UUID, CustomerSummary] =
+    state.updatedWith(e.customerId):
+      case Some(s) => Some(s.copy(s.orderCount + 1,
+                                  s.lifetimeTotal + e.total, e.placedAt))
+      case None    => Some(CustomerSummary(1, e.total, e.placedAt))
 
-
-# --- QUERY SIDE: trivial, no domain logic ---
-def get_customer_summary(read_db, customer_id) -> dict:
-    return read_db.fetch_one(
-        "SELECT * FROM customer_order_summary WHERE customer_id = %s",
-        customer_id)
+  def rebuild(stream: Iterator[OrderPlaced]): Map[UUID, CustomerSummary] =
+    stream.foldLeft(Map.empty[UUID, CustomerSummary])(apply)
 ```
 
-Notice the query is a single-row lookup with zero joins. All the work moved to write time, done once per event instead of once per read. If you need a second view — say, a search index over orders — you add another projection reading the same stream. Because a projection is just a fold over events, you can rebuild a broken or newly-added read model by replaying the stream from the start.
+The query against such a view is a single-key lookup with no joins. The join work has moved to write time and is performed **once per event rather than once per read**, which is the reason the arrangement pays off only when reads outnumber writes. A second view — a search index over the same orders — is a second projection over the same stream, independent of the first.
 
-## The consequence you must name: eventual consistency
+## The consequence: eventual consistency
 
-Look again at the handler comment: *"the read model is NOT updated yet."* The command returns after the write commits; the projection runs afterward, asynchronously. Between those two moments, a query hits stale data. Microsoft states it plainly — with separate stores, "read stores may lag behind writes." Richardson calls it "replication lag / eventually consistent views."
+The command returns after the write commits; the projection runs afterwards, asynchronously. In the interval between those two points a query observes stale data. Microsoft's guidance names eventual consistency as the consequence of separating the stores: the read store is not updated until the change has propagated, so a query can return data that does not yet reflect the last write. Richardson lists the same cost as replication lag between the write side and the eventually consistent views.
 
-In an interview, say this out loud and then say how you handle it. The classic trap is **read-your-writes**: a user submits a form, the UI immediately re-queries, the projection hasn't caught up, and their change appears to vanish. Mitigations, roughly in order of preference:
+The concrete failure mode is **read-after-write staleness**: a client submits a command, immediately re-queries the read model, the projection has not yet applied the event, and the change appears not to have happened. Mitigations, roughly in order of cost:
 
-- **Don't re-read.** Have the command return enough for the UI to update optimistically, or echo the command's result.
-- **Read from the write model** for the just-written entity, using the read model only for the broader views.
-- **Version / track progress.** Tag writes with a version or event offset and have the client wait until the read model has caught up to it before trusting a query.
-- **Show it in the UX.** "Processing…" is honest and cheap.
+- **Avoid the re-read.** Return enough from the command for the caller to render the new state without querying.
+- **Read the entity from the write model** and use the read model only for the aggregate views it exists to serve.
+- **Track progress explicitly.** Tag the write with a version or stream offset, expose the offset the projection has consumed, and have the client wait until the projection has caught up to that offset before trusting the query.
+- **Surface the lag in the interface** rather than hiding it.
 
-Whatever you choose, the point is that CQRS turns a consistency question you got for free into one you now own.
+CQRS converts a consistency guarantee the database provided into one the application must state and enforce.
 
 ## CQRS is not event sourcing
 
-These two get conflated constantly; keep them separate. **Event sourcing** stores state as an append-only log of events and rebuilds current state by replaying them. **CQRS** is about using different models for reads and writes. They're complementary — an event-sourced write model produces exactly the event stream a projection wants to consume, which is why they're so often shown together — but each stands alone. You can do CQRS with a plain relational write model that emits change events (or uses a [transactional outbox](/articles/microservices/2026-07-26-transactional-outbox-pattern) to publish them reliably), no event store in sight. And you can do [event sourcing](/articles/microservices/2026-07-31-event-sourcing-log-as-source-of-truth) while reading straight from a rebuilt aggregate, no separate read model at all. Adopt them independently.
+The two are frequently conflated. **Event sourcing** stores state as an append-only log of events and reconstructs current state by replaying it. **CQRS** is the use of different models for reads and writes. They compose well — an event-sourced write model produces exactly the stream a projection consumes — but neither requires the other. CQRS is achievable with a relational write model that emits change events through an outbox and no event store at all, and [event sourcing](/articles/microservices/2026-07-31-event-sourcing-log-as-source-of-truth) is achievable while serving reads from the rebuilt aggregate with no separate read model.
 
-## When it's overkill
+## When the pattern costs more than it returns
 
-Fowler's caution is the most important sentence in his write-up: "you should be very cautious about using CQRS." He's blunt that most cases he's seen went badly, with CQRS "seen as a significant force for getting a software system into serious difficulties." It adds complexity, extra stores to keep in sync, messaging with its failures and duplicates, and eventual consistency you have to design around.
+Fowler's caution is explicit: the pattern warrants great caution. He reports that most cases he has seen went badly, with CQRS "seen as a significant force for getting a software system into serious difficulties." The pattern adds a second store to keep synchronised, a messaging path with its own failure and duplication modes, and eventual consistency that every client must accommodate.
 
-So for the typical CRUD app — where the read and write shapes are basically the same and load is modest — CQRS is a net loss. Reach for it selectively, at a single bounded context, when you have a real driver: a genuinely complex domain where command and query logic diverge, a punishing read/write ratio, or expensive denormalized views that a normalized schema can't serve. Apply it to the whole system by default and you've bought all the cost for little of the benefit.
+For an application whose read and write shapes coincide and whose load is modest, that cost buys nothing. The pattern is applied selectively, within a single bounded context, where a driver exists: command and query logic that genuinely diverge, a read/write ratio skewed heavily toward reads, or denormalized views a normalized schema cannot serve within the latency budget. Applied system-wide by default it incurs the full cost across every context while the benefit accrues to a few.
 
-**Try next:** take one read-heavy endpoint in a service you know, sketch the denormalized view it really wants, and write the single projection that would maintain it from that service's events — then decide honestly whether the eventual consistency is worth it.
+## Pitfalls
+
+- **A projection that is not idempotent double-counts on redelivery.** At-least-once event delivery replays messages after a consumer crash between applying an event and committing its offset; an increment-style update such as `order_count + 1` is applied twice. The projection must either store the consumed offset in the same transaction as the derived state or key updates so that reapplication is a no-op.
+- **Writing the state change and publishing the event as two separate operations loses events.** A crash between the database commit and the broker publish leaves a persisted order that no projection ever sees, and the read model diverges permanently. Both writes must be in one local transaction, with a relay publishing from the outbox.
+- **Out-of-order delivery corrupts views that depend on ordering.** A projection maintaining "last order at" or a status field applies whichever event arrives first; a stale event arriving after a newer one overwrites the newer value. Ordering must be preserved per key, or the projection must ignore events older than the version it has already applied.
+- **Read-model rebuild is only possible if the events retain the fields the view needs.** A projection added later cannot recover data the original event never carried, and the stream cannot be retrofitted.
+- **A read model shared across several screens re-acquires the problem CQRS was applied to solve.** As each new view adds columns to one table, the view stops matching any single query and joins reappear on the read side.
+- **The command returning success is not evidence the query will reflect it.** Tests that issue a command and immediately assert on the read model pass or fail depending on projection timing, and are a source of intermittent failures rather than a check on correctness.

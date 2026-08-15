@@ -2,8 +2,8 @@
 title: "Negative Caching and Failing Safe: Caching Absence, Errors, and Cache Outages"
 date: 2026-08-10
 track: microservices
-summary: A cache that only remembers successes leaves two gaps attackers and outages walk straight through — repeated misses for keys that will never exist, and the moment the cache itself dies. Here is how to cache absence with a sentinel and short TTL, cache errors with stale-if-error, and fail safe when the cache is gone.
-reading_time: 6
+summary: A cache that records only successes leaves two gaps — repeated misses for keys that will never exist, and the moment the cache tier itself becomes unreachable. This article covers caching absence with a sentinel and a short TTL, caching errors with stale-if-error, and choosing fail-open or fail-closed behaviour when the cache is gone.
+reading_time: 7
 tags:
   - caching
   - resilience
@@ -23,22 +23,24 @@ sources:
     url: "https://systemdesignschool.io/fundamentals/cache-failure-modes"
 ---
 
-Most caching write-ups optimise the happy path: a value exists, you store it, you serve it fast. But a cache that only remembers successes has two blind spots, and both turn into outages. The first is the lookup that returns *nothing* — a user ID that was never issued, a product SKU that 404s. Every one of those requests misses the cache, falls through to the database, finds nothing, and stores nothing, so the next identical request repeats the whole trip. An attacker who spams non-existent keys turns your cache into a passthrough and your database into the bottleneck. This is **cache penetration** (covered separately in [cache penetration, breakdown, and avalanche](/articles/distributed-systems/2026-08-10-cache-penetration-breakdown-avalanche)).
+**Gist.** A cache that stores only successful lookups converts two situations into origin load: queries for keys that do not exist, which miss forever, and the interval during which the cache tier itself is unreachable. Negative caching stores the *absence* of a result behind a distinct sentinel value with a deliberately short time-to-live (TTL), and fail-safe design fixes in advance whether an unavailable cache means "allow" or "deny". The cost is a window of incorrectness — a key created immediately after a negative entry is written reads as missing until that entry expires — plus the extra memory a negative entry occupies for every key an adversary can invent.
 
-The second blind spot is the cache *itself* failing. Redis restarts, a network partition isolates it, or the whole tier avalanches — and if your code treats "cache unreachable" as an exception that bubbles up, you have converted a cache outage into a total outage. Handle it the other way and you get a stampede: every request now goes to the database at once.
+## The two gaps
 
-Negative caching and fail-safe design address exactly these two gaps: cache the *absence* of a result, cache *errors* deliberately, and decide in advance how the system behaves when the cache is gone.
+The first gap is the lookup that returns nothing: a user identifier never issued, a product SKU that resolves to a 404. Each such request misses the cache, reaches the database, finds no row, and stores nothing, so an identical subsequent request repeats the full path. A client issuing a stream of non-existent keys therefore drives one origin query per request. This is **cache penetration**, covered separately in [cache penetration, breakdown, and avalanche](/articles/distributed-systems/2026-08-10-cache-penetration-breakdown-avalanche).
 
-## Negative caching: remember that nothing is there
+The second gap is failure of the cache tier itself — a Redis restart, a partition, or an avalanche across the whole tier. Code that lets "cache unreachable" propagate as an error turns a cache outage into a service outage. Code that silently falls through to the origin instead produces the opposite failure: every request that was previously a cache hit becomes a database query in the same instant.
 
-The idea is old and battle-tested. DNS has done it since [RFC 2308](https://www.rfc-editor.org/rfc/rfc2308): when a resolver asks for a name that does not exist, the authoritative server returns `NXDOMAIN`, and resolvers cache that "does not exist" answer so they stop re-asking. The TTL for the negative answer is taken from the zone's `SOA.MINIMUM` field (bounded by the SOA record's own TTL). RFC 2308 is explicit about keeping it short: "Values of one to three hours have been found to work well... Values exceeding one day have been found to be problematic." A too-long negative TTL means a name you just registered stays invisible for hours.
+## Negative caching: recording that nothing is there
 
-That gives us the two design rules for application-level negative caching:
+The Domain Name System (DNS) has done this since [RFC 2308](https://www.rfc-editor.org/rfc/rfc2308). When a resolver asks for a name that does not exist, the authoritative server returns `NXDOMAIN`, and resolvers cache that non-existence answer rather than re-querying. **The TTL for the negative answer is taken from the `MINIMUM` field of the zone's start-of-authority (SOA) record, bounded by the TTL of the SOA record itself.** RFC 2308 states that "values of one to three hours have been found to work well" and that "values exceeding one day have been found to be problematic". A long negative TTL keeps a newly registered name invisible for the remainder of that interval.
 
-1. **Use a sentinel value**, not an empty string or a missing key, so you can tell "known to be absent" apart from "not cached." A plain `GET` that returns nil is ambiguous — it could mean either. A distinct sentinel removes the ambiguity.
-2. **Use a short TTL** — seconds to a couple of minutes — because a negative entry is a guess about the future. The key might get created a moment later, and a long negative TTL becomes a correctness bug where real data reads as missing.
+Two design rules follow for application-level negative caching.
 
-Here is a sentinel-based negative cache in Go over Redis:
+1. **The absent marker must be a sentinel value, not a missing key or an empty string.** A `GET` returning nil is ambiguous between "known to be absent" and "not cached"; a distinct sentinel removes the ambiguity, because the two cases require different handling — one is a hit, the other a miss.
+2. **The negative TTL must be short**, on the order of seconds to a few minutes, because a negative entry is a prediction about the future. The key may be created immediately afterwards, and the entry's lifetime is exactly the window during which real data reads as missing.
+
+A sentinel-based negative cache in Go over Redis:
 
 ```go
 const nullSentinel = "\x00NULL\x00" // distinct from any real serialized value
@@ -78,23 +80,60 @@ func GetUser(ctx context.Context, rdb *redis.Client, db *DB, id string) (*User, 
 }
 ```
 
-Three details are interview-grade. **The sentinel is not empty** — an empty value or a zero-length record collides with legitimately empty payloads, so pick a byte sequence that cannot appear in your real serialization. **The negative TTL is much shorter than the positive one** and carries jitter (`jitter()` spreads expiries so a batch of negatives created together does not expire together and re-stampede). **Only "no such row" gets cached** — a timeout or connection error is *not* an absence, so caching it as a sentinel would hide data that actually exists.
+Three properties carry the design. **The sentinel is non-empty**: an empty value or zero-length record collides with legitimately empty payloads, so the marker must be a byte sequence the real serialization cannot produce. **The negative TTL is much shorter than the positive one and carries jitter** — `jitter()` spreads expiry times so that a batch of negative entries written together does not expire together and re-stampede the origin. **Only "no such row" is cached**: a timeout or connection error is not evidence of absence, and storing a sentinel for it would hide a row that exists until the entry expires.
 
-For high-cardinality penetration attacks — random keys that will never resolve — a negative cache still stores one entry per bogus key and can be memory-flooded. Pair it with a **Bloom filter** in front: if the filter says "definitely not present," reject before touching Redis or the DB at all. The negative cache handles the churn of legitimately-recently-deleted keys; the Bloom filter handles the adversarial firehose.
+Against high-cardinality penetration — random keys that will never resolve — a negative cache still allocates one entry per distinct bogus key, so its memory grows with the attacker's key space. A **Bloom filter** placed in front bounds this: a negative answer from the filter is definitive, so the request is rejected before reaching Redis or the database. The negative cache then covers keys recently deleted, and the filter covers the adversarial stream.
 
-## Caching errors: serve last-good when the origin is down
+## Caching errors: serving last-good while the origin fails
 
-Absence is one thing; a failing origin is another. If a downstream service returns 5xx, you have two bad options — propagate the error, or hammer the struggling backend with retries. A third option is to cache the error briefly, or better, keep serving the last good value.
+A failing origin is a different case from an absent row. Propagating the error and retrying against a struggling backend are both poor outcomes; a third option is to cache the error for a brief interval, or to continue serving the last known-good value.
 
-HTTP formalised this in [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861.html) with **`stale-if-error`**: "when an error is encountered, a cached stale response MAY be used to satisfy the request." Its sibling `stale-while-revalidate` serves stale immediately and refreshes in the background. The application-level equivalent: keep a *soft* expiry and a *hard* expiry on cached values. Past soft expiry you try to refresh; if the refresh fails, you serve the stale value until hard expiry rather than erroring. (This is the same stale-serving machinery discussed in [cache stampede](/articles/microservices/2026-08-10-cache-stampede-request-coalescing) — reused here for resilience rather than throughput.)
+HTTP formalises the latter in [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861.html) as **`stale-if-error`**: "when an error is encountered, a cached stale response MAY be used to satisfy the request." Its companion `stale-while-revalidate` serves the stale response immediately and refreshes in the background. The application-level equivalent maintains **two expiry timestamps per entry, soft and hard**. Past the soft expiry a refresh is attempted; if the refresh fails, the stale value continues to be served until the hard expiry, at which point the entry is no longer usable and the error surfaces. The same stale-serving machinery appears in [cache stampede](/articles/microservices/2026-08-10-cache-stampede-request-coalescing), there for throughput rather than resilience.
 
-If you must cache an actual error response (say a 429 or a transient 503 you cannot serve stale for), cache it with a **very short TTL** — a few seconds — and never cache 4xx client errors as if they were server state. The rule mirrors negative caching: short TTL, explicit sentinel, and never let a transient failure become a durable lie.
+Where an error response itself must be cached — a 429 or a transient 503 with no stale value available — it is cached with a **very short TTL**, on the order of seconds. A response determined by the request rather than by origin state — a malformed body, a failed authorization — is not shared-cacheable at all, which is a separate question from caching the absence of a resource. The constraint is the same as for negative caching: a transient failure must not become a durable answer.
 
-## Failing safe when the cache dies
+### Implementation sketch (Scala)
 
-Now the hard case: the cache tier itself is unreachable. The default posture should be **fail-open** — treat a cache error as a miss and read straight from the database, so a Redis blip degrades latency instead of availability. But naive fail-open is a trap. If 50,000 req/s were all being served from cache and the cache vanishes, all 50,000 now hit the database simultaneously — a **cache avalanche**. Fail-open without a governor just moves the outage.
+The soft/hard expiry state machine, with the origin call as the only failure point:
 
-The fix is to wrap the fallback in a **circuit breaker** and a concurrency limit. When cache reads start failing, the breaker opens and you stop pounding a dead cache; the limiter caps how much load reaches the database so the fallback path cannot itself become the stampede. (See [circuit breakers with Resilience4j](/articles/microservices/2026-07-24-circuit-breakers-resilience4j) for the state machine.)
+```scala
+final case class Entry[A](value: A, soft: Long, hard: Long)
+
+enum Result[+A]:
+  case Fresh(value: A)
+  case Stale(value: A)   // origin failed, within hard expiry
+  case Failed(cause: Throwable)
+
+final class StaleIfError[K, V](
+    softTtlMs: Long,
+    hardTtlMs: Long,
+    load: K => V
+):
+  private val entries = scala.collection.concurrent.TrieMap.empty[K, Entry[V]]
+
+  def get(key: K, now: Long): Result[V] = entries.get(key) match
+    case Some(e) if now < e.soft => Result.Fresh(e.value)
+    case Some(e) if now < e.hard => refresh(key, now).getOrElse(Result.Stale(e.value))
+    case _                       => refresh(key, now).getOrElse(Result.Failed(Expired))
+
+  // A failed refresh must not evict: the stale value is the fallback.
+  private def refresh(key: K, now: Long): Option[Result[V]] =
+    try
+      val v = load(key)
+      entries.update(key, Entry(v, now + softTtlMs, now + hardTtlMs))
+      Some(Result.Fresh(v))
+    catch case _: Exception => None
+
+  private val Expired = RuntimeException("no usable entry")
+```
+
+The load-bearing line is the `catch` that returns `None` without touching `entries`: eviction on refresh failure would discard the value that `stale-if-error` exists to serve.
+
+## Failing safe when the cache is unreachable
+
+For the cache tier being down, the common default posture is **fail-open** — a cache error is treated as a miss and the read proceeds to the database, so an outage of the cache degrades latency rather than availability. Unqualified fail-open has a failure mode of its own: a request rate previously absorbed by cache hits arrives at the database in full when the cache disappears, which is a **cache avalanche**. Fail-open without a governor relocates the outage rather than preventing it.
+
+The fallback path is therefore wrapped in a **circuit breaker** and a **concurrency limit**. The breaker stops repeated attempts against an unresponsive cache once failures accumulate; the limiter caps how many fallback queries reach the database concurrently, so the fallback cannot itself become the stampede. The breaker state machine is described in [circuit breakers with Resilience4j](/articles/microservices/2026-07-24-circuit-breakers-resilience4j).
 
 ```go
 // getUserFailSafe runs when the cache read errored (cache down, not a miss).
@@ -119,6 +158,16 @@ func getUserFailSafe(ctx context.Context, db *DB, id string) (*User, error) {
 }
 ```
 
-**Fail-open is the right default for read-mostly, non-authoritative caches** — product pages, profiles, feeds — where a stale or slower answer beats an error. **Fail-closed is correct when the cache is authoritative for a safety decision**: a rate limiter whose counters live in Redis, a token denylist, a paywall check. If those "fail open," an attacker just needs to knock over Redis to bypass the control entirely. The question to ask in review is always: *if the cache returns nothing, is the safe answer "let it through" or "keep it out"?* Negative caching decides how you remember absence; fail-safe design decides what absence means when the cache can no longer tell you.
+The choice between postures follows from what the cached value decides. **Fail-open suits read-mostly, non-authoritative caches** — product pages, profiles, feeds — where a slower or staler answer is preferable to an error. **Fail-closed is required where the cache is authoritative for a safety decision**: rate-limiter counters held in Redis, a token denylist, a paywall check. If such a control fails open, disabling the cache is sufficient to bypass the control. The question a review must answer is whether, when the cache returns nothing, the safe answer is to allow the request or to reject it. Negative caching determines how absence is recorded; fail-safe design determines what absence means once the cache can no longer report it.
 
-**Try next:** Add a Bloom filter in front of `GetUser` and measure how many DB round-trips it eliminates under a synthetic penetration attack of random non-existent IDs; then kill Redis mid-load and confirm your breaker opens before your database connection pool saturates.
+## Pitfalls
+
+- **An empty string or empty struct used as the absent marker collides with legitimate empty payloads**, so a real record whose serialized form is empty is reported as missing. The marker must be a byte sequence the serializer cannot emit.
+- **Caching a timeout or connection error as a negative entry hides existing data** for the whole negative TTL, because the code treated "could not determine" as "determined to be absent".
+- **A negative TTL set as long as the positive TTL turns creation into a delayed-visibility bug**: a key written moments after the sentinel is invisible until the sentinel expires, with no write path invalidating it.
+- **Negative entries created in one burst and given identical TTLs expire simultaneously**, producing a second stampede at expiry. Jitter on the TTL is what separates them.
+- **A negative cache alone does not bound memory under a penetration attack**, since each distinct invented key allocates its own entry; the bound comes from a membership filter in front of the cache.
+- **Fail-open without a concurrency limit converts a cache outage into a database outage**, because the entire hit rate arrives at the origin at once.
+- **Fail-open on an authoritative cache removes the control it enforces**: with rate-limiter counters or a denylist in Redis, making Redis unavailable is equivalent to disabling the check.
+- **Evicting a cache entry when its refresh fails destroys the value `stale-if-error` would have served**, converting a recoverable degradation into an error response.
+- **Caching a request-specific rejection — a malformed body, a failed authorization — under a key shared across clients** makes one client's mistake visible to the others for the TTL, since the response depended on the request, not on origin state.

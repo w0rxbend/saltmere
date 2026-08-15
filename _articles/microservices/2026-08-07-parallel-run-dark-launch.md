@@ -1,9 +1,9 @@
 ---
-title: "Parallel run: prove the new code in production before you trust it"
+title: "Parallel run: proving new code against production traffic before trusting it"
 date: 2026-08-07
 track: microservices
-summary: "A parallel run calls both the old and new implementation on every live request, serves the old (trusted) result, and compares the new one in the background. It's how you verify a rewrite against real production traffic without risking a single response. Here's the pattern, a GitHub Scientist experiment, a language-agnostic comparator that handles side-effects and non-deterministic fields, and how to roll a real migration — plus why it is not a canary."
-reading_time: 6
+summary: "A parallel run invokes both the old and the new implementation on every sampled live request, serves the old (trusted) result, and compares the new one out of band. It verifies a rewrite against real production traffic without any request being answered by unproven code. Covers the pattern, a GitHub Scientist experiment, a language-agnostic comparator handling side effects and non-deterministic fields, the migration sequence, and why it is not a canary."
+reading_time: 7
 tags: [parallel-run, dark-launch, migration, testing-in-production, microservices]
 sources:
   - title: "Branch By Abstraction — Martin Fowler (bliki)"
@@ -18,32 +18,32 @@ sources:
     url: "https://flexport.engineering/using-githubs-scientist-library-to-refactor-with-confidence-9d34600edd5e"
 ---
 
-You've rewritten a gnarly piece of code — a pricing engine, a permissions check, a tax calculator — and your tests pass. Tests prove the cases you thought of. They say nothing about the malformed input a real customer sent in 2019 that some upstream system still replays, or the rounding edge your fixtures never covered. The only dataset that exercises all of that is production traffic, and you don't want to *serve* results from unproven code to find out.
+**Gist.** A test suite exercises the cases its authors imagined; a rewritten pricing engine, permissions check or tax calculator meets inputs no fixture covers, and only production traffic exercises that distribution. A **parallel run** invokes both the old (control) and the new (candidate) implementation on the same request, returns the control's result, and compares the candidate's result out of band, so the candidate answers no user while accumulating real-traffic evidence. The cost is paid in compute — the work is performed twice — and in engineering effort to make the candidate side-effect-free, which is the constraint that decides whether the technique is applicable at all.
 
-A **parallel run** is the way out. On every live request you call *both* the old and the new implementation, you serve the old one's result (it's the trusted one), and you compare the new one's result in the background. Sam Newman puts it plainly in *Building Microservices*: "call both the old and new implementations simultaneously and compare their results." The user never sees the new code. You accumulate real-traffic evidence that it agrees with the old code — or a list of exactly the inputs where it doesn't — until you have the confidence to cut over.
+Sam Newman describes the pattern in *Building Microservices* as calling both the old and the new implementation rather than either one, so that their results can be compared. The output of the run is not a pass/fail verdict but a **list of the exact inputs on which the two implementations disagree**.
 
-Note the shape: this is a *verification* technique. It sits one level up from [parallel change / expand-contract](/articles/microservices/2026-08-03-parallel-change-expand-contract), which is a schema-and-interface migration pattern for coexisting old and new *shapes* of a contract — parallel run is about proving one *implementation* matches another before you switch, not about evolving a field.
+A parallel run is a *verification* technique. It sits one level above [parallel change / expand-contract](/articles/microservices/2026-08-03-parallel-change-expand-contract), which is a schema-and-interface migration pattern for coexisting old and new *shapes* of a contract. Parallel run proves that one *implementation* matches another before a switch; it does not evolve a field.
 
 ## Not a canary
 
-The distinction that trips people up is canary. Both run new code in production; they are opposites in who sees the result.
+Canary release and parallel run both execute new code in production. They are opposites in **who observes the new code's result**.
 
-- A **canary** routes a *subset of live traffic* to the new path and **serves that path's result** to those users. Some real requests are answered by unproven code. You limit blast radius by limiting the fraction of users, and you watch error rates and latency to decide whether to widen it.
-- A **parallel run** sends the *same request to both* paths and **serves the old, trusted result** to everyone. The new path answers nobody; its output only feeds a comparison. Blast radius is zero because no user is ever served the candidate.
+- A **canary** routes a subset of live traffic to the new path and **serves that path's result** to the users in the subset. Some real requests are answered by unproven code. Blast radius is bounded by the traffic fraction, and the decision to widen it comes from error rate and latency on the new path.
+- A **parallel run** sends the *same request to both* paths and **serves the control's result to everyone**. The candidate's output feeds only a comparison. Blast radius is zero, because no user is ever served the candidate.
 
-So canary trades a little user exposure for a live signal; parallel run buys the signal with compute (you run the work twice) and gets zero exposure in return. They compose, too — a common sequence is parallel run to prove *correctness*, then canary to prove *operational* behavior under real serving load.
+A canary trades user exposure for a live serving signal; a parallel run buys a correctness signal with duplicated compute and yields no exposure. The two compose: parallel run establishes *correctness*, canary then establishes *operational* behaviour under real serving load, which a parallel run cannot measure because the candidate never carries the serving path's dependencies at full rate.
 
-## The mechanics you can't skip
+## The two mechanics that cannot be skipped
 
-Two problems make a naive parallel run dangerous, and both are about the candidate touching the world.
+Both hazards concern the candidate touching the world.
 
-**Side-effects.** If the new path also sends the email, charges the card, or writes the row, running it in parallel doubles those effects. The candidate must be side-effect-free, or run against a *shadow* store and stubbed collaborators. Newman's suggested tactic is a spy (from unit testing) so the new code *thinks* it sent the notification while you assert on the call instead of firing it. If you genuinely can't isolate the side-effects, you can't parallel-run that code — that's the honest constraint.
+**Side effects.** If the candidate also sends the email, charges the card, or writes the row, executing it in parallel **doubles those effects**. The candidate must therefore be side-effect-free, or be pointed at a *shadow* store with stubbed collaborators. Newman's suggested tactic is the unit-testing spy: the candidate behaves as though it dispatched the notification, and the call is asserted on rather than performed. Where side effects cannot be isolated, the code cannot be parallel-run — that is the honest constraint, not a detail to engineer around later.
 
-**Non-determinism.** Timestamps, generated IDs, map ordering, and floating-point tails will differ between two implementations that are both "correct." Compare naively and every request is a mismatch and the signal is noise. You normalize before comparing: drop or freeze `generated_at`, sort collections, round money to the cent.
+**Non-determinism.** Timestamps, generated identifiers, map iteration order and floating-point tails differ between two implementations that are both correct. Comparing raw results makes **every request a mismatch**, and the mismatch log stops carrying information. The comparison therefore runs over a normalized projection: non-deterministic fields dropped or frozen, collections sorted into a canonical order, monetary values rounded to the currency's minor unit.
 
 ## A GitHub Scientist experiment
 
-GitHub open-sourced [Scientist](https://github.com/github/scientist/blob/main/README.md) — "a Ruby library for carefully refactoring critical paths" — which is a parallel run in library form. You declare a `use` block (the control, always returned) and a `try` block (the candidate). Scientist runs both, randomizes their order, swallows the candidate's exceptions, times both, compares the results, and hands a report to `publish`.
+GitHub open-sourced [Scientist](https://github.com/github/scientist/blob/main/README.md), described in its README as "a Ruby library for carefully refactoring critical paths". It is a parallel run in library form. An experiment declares a `use` block (the control, whose value is always returned) and a `try` block (the candidate). Scientist runs both, **randomizes their execution order**, swallows exceptions raised by the candidate, times both, compares the results, and passes a result object to `publish`.
 
 ```ruby
 require "scientist"
@@ -55,22 +55,22 @@ def can_read?(user, model)
 
     e.context user_id: user.id, model: model.class.name
 
-    # Normalize before comparing so non-deterministic noise doesn't read as a mismatch.
+    # Normalize before comparing so non-deterministic noise does not read as a mismatch.
     e.compare do |control, candidate|
-      control == candidate
+      normalize(control) == normalize(candidate)
     end
 
-    # Don't run the experiment for every request if it's hot; sample instead.
+    # Sample rather than duplicating every request on a hot path.
     e.run_if { rand < 0.10 }
   end
 end
 ```
 
-`science` returns whatever `use` returns — the candidate never changes what the caller gets. Order is randomized on each run specifically to surface hidden coupling: if the two blocks share mutable state, running control-then-candidate and candidate-then-control produce different mismatches. Flexport, who ran Scientist over real refactors, tracks exactly this as a **"Mismatched by run order"** metric to catch data inter-dependencies. Your `publish` method ships `result.matched?`, `result.mismatched?`, timings, and the serialized `context` to your metrics and logs — the mismatch log becomes your to-fix list. Ports exist well beyond Ruby: [Scientist.NET](https://github.com/scientistproject/Scientist.net), plus Python, Java, Go, Node/TypeScript, PHP, and more, so this is not a Ruby-only technique.
+`science` returns whatever `use` returns, so the candidate cannot alter what the caller receives. **Order randomization surfaces hidden coupling**: if the two blocks share mutable state, the control-then-candidate ordering and the candidate-then-control ordering produce different mismatches, and a difference that correlates with order is evidence of shared state rather than of divergent logic. Flexport, reporting on its use of Scientist over real refactors, describes tracking run order alongside mismatches for exactly this reason. The `publish` method forwards `result.matched?`, `result.mismatched?`, the timings and the serialized `context` to metrics and logs; the mismatch log is the work queue. Ports exist beyond Ruby, including [Scientist.NET](https://github.com/scientistproject/Scientist.net) alongside Python, Java, Go, Node/TypeScript and PHP implementations.
 
-## The comparator, without a library
+## The comparator without a library
 
-If no port fits your stack, a parallel run is about twenty lines. The load-bearing parts are the side-effect isolation and the normalization, not the framing:
+Where no port fits the stack, the pattern is roughly twenty lines. The load-bearing parts are the side-effect isolation and the normalization, not the framing.
 
 ```
 function computeWithParallelRun(request):
@@ -99,26 +99,61 @@ function computeWithParallelRun(request):
         log.warn("candidate threw", err, request.id)
 
     return control        # ALWAYS the old result
-
-function normalize(result):
-    result.generated_at = null       # freeze non-deterministic fields
-    result.trace_id     = null
-    result.items        = sort(result.items)
-    result.total        = round(result.total, 2)
-    return result
 ```
 
-The two rules that matter: `control` is what you return, on every branch including the error branch; and the candidate's cost — exceptions, latency, mismatches — is telemetry, never a user-facing failure.
+Two invariants govern the whole construction. **`control` is returned on every branch, including the branch where the candidate raised.** And **the candidate's cost — its exceptions, its latency, its mismatches — is telemetry, never a user-visible failure.** Any implementation that violates the first invariant has become a canary without saying so.
 
-## Rolling a real migration
+### Implementation sketch (Scala)
 
-1. **Wrap the seam behind an abstraction.** You need one interception point where both implementations can be invoked with the same input. Martin Fowler's [Branch By Abstraction](https://martinfowler.com/bliki/BranchByAbstraction.html) is the clean way to create it, and he notes Steve Smith's variation "which involves verifying that the two implementations return the same results to requests" — that variation *is* the parallel run.
-2. **Make the candidate inert.** Audit it for side-effects and route every write, email, and external call to a shadow or a spy. This is usually the hardest engineering, and it's the step teams skip and regret.
-3. **Start dark, sampled, comparison-only.** Turn the experiment on behind a flag at a low sample rate. Serve control, log mismatches, watch candidate latency and error rate.
-4. **Drive mismatches to zero.** Each distinct mismatch is a real behavioral difference — a genuine bug in the new code, or (often) a latent bug in the old code, or a normalization gap. Fix, redeploy, watch the rate fall. Ramp the sample toward 100% as it stabilizes.
-5. **Cut over deliberately.** When the match rate has held near-perfect across a full traffic cycle (weekday peak, weekend, month-end batch), flip the abstraction to serve the *candidate* and demote the old path to the compared side. Now you're de-risking the removal, not the addition.
-6. **Contract.** Once the new path has served cleanly, delete the old implementation and the experiment scaffolding. A parallel run left running forever is just a permanent doubling of your compute bill.
+The harness expresses both invariants in the type: the candidate is evaluated inside `Try`, and the control's value is the only value that escapes.
 
-The whole point is that at no moment before step 5 could the new code hurt a user, and by step 5 you have production-scale evidence — not a test suite's worth — that it behaves. That's a fundamentally stronger position than "the tests are green, ship it."
+```scala
+final case class Report[A](matched: Boolean, control: A, candidate: Try[A], context: Map[String, String])
 
-**Try next:** take one pure, side-effect-free function on a hot path you've been afraid to touch, wrap it with Scientist (or the twenty-line comparator above) at a 5% sample, and run it dark for a week — then read the mismatch log and see how many of the differences turn out to be bugs in the *old* code.
+def experiment[A](
+    name: String,
+    context: Map[String, String],
+    sampleRate: Double,
+    normalize: A => A,
+    publish: Report[A] => Unit
+)(control: => A, candidate: => A): A =
+  if Random.nextDouble() >= sampleRate then control
+  else
+    val controlFirst = Random.nextBoolean() // order randomization exposes shared mutable state
+    // Both thunks are forced here; the chosen order is the only difference between branches.
+    val (c, k) =
+      if controlFirst then
+        val first = control
+        (first, Try(candidate))
+      else
+        val first = Try(candidate)
+        (control, first)
+
+    val matched = k.map(normalize).toOption.contains(normalize(c))
+    publish(Report(matched, c, k, context + ("control_first" -> controlFirst.toString)))
+    c // the candidate's value and its exception both terminate here
+```
+
+`Try(candidate)` converts a candidate failure into a value, so a raised exception is recorded in the report rather than propagating to the caller. Recording `control_first` in the context is what makes the run-order metric computable after the fact.
+
+## Rolling a migration
+
+1. **Wrap the seam behind an abstraction.** A single interception point is required at which both implementations can be invoked with the same input. Martin Fowler's [Branch By Abstraction](https://martinfowler.com/bliki/BranchByAbstraction.html) describes how to create one: the callers are moved onto an abstraction layer, and the implementation behind that layer can then be swapped, or — as in a parallel run — invoked twice.
+2. **Make the candidate inert.** Audit for side effects and route every write, notification and external call to a shadow or a spy. This is typically the largest engineering item in the migration.
+3. **Start dark, sampled, comparison-only.** Enable the experiment behind a flag at a low sample rate, serving control, logging mismatches, and observing candidate latency and error rate.
+4. **Drive mismatches to zero.** Each distinct mismatch is a real behavioural difference: a defect in the candidate, a latent defect in the control, or a gap in normalization. The sample rate is raised toward full traffic as the rate falls.
+5. **Cut over deliberately.** Once the match rate has held across a full traffic cycle — weekday peak, weekend, month-end batch — the abstraction is flipped to serve the candidate and the old path is demoted to the compared side. The experiment now de-risks the *removal* rather than the addition.
+6. **Contract.** After the new path has served cleanly, the old implementation and the experiment scaffolding are deleted. A parallel run left permanently enabled is a permanent duplication of compute.
+
+Before step 5, no request can be harmed by the candidate; at step 5 the evidence is production-scale rather than fixture-scale.
+
+## Pitfalls
+
+- **A candidate that writes doubles the write.** Emails sent twice, cards charged twice, rows inserted twice — the symptom appears in production the moment the experiment is enabled, because "compared only" describes the *result*, not the code path's effects.
+- **Comparing un-normalized results makes every request a mismatch.** A `generated_at` timestamp or a fresh trace identifier differs on every run, so the mismatch rate pins at 100% and the log carries no information about logic.
+- **Sorting inside `normalize` hides an ordering bug.** If the contract specifies an order and the comparator sorts before comparing, a candidate that returns the right elements in the wrong order is recorded as a match.
+- **Returning the candidate on the control's error branch converts the experiment into a canary.** The blast-radius-zero property holds only if `control` is returned unconditionally.
+- **An unsampled experiment on a hot path doubles that path's load.** Latency regressions and dependency saturation follow from the duplicated work, not from the candidate's logic.
+- **Mismatches attributed only to the candidate mask defects in the control.** A difference is evidence that the two disagree; deciding which is correct requires reading the specification, and the old implementation is frequently the wrong one.
+- **Order-correlated mismatches indicate shared mutable state, not divergent logic.** Without recording which block ran first, the two causes are indistinguishable in the mismatch log.
+- **An experiment left enabled after cut-over keeps paying for the dead implementation.** The compute duplication persists indefinitely, and the retained old code continues to require maintenance.

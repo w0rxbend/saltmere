@@ -2,8 +2,8 @@
 title: "Distributed Locking, Redlock, and the Fencing-Token Debate"
 date: 2026-08-10
 track: microservices
-summary: "A single-node SET NX lock is easy to write and easy to get subtly wrong. The hard part isn't the happy path — it's what happens when a client pauses past the TTL. That question splits distributed locks into two camps: efficiency locks (Redlock is fine) and correctness locks (you need fencing tokens the resource actually checks)."
-reading_time: 6
+summary: "A single-node SET NX lock is short to write and subtly easy to get wrong. The hard case is not the happy path but a client that pauses past the time-to-live. That case splits distributed locks into two categories: efficiency locks, for which Redlock suffices, and correctness locks, which require fencing tokens the protected resource itself checks."
+reading_time: 7
 tags: [distributed-locks, redis, redlock, zookeeper, etcd, consistency]
 sources:
   - title: "Distributed Locks with Redis (Redlock) — Redis docs"
@@ -18,19 +18,19 @@ sources:
     url: "https://etcd.io/docs/v3.5/learning/why/"
 ---
 
-Mutual exclusion is a solved problem inside one process: a mutex, a `synchronized` block, a compare-and-swap. Stretch it across processes on different machines and every guarantee you leaned on quietly disappears. There is no shared memory, no scheduler that can suspend a thread that misbehaves, and — the part that trips almost everyone — no way to stop a process that already holds the lock from *thinking* it still holds it after it has actually lost it. Distributed locking is less about acquiring the lock and more about what happens in that gap.
+**Gist.** Mutual exclusion across machines has no shared memory and no scheduler that can suspend a misbehaving holder, so a lock service can only tell a client that it *held* the lock at some past instant. A time-to-live (TTL) bounds the damage from a crashed holder, and a quorum algorithm such as Redlock removes the single point of failure, but neither prevents a paused holder from writing after its lease expired. The only construction that closes that gap moves enforcement to the protected resource — a monotonically increasing **fencing token** checked on every write — at the cost of modifying the resource itself.
 
-## The naive Redis lock
+## The single-node Redis lock
 
-The canonical single-node lock is one command. You set a key only if it is absent, stamp it with a value nobody else can guess, and give it a time-to-live so a crashed holder can't wedge the lock forever:
+The canonical single-node lock is one command: set a key only if it is absent, stamp it with a value no other client can guess, and attach an expiry so a crashed holder cannot wedge the lock permanently.
 
 ```
 SET resource_name my_random_value NX PX 30000
 ```
 
-`NX` makes the write conditional on the key not existing — that's the mutual exclusion. `PX 30000` is a 30-second auto-expiry — that's the deadlock avoidance. `my_random_value` is a per-acquisition nonce (a UUID, or 20 bytes from `/dev/urandom`), and it matters enormously at release time.
+`NX` makes the write conditional on the key not existing — that is the mutual exclusion. `PX 30000` sets a 30-second auto-expiry — that is the deadlock avoidance. `my_random_value` is a per-acquisition nonce (a UUID, or 20 bytes read from `/dev/urandom`), and it is load-bearing at release time.
 
-The tempting release is `DEL resource_name`. It's wrong. Consider: your lock's TTL expires while you're mid-work, Redis frees it, another client acquires it, and *then* your slow `DEL` fires — deleting a lock you no longer own. So release has to be a compare-and-delete: check the value is still yours, and only then delete. That read-then-delete must be atomic, which on Redis means a Lua script (the server runs it without interleaving other commands). This is the exact script from the Redis docs:
+Releasing with `DEL resource_name` is incorrect. The interleaving that breaks it: the TTL expires while the holder is still working, Redis frees the key, a second client acquires it, and only then does the first client's slow `DEL` arrive, **deleting a lock held by someone else**. Release must therefore be a compare-and-delete: verify the stored value is still the caller's nonce, then delete. The read and the delete must be atomic, which on Redis means a Lua script, since the server runs a script without interleaving other commands. The Redis documentation gives exactly this script:
 
 ```lua
 if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -40,58 +40,92 @@ else
 end
 ```
 
-Called with `KEYS[1] = resource_name` and `ARGV[1] = my_random_value`. Now you only ever delete your own lock. (Redis 8.4+ folds this into a single `DELEX key IFEQ my_random_value` command, but the Lua form is what you'll be asked to write in an interview.)
+It is invoked with `KEYS[1] = resource_name` and `ARGV[1] = my_random_value`, so a client can only ever delete its own acquisition. Recent Redis versions also expose a conditional delete that folds the comparison and the deletion into one command, removing the need for the script.
 
-This lock is correct against crashes and correct against slow releases. What it is *not* correct against is a paused holder — and that failure mode is the whole story.
+This lock is correct against holder crashes and against slow releases. It is not correct against a **paused** holder.
 
-## The failure mode that TTLs can't fix
+## The failure mode a TTL cannot fix
 
-Client 1 acquires the lock with a 30-second TTL and starts working. Then it stalls: a stop-the-world GC pause, a hypervisor descheduling the VM, a blocked syscall, a laptop lid closing. The pause runs past 30 seconds. Redis expires the key. Client 2 acquires the very same lock and proceeds. Client 1 wakes up — with no idea any time has passed — and finishes its operation, still believing it holds the lock. **Two clients now act on the resource at once.**
+Client 1 acquires the lock with a 30-second TTL and begins work. It then stalls: a stop-the-world garbage-collection pause, a hypervisor descheduling the virtual machine, a blocked system call, a suspended laptop. The stall exceeds 30 seconds. Redis expires the key. Client 2 acquires the same lock and proceeds. Client 1 resumes with no indication that time has passed, completes its operation, and still believes it holds the lock. **Two clients act on the resource concurrently.**
 
-No TTL setting fixes this, because the pause is unbounded and the client can't know it happened. A shorter TTL makes it *more* likely; a longer TTL makes a genuine crash wedge the lock for longer. The lock service did nothing wrong. The problem is that the lock is advisory: it tells the client "you hold it," and a paused client hears a stale answer.
+No TTL value eliminates this, because the pause is unbounded and invisible to the paused process. A shorter TTL makes the overlap more likely; a longer TTL leaves a genuinely crashed holder's lock wedged for longer. The lock service behaved correctly throughout. The defect is that the lock is **advisory**: it reports a fact about the past, and a resumed client reads that report as a fact about the present.
 
 ## Redlock
 
-Redlock is antirez's algorithm for locking without a single point of failure, across N independent Redis masters (typically 5) that don't replicate to each other. To acquire, a client:
+Redlock is antirez's algorithm for locking without a single point of failure, running across N independent Redis masters — typically 5 — that do not replicate to one another. Acquisition proceeds as follows.
 
-1. Records the current time.
-2. Tries to `SET ... NX PX` the same key + nonce on all N nodes sequentially, each with a *tiny* per-node timeout (5–50 ms) so a dead node can't stall the whole attempt.
-3. Considers the lock held only if it got a **majority (N/2 + 1)** *and* the total elapsed time is less than the TTL.
-4. Sets the lock's effective validity to `TTL − elapsed − clock_drift`.
-5. On failure, unlocks every node — including ones it thinks it didn't get.
+1. Record the current time.
+2. Attempt `SET ... NX PX` with the same key and nonce on all N nodes sequentially, each attempt bounded by a small per-node timeout (5–50 ms) so an unreachable node cannot stall the whole acquisition.
+3. Treat the lock as held only if a **majority (N/2 + 1)** of nodes accepted it *and* total elapsed time is below the TTL.
+4. Set the lock's effective validity to `TTL − elapsed − clock_drift`.
+5. On failure, release on every node, including those believed not to have granted it.
 
-The majority quorum means the lock survives a minority of nodes crashing, and no single Redis being restarted (and losing the key) breaks safety. It's a genuinely clever design. But it addresses *node* failure, not *client* pauses — step 4's validity accounting protects the acquire phase, not the arbitrarily long gap between "I hold it" and "I write."
+The majority quorum means the lock tolerates a minority of node failures. Restarts are a subtler matter: an instance that restarts without a durable copy of the key forgets the acquisition it granted, and enough such restarts let a second client assemble its own majority for the same key. The Redis documentation addresses this by requiring that a crashed instance stay unavailable for at least the TTL before rejoining — a *delayed restart* — so that every lock it had granted has expired everywhere by the time it accepts new acquisitions. The algorithm addresses **node** failure. It does not address **client** pauses: the validity accounting in step 4 constrains the acquire phase, not the interval between the moment the client concludes it holds the lock and the moment its write reaches the resource.
 
 ## Kleppmann's critique: fencing tokens
 
-Martin Kleppmann's 2016 post "How to do distributed locking" makes the argument that reframed the whole topic. He splits locks into two purposes:
+Martin Kleppmann's 2016 post "How to do distributed locking" separates locks by purpose.
 
-- **Efficiency** — the lock just avoids doing the same work twice (a duplicate email, a redundant expensive computation). A rare double-execution costs you a little money or an apology. Here, he says, "it is unnecessary to incur the cost and complexity of Redlock" — a single-node lock is fine.
-- **Correctness** — a double-execution corrupts data: "corrupted file, data loss, permanent inconsistency, the wrong dose of a drug administered to a patient." Here you need the lock to *never* let two holders write.
+- **Efficiency.** The lock exists to avoid repeating work — a duplicate email, a redundant expensive computation. A rare double execution costs money or an apology. For this case Kleppmann writes that "it is unnecessary to incur the cost and complexity of Redlock"; a single-node lock suffices.
+- **Correctness.** A double execution damages data — Kleppmann's examples are a corrupted file, lost data, permanent inconsistency, and the wrong dose of a drug administered to a patient. Here two holders must never both write.
 
-His key result: **no lock service alone can give you correctness**, because of the pause scenario above. Redlock, he notes, "does not have any facility for generating fencing tokens." The fix has to move to the resource. A **fencing token** is a monotonically increasing number the lock hands out on each successful acquisition. Every write to the protected resource carries its token, and the resource **rejects any token lower than the highest it has already seen**:
+His central claim is that **no lock service alone provides correctness**, precisely because of the pause scenario above; of Redlock specifically he notes that it "does not have any facility for generating fencing tokens." The enforcement must move to the resource. A **fencing token** is a monotonically increasing number issued on each successful acquisition. Every write to the protected resource carries its token, and the resource **rejects any token lower than the highest it has already accepted**, persisting that high-water mark atomically with the write.
 
-```python
-# Storage server enforces the fence; the lock only mints the token.
-def write(payload, token):
-    if token <= storage.max_seen_token:   # a stale, paused holder
-        raise StaleLockError(f"token {token} <= {storage.max_seen_token}")
-    storage.max_seen_token = token        # persisted atomically with the write
-    storage.apply(payload)
+Replaying the pause with fencing: client 1 acquires token 33, pauses, and loses the lock. Client 2 acquires token 34 and writes, advancing the high-water mark to 34. Client 1 resumes and writes with token 33, and the resource rejects it. The lock remains advisory, but that no longer matters, because exclusion is enforced by a comparison that does not depend on timing. This is the same structure as [idempotency keys](/articles/microservices/2026-07-30-idempotency-keys-safe-retries): rather than trusting the caller's claim, the server checks a guard it owns.
+
+### Implementation sketch (Scala)
+
+The load-bearing parts are the quorum count with validity accounting on the client side, and the monotonic guard on the resource side.
+
+```scala
+final case class Lease(nonce: String, token: Long, validityMs: Long)
+
+def acquire(nodes: List[RedisNode], key: String, ttlMs: Long): Option[Lease] =
+  val nonce = java.util.UUID.randomUUID().toString
+  val start = System.nanoTime()
+  // Per-node timeout keeps one unreachable node from consuming the whole TTL.
+  val granted = nodes.count(_.setNxPx(key, nonce, ttlMs, timeoutMs = 50))
+  val elapsedMs = (System.nanoTime() - start) / 1000000
+  val validity = ttlMs - elapsedMs - clockDriftMs
+  if granted >= nodes.size / 2 + 1 && validity > 0 then
+    Some(Lease(nonce, mintToken(), validity))
+  else
+    nodes.foreach(_.releaseIfValueEquals(key, nonce)) // includes nodes believed to have refused
+    None
+
+// Enforcement lives with the resource, not the lock service.
+final class FencedStore(persist: (Array[Byte], Long) => Unit):
+  private var highWaterMark: Long = 0L
+  def write(payload: Array[Byte], token: Long): Either[String, Unit] = synchronized {
+    if token <= highWaterMark then Left(s"stale token $token <= $highWaterMark")
+    else
+      // The mark and the payload must reach durable storage in one transaction.
+      persist(payload, token)
+      highWaterMark = token
+      Right(())
+  }
 ```
 
-Now replay the pause. Client 1 acquires with token 33, pauses, and loses the lock. Client 2 acquires with token 34 and writes. Client 1 wakes and writes with token 33 — and the storage server rejects it, because it has already accepted 34. The lock became advisory again, but it no longer matters: the resource is the one enforcing exclusion, and it does so with a rule that's immune to timing. This is the same "make the resource the arbiter" instinct behind [idempotency keys](/articles/microservices/2026-07-30-idempotency-keys-safe-retries) — instead of trusting the caller's claim, the server checks a monotonic guard it controls.
+`mintToken` must return values that increase across acquisitions; the following section describes services that supply such values directly.
 
 ## antirez's rebuttal
 
-antirez replied in "Is Redlock safe?" He doesn't dispute that fencing works; he questions the premises. If your resource can check a monotonic token, he argues, it can just as well check a **large random token** as a compare-and-set — you don't strictly need monotonicity, and either way the resource does the real enforcement. He also defends Redlock's timing model: after acquiring the majority the algorithm *re-checks* it hasn't run out of validity. The honest reading: for **efficiency** locks the two barely disagree, and for **correctness** locks both end up saying the resource must guard its own writes. The dispute is about how safe an unfenced lock is in practice, not whether fencing is the mechanism.
+antirez responded in "Is Redlock safe?". He does not dispute that fencing works; he disputes the premises. If a resource is capable of checking a monotonic token, he argues, it is equally capable of checking a **large random token** by compare-and-set, so strict monotonicity is not required, and in either construction the resource performs the actual enforcement. He also defends Redlock's timing model, noting that after obtaining the majority the algorithm re-checks that validity has not been exhausted. For **efficiency** locks the two positions differ little, and for **correctness** locks both conclude that the resource must guard its own writes. The disagreement concerns how safe an unfenced lock is in practice, not whether fencing is the mechanism.
 
-## The correctness-oriented alternative: lease-based locks
+## Lease-based locks on consensus systems
 
-If you need correctness, reach for a coordination service built on consensus. **ZooKeeper**'s lock recipe has each client create a *sequential ephemeral* znode under a lock node; the client holding the lowest sequence number owns the lock, and everyone else watches the next-lower node rather than stampeding. Two properties fall out for free: the znode is *ephemeral*, so a client's session dying (even a paused client whose session times out) releases the lock automatically, and the ever-increasing sequence number (or the znode's `zxid`) *is* a natural fencing token. **etcd** does the equivalent with a lease-backed lock; each key carries a `revision`, and that monotonic revision serves as the fence a resource can check. **Chubby**, Google's lock service, pioneered this lease-plus-sequencer shape. These systems are slower than a Redis `SET` and require a quorum to be up — that's the price of a lock whose guarantees survive the pause.
+Where correctness is required, a coordination service built on consensus supplies both the lease and the token. **ZooKeeper**'s lock recipe has each client create a *sequential ephemeral* znode beneath a lock node; the client owning the lowest sequence number holds the lock, and each other client watches the next-lower znode rather than all contending on one notification. Two properties follow: the znode is *ephemeral*, so the expiry of a client's session — including a paused client's session — releases the lock, and the increasing sequence number (or the znode's `zxid`) serves as a fencing token. **etcd** provides a lease-backed lock in which each key carries a `revision`, and that monotonic revision is the value a resource can fence on. **Chubby**, Google's lock service, established this lease-plus-sequencer shape. These systems require a quorum to be available and are slower than a single Redis `SET`; that is the cost of a lock whose token survives the pause.
 
 ## Choosing
 
-Ask one question: *what breaks if two clients hold the lock at once?* If the answer is "we waste some work," a single-node `SET NX PX` with the Lua release is the right amount of engineering, and Redlock buys availability if that node's failure worries you. If the answer is "we corrupt data or double-charge a customer," no lock is enough on its own — you need fencing tokens the resource enforces, and a lease-based lock (ZooKeeper, etcd, Chubby) is a cleaner place to get monotonic tokens than bolting them onto Redis. The lock schedules; the resource decides.
+The deciding question is what breaks when two clients hold the lock simultaneously. If the answer is duplicated work, a single-node `SET NX PX` with the Lua compare-and-delete release is proportionate, and Redlock adds availability when the failure of that one node is the concern. If the answer is corrupted data or a double charge, no lock is sufficient on its own: the resource must check fencing tokens, and a lease-based lock (ZooKeeper, etcd, Chubby) issues monotonic tokens directly rather than requiring them to be constructed on top of Redis. The lock schedules; the resource decides.
 
-**Try next:** take the fencing example above and add token persistence, then simulate a paused holder — sleep past the TTL between acquire and write — and confirm the storage server rejects the stale token while the newer holder's write succeeds.
+## Pitfalls
+
+- **Releasing with `DEL` instead of a compare-and-delete.** Symptom: a client's lock disappears while it is still working. Cause: a previous holder's delayed release deleted a key that had already expired and been re-acquired.
+- **Performing the compare and the delete as two client round trips.** Symptom: the same cross-holder deletion as above, now rarer and harder to reproduce. Cause: the key can expire and be re-acquired between the `GET` and the `DEL`; only a server-side script or a single conditional-delete command makes the pair atomic.
+- **Reusing a fixed lock value across acquisitions.** Symptom: every client passes the ownership check. Cause: the compare-and-delete distinguishes owners solely by the nonce, so a constant value makes all holders indistinguishable.
+- **Extending the TTL to "avoid" the pause problem.** Symptom: after a real crash the resource is unavailable for the full extended TTL. Cause: the TTL trades crash-recovery latency against overlap probability; it cannot bound an unbounded pause.
+- **Treating Redlock's quorum as protection against paused clients.** Symptom: two holders write despite a five-node deployment. Cause: the quorum and validity accounting cover node failure and acquisition time, not the interval between acquisition and the write.
+- **Minting fencing tokens on the client.** Symptom: an older holder's token exceeds a newer holder's and the resource accepts the stale write. Cause: monotonicity must come from a single ordering authority — a ZooKeeper sequence number, an etcd revision — not from independent clients.
+- **Persisting the token high-water mark separately from the payload.** Symptom: after a crash the resource accepts a token it had already fenced out. Cause: if the mark and the write are not committed atomically, recovery can restore one without the other.

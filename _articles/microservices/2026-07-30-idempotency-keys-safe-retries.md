@@ -3,7 +3,7 @@ title: "Idempotency Keys: Making Retries Safe When Delivery Is At-Least-Once"
 date: 2026-07-30
 track: microservices
 summary: "Timeouts and circuit breakers make retries inevitable, and retries make duplicate side effects inevitable. A client-supplied Idempotency-Key lets the server collapse those duplicates into one, using a unique constraint to settle the concurrent case."
-reading_time: 7
+reading_time: 8
 tags: [idempotency, retries, at-least-once, http, api-design, postgres]
 sources:
   - title: "The Idempotency-Key HTTP Header Field (draft-ietf-httpapi-idempotency-key-header-07)"
@@ -43,13 +43,15 @@ The server-side contract is a three-state machine keyed on the stored row:
 
 1. **Absent** — the operation has not been seen. Claim the key, execute, store the outcome.
 2. **`completed`** — return the stored response verbatim without re-executing. The draft: "The resource SHOULD respond with the result of the previously completed operation, success or an error."
-3. **`in_flight`** — a concurrent retry has raced the original. The second attempt must not execute in parallel; the draft prescribes HTTP `409 Conflict`.
+3. **`in_flight`** — a concurrent retry has raced the original. The second attempt must not execute in parallel; the draft directs the resource to HTTP `409 Conflict`.
 
 Case 3 is where naive implementations fail. **A read-then-write check ("have I seen this key?") is not a deduplication primitive**: two requests can both observe the absent state before either writes, and both proceed. The claim must be a single atomic operation.
 
 ## Settling the race in the database
 
-The atomicity is delegated to a unique constraint. Exactly one inserter wins; the others do not fail instantly but block until the winner's transaction resolves, because Postgres makes a second inserter wait on the first transaction's not-yet-committed row before deciding whether the conflict is real. If the winner commits, the losers see the conflict and take the replay path; if it aborts, one of them becomes the winner. The decision is made by the index, not by request timing.
+The atomicity is delegated to a unique constraint. Exactly one inserter can hold the key, and **the decision is made by the index rather than by request timing** — no amount of interleaving lets two attempts both believe they own the key.
+
+The constraint settles which attempt executes, but it does not by itself tell the losers what state the winner is in. A conflict means only that some other attempt has claimed the key; whether that attempt is still running, has committed, or has rolled back is a separate question, answered by reading the row. This is why the contract needs three cases rather than two, and why the `in_flight` state is observable at all.
 
 ```sql
 CREATE TABLE idempotency_keys (
@@ -73,6 +75,8 @@ RETURNING idempotency_key;
 ```
 
 The statement returns one row when the claim was won and *zero rows* — an empty result set, not a null value — when another attempt already holds the key. Zero rows is therefore the conflict signal; the handler then reads the existing row and either replays its stored response, rejects the in-flight duplicate, or rejects a fingerprint mismatch.
+
+**Zero rows does not guarantee that the subsequent read finds a row.** The conflicting claim may belong to a transaction that has not committed, and that transaction may yet abort; the reaper may also remove the row between the two statements. The handler must therefore treat "insert conflicted, read found nothing" as a real state rather than an impossible one — the branch that most implementations omit, and the one the sketch below makes explicit.
 
 Brandur Leach's Postgres write-up reaches the same invariant from the other direction: a unique constraint on the key plus a `locked_at` column and a recovery point, wrapped in a `SERIALIZABLE` transaction, so that "if two different transactions both try to lock any one key, one of them will be aborted by Postgres." Either formulation preserves the invariant: **at most one execution of the side effect per (key, fingerprint) pair within the retention window.**
 
@@ -104,8 +108,8 @@ def claim(store: Store, key: String, fp: String, attempt: Int = 0): Claim =
       case Some((storedFp, _, _)) if storedFp != fp => Claim.Mismatch
       case Some((_, "completed", Some((code, body)))) => Claim.Replay(code, body)
       case Some(_) => Claim.InFlight
-      // Reaped between the failed insert and the read. The retry is bounded:
-      // an unbounded recursion here livelocks against a pathological reaper.
+      // Conflicting claim vanished: winner rolled back, or reaper deleted it.
+      // Bounded retry -- unbounded recursion livelocks against a hot key.
       case None if attempt < 1 => claim(store, key, fp, attempt + 1)
       case None => Claim.InFlight
 
@@ -121,7 +125,7 @@ def handle(store: Store, key: String, fp: String)(
     case Claim.Mismatch => Left(422)
 ```
 
-The `case None` branch is the non-obvious one: a failed insert followed by an absent row is possible only if the reaper deleted the key between the two statements, and re-entering the claim is the only outcome that preserves the invariant.
+The `case None` branch is the non-obvious one. A failed insert followed by an absent row means the claim that caused the conflict is no longer in force — its transaction rolled back, or the reaper removed the row between the two statements. Re-entering the claim is the only outcome that preserves the invariant: falling through to `Won` would execute without holding the key, and returning an error would strand an operation that nothing else is running. The attempt counter bounds the recursion so that a key under sustained contention degrades to `409` rather than spinning.
 
 ## Retention
 
@@ -131,7 +135,7 @@ The table grows by one row per distinct operation and must be reaped:
 DELETE FROM idempotency_keys WHERE created_at < now() - INTERVAL '72 hours';
 ```
 
-The window follows from the maximum plausible retry latency, not from storage convenience. With `n` retries under exponential backoff of base `b` and initial delay `d`, the last attempt can arrive at roughly `d·(bⁿ−1)/(b−1)` after the first, plus any operator-driven replay of a dead-letter queue. Stripe documents that keys are removed after 24 hours, which makes 24 hours a ceiling on retention rather than a floor — a retry that arrives later is not guaranteed to be recognised; Brandur reaps near 72 hours to leave room for post-deploy recovery. The draft fixes no number but requires publication: the resource "SHOULD define such expiration policy and publish it in the documentation." **The risk is asymmetric** — reaping too late costs storage proportional to request volume, whereas reaping too early re-runs a side effect that already committed, which is the exact failure the table exists to prevent.
+The window follows from the maximum plausible retry latency, not from storage convenience. With `n` retries under exponential backoff of base `b` and initial delay `d`, the last attempt can arrive at roughly `d·(bⁿ−1)/(b−1)` after the first, plus any operator-driven replay of a dead-letter queue. Stripe documents that keys are removed after 24 hours, which makes 24 hours a ceiling on retention rather than a floor — a retry that arrives later is not guaranteed to be recognised. Brandur's design pairs the key table with a reaper for expired rows but does not settle the window on the operator's behalf. The draft fixes no number but requires publication: the resource "SHOULD define such expiration policy and publish it in the documentation." **The risk is asymmetric** — reaping too late costs storage proportional to request volume, whereas reaping too early re-runs a side effect that already committed, which is the exact failure the table exists to prevent.
 
 | Case | Signal | Server action |
 |---|---|---|
@@ -143,13 +147,14 @@ The window follows from the maximum plausible retry latency, not from storage co
 
 ## Where the responsibility sits
 
-Idempotency keys do not replace retries, timeouts or circuit breakers; they are the precondition that makes those mechanisms safe to point at a non-idempotent endpoint. The client owns generating one stable key per logical operation and retrying with backoff and jitter. The server owns the atomic claim, the fingerprint comparison, the commit boundary and the published retention window. The concurrent case — the one that manifests in production — is then decided by a unique index rather than by timing.
+Idempotency keys do not replace retries, timeouts or circuit breakers; they are the precondition that makes those mechanisms safe to point at a non-idempotent endpoint. The client owns one stable key per logical operation and retries with backoff and jitter. The server owns the atomic claim, the fingerprint comparison, the commit boundary and the published retention window.
 
 ## Pitfalls
 
 - **Key regenerated per attempt.** A client that mints a fresh UUID inside the retry loop defeats the mechanism entirely: every attempt is a new key and every attempt executes. The key must be generated once, before the first send, and captured in the retry closure.
 - **Check-then-insert instead of insert-then-check.** Two concurrent attempts both read "absent" and both execute; the double charge occurs under exactly the load that triggered the retry. Only a unique constraint violation is a reliable claim signal.
 - **Response stored outside the side effect's transaction.** A crash between the charge commit and the status update leaves the row `in_flight` forever; subsequent retries receive `409` indefinitely and the operation never converges. Either commit both together or record a recovery point per step.
+- **Conflict-then-empty-read treated as impossible.** Code that assumes a conflicting insert implies a readable row throws a null-pointer or match error when the conflicting transaction rolls back or the reaper intervenes, turning a recoverable race into a 500 on a retry path.
 - **`409` returned without a retry hint.** Clients that treat `409` as terminal report a failure for an operation that is about to succeed, producing a false-negative in the caller's ledger.
 - **Fingerprint over a non-canonical body.** Hashing raw bytes makes JSON key reordering or whitespace changes by an intermediary look like payload tampering, so legitimate retries are rejected with `422`.
 - **Retention shorter than the client's maximum backoff.** A retry arriving after the reaper sees an absent key, is treated as new, and re-executes — the duplicate returns silently, with no error anywhere in the logs.

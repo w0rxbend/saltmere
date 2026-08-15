@@ -1,8 +1,8 @@
 ---
-title: "AsyncAPI 3.0: contract-first for the events between your services"
+title: "AsyncAPI 3.0: contract-first for the events between services"
 date: 2026-07-31
 track: microservices
-summary: "REST has OpenAPI; your Kafka and MQTT topics have had nothing comparable. AsyncAPI 3.0 (Dec 2023) finally split channels from operations and dropped the confusing publish/subscribe wording — here's a real document and what to do with it in CI."
+summary: "Representational State Transfer (REST) interfaces have OpenAPI; broker topics had no equivalent. AsyncAPI 3.0 (December 2023) separates channels from operations and replaces publish/subscribe with send/receive — a worked document and its role in continuous integration."
 reading_time: 5
 tags: [asyncapi, event-driven, contracts, kafka, schemas, newman]
 sources:
@@ -14,17 +14,21 @@ sources:
     url: "https://www.asyncapi.com/blog/release-notes-3.1.0"
 ---
 
-When services talk over a broker instead of HTTP, the contract problem doesn't go away — it gets worse, because the coupling is now invisible. Nobody sees the shape of the `user.signedup` event until a consumer breaks. Newman's chapters on schemas and contract tests all assume you *have* a written schema to test against. For synchronous APIs that's OpenAPI. For event-driven ones it's **AsyncAPI**, and version 3.0 (released 5 December 2023, with 3.1 following as a compatible patch) is the first version that models messaging cleanly.
+**Gist.** When services communicate through a message broker rather than over Hypertext Transfer Protocol (HTTP) request/response, the coupling between them stops being visible at any call site: no code references the consumer, so the shape of an event such as `user.signedup` is discovered only when a consumer fails to parse it. AsyncAPI is a machine-readable description format for that coupling, and **version 3.0.0, released 5 December 2023, models a channel and an application's use of that channel as two separate objects**, so one topic definition serves both producer and consumer. The cost is a second artefact to keep synchronised with the running code, and a description that covers routing and message shape without enforcing anything at the broker, which leaves runtime rejection of a bad payload to a schema registry if one is deployed.
 
-## What 3.0 fixed
+## The 2.x structure and what 3.0 changed
 
-The big change is that **channels and operations are separate top-level objects.** In 2.x a channel *was* an operation — a topic was welded to "this app publishes here" — so the same topic couldn't be described from both the producer's and the consumer's side without duplication. In 3.0:
+In AsyncAPI 2.x a channel item carried the operation directly: the channel entry held a `publish` or a `subscribe` block. **A channel therefore encoded both an address and a direction**, and a topic described from the producing side could not be reused verbatim by the consuming side — the second document had to restate the address, the message, and the bindings under the opposite keyword. Duplication of that kind drifts: the two copies of the payload schema diverge, and the divergence is discovered at runtime.
 
-- **`channels`** describe *where* messages flow (an address like `user/signedup`) and *what* messages can appear there. They're now reusable and referenceable across documents.
-- **`operations`** describe *what an application does* with a channel, using the actions **`send`** and **`receive`** instead of the old `publish`/`subscribe` — which nobody could ever remember the direction of.
-- **`messages`** is now a plural map, so a channel can carry several message types and each is individually `$ref`-able (this is what makes request/reply expressible).
+Version 3.0.0 splits the document along three axes.
 
-Here is a minimal but complete 3.0 document for a signup event over MQTT:
+- **`channels` describe where messages flow.** A channel entry holds an `address` (for example `user/signedup`), the servers it applies to, and the messages that may appear on it. It states nothing about direction, so a single definition is valid from either side and can be referenced from other documents.
+- **`operations` describe what one application does with a channel.** An operation names its `channel` by reference and carries an `action` whose value is **`send`** or **`receive`**, replacing 2.x's `publish` and `subscribe`.
+- **`messages` is a map rather than a single value.** A channel can therefore carry several message types, and each entry is individually addressable by JSON Reference (`$ref`). Request/reply is modelled separately, by a `reply` object on the operation rather than by the channel.
+
+The direction rename is the part that changes review outcomes rather than only structure. Under `publish`/`subscribe` the keyword described what a *client of the document* would do, which inverted relative to the application the document described. **`send` and `receive` are stated from the perspective of the application the document belongs to**: `receive` means this application consumes the message.
+
+A minimal 3.0.0 document for a signup event carried over Message Queuing Telemetry Transport (MQTT):
 
 ```yaml
 asyncapi: 3.0.0
@@ -49,28 +53,36 @@ channels:
             ts:    { type: integer, description: epoch millis }
 operations:
   onUserSignedup:
-    action: receive          # this app CONSUMES the event
+    action: receive          # this application consumes the event
     channel:
       $ref: '#/channels/userSignedup'
 ```
 
-The producing service ships the *same* channel with an operation whose `action: send`. One channel definition, two viewpoints — that's the reuse 3.0 unlocked.
+The producing service publishes the same channel object with an operation whose `action` is `send`. **One channel definition, two operation objects, no duplicated payload schema** — the reuse that the 2.x structure prevented.
 
-## Making it earn its keep in CI
+Version 3.1.0 followed 3.0.0; its release notes record the additions made on top of the 3.0 structure.
 
-A spec file that only humans read rots. Wire it into the pipeline so it fails builds:
+## Enforcement in continuous integration
+
+A description that only humans read diverges from the code it describes, because nothing fails when it does. Two commands turn it into a build gate:
 
 ```bash
-# validate the document itself
+# validate the document against the AsyncAPI schema
 npx @asyncapi/cli validate asyncapi.yaml
 
-# generate typed models your producer/consumer import,
+# generate typed models the producer and consumer import,
 # so a payload change that breaks the schema breaks compilation
 npx @asyncapi/modelina-cli generate typescript asyncapi.yaml -o ./generated
 ```
 
-Add the validate step to every PR and the generated models to your build, and a breaking change to the `UserSignedup` payload can't merge silently — it either fails validation or fails to compile against the consumer. That's the same discipline consumer-driven contract tests give you for REST, applied to the broker.
+The first command checks the document itself: an unresolvable `$ref`, an `action` outside the `send`/`receive` set, or a malformed channel fails the step. Nothing in that check reaches the code. **The coupling to the code comes from the second command**: when the generated models are compiled as part of the build, a field renamed in the payload schema and not renamed in the consumer produces a compilation failure in the consumer's repository, and a field renamed in the consumer without a schema change produces the same failure against the regenerated model. That is the property consumer-driven contract testing supplies for synchronous interfaces, obtained here through the type system rather than through a recorded interaction.
 
-A caveat worth stating: AsyncAPI describes the *envelope and routing* — topics, protocols, message shapes — but the payload schema is still just JSON Schema (or Avro/Protobuf via bindings). It documents that a Kafka topic exists and what rides on it; it does not run your broker's schema registry for you. Use it alongside the registry, not instead of it.
+The boundary of the format matters for what this gate can catch. **AsyncAPI describes the envelope and the routing** — addresses, protocols, servers, bindings, message shapes. The payload schema is JSON Schema by default, or Avro or Protocol Buffers referenced through a schema-format binding. A document therefore records that a topic exists and what is meant to travel on it; it does not enforce anything at broker level, and it does not replace a schema registry that rejects incompatible writes at produce time. The two are complementary: the registry enforces at runtime, the document plus generated models enforce at build time.
 
-**Try next:** pick one event your services already exchange, write its channel + a `send` and a `receive` operation in a 3.0 doc, and add `asyncapi validate` to that repo's CI. Then change a field name in the payload and watch the pipeline catch it before a consumer does at 2 a.m.
+## Pitfalls
+
+- **Reading `send`/`receive` from the reader's perspective inverts the wiring.** An operation with `action: receive` in a producer's document declares that the producer consumes the message; a service generated from a misread action subscribes to a topic it was meant to publish to, and the topic stays silent with no error anywhere.
+- **Validating the document without compiling the generated models catches nothing about the code.** `asyncapi validate` accepts any well-formed schema, including one that no longer matches the class the producer serialises, so the pipeline stays green while the payload drifts.
+- **Carrying 2.x habits into a 3.0 file duplicates the payload.** Writing one channel per direction reintroduces the two copies of the message schema that the channel/operation split exists to avoid, and the copies diverge on the next field addition.
+- **Treating the document as a substitute for a schema registry leaves produce-time writes unchecked.** Nothing in the specification runs at the broker; a producer that bypasses the generated model can still write a payload the document forbids.
+- **A `$ref` to a message inside a channel that is later renamed breaks silently in editors that resolve references lazily.** The failure appears only when the document is validated or a generator resolves the reference, which may be a separate pipeline from the one that edited the file.

@@ -1,9 +1,9 @@
 ---
-title: 'Pagination at Scale: Why OFFSET Falls Over and Keyset Wins'
+title: 'Pagination at Scale: Why OFFSET Degrades and Keyset Does Not'
 date: 2026-08-10
 track: microservices
-summary: OFFSET pagination is O(offset) — the database scans and throws away every row before the page you want, so page 10,000 crawls and concurrent inserts make rows duplicate or vanish. Keyset (seek-method / cursor) pagination stays O(limit) by riding the index with a row-value WHERE clause, and it is stable under writes. Here is the Big-O framing, concrete SQL for both, a base64 opaque-cursor encode/decode, composite keys, deletions, and how Relay- and Stripe-style API cursors are built.
-reading_time: 6
+summary: OFFSET pagination is O(offset) — the database sorts the derived table and discards every row before the requested page, so deep pages degrade while shallow ones stay fast, and concurrent inserts or deletes make rows duplicate or vanish. Keyset pagination (the seek method) stays O(limit) by riding a matching index with a row-value comparison, and its window is anchored to a value rather than a position. This article derives the cost, gives SQL for both, an opaque base64 cursor, composite keys, deletion behaviour, and the Relay and Stripe cursor shapes.
+reading_time: 7
 tags:
 - pagination
 - databases
@@ -29,11 +29,11 @@ sources:
   url: https://docs.slack.dev/apis/web-api/pagination/
 ---
 
-You built a list endpoint. `?page=2&size=20` works fine in the demo. Six months later a customer with 400,000 orders opens page 15,000 and the request times out — while the customer on page 1 is fast. Nothing changed except the offset. That asymmetry is the whole story, and it is a classic system-design interview probe: *how does your pagination behave at page N, and what happens when someone inserts a row mid-scan?*
+**Gist.** A list endpoint paged with `LIMIT ... OFFSET n` costs O(offset + limit), because the SQL semantics require the derived table to be ordered and the leading `n` rows discarded, and its window is a positional count that concurrent writes invalidate. Keyset pagination — Markus Winand's *seek method*, marketed as "No Offset" — replaces the count with a row-value predicate on the sort key of the last row returned, which a matching index turns into a range scan of cost O(limit) that is stable under inserts and deletes. The price is the loss of random access: there is no jump to page 500, and no cheap exact page count.
 
 ## Why OFFSET degrades: O(offset), not O(limit)
 
-The obvious query looks cheap:
+The apparently cheap query:
 
 ```sql
 SELECT id, created_at, title
@@ -43,13 +43,13 @@ SELECT id, created_at, title
  LIMIT 20 OFFSET 300000;   -- page 15,001
 ```
 
-The SQL standard is explicit about what `OFFSET` means: the derived table is *first sorted, then the leading rows are dropped*. The database has no shortcut — to return rows 300,001..300,020 it must produce and discard the 300,000 rows in front of them. Even with a perfect index on `(tenant_id, created_at, id)`, it walks 300,020 index entries and throws 300,000 away. Cost grows with the offset: **O(offset + limit)**. Page 1 touches 20 rows; page 15,001 touches 300,020. That is why the deep page is slow and the shallow page is not.
+The SQL standard defines `OFFSET` as an operation on the already-ordered derived table: **the rows are sorted first, then the leading rows are dropped**. No shortcut exists, because the identity of row 300,001 is not known until the 300,000 rows in front of it have been produced. Even with an index on `(tenant_id, created_at, id)` that supplies the order directly, the engine walks 300,020 index entries and discards 300,000 of them. The cost is therefore **O(offset + limit)**: page 1 touches 20 entries, page 15,001 touches 300,020. The asymmetry between a fast first page and a slow deep page is entirely explained by this term, and it grows without bound as the table grows.
 
-The second, subtler problem is **instability**. `OFFSET` is a blind count of rows to skip — it carries no memory of *what* you already saw. If someone inserts a row that sorts ahead of your window between fetching page 2 and page 3, every subsequent row shifts down by one: the last item of page 2 reappears as the first item of page 3 (a **duplicate**). A delete shifts the other way and an item is **skipped** entirely. Under any write traffic, offset paging silently lies.
+The second defect is **instability**. An offset carries no memory of which rows were already returned; it is a blind count. If a row that sorts ahead of the current window is inserted between the fetch of page 2 and the fetch of page 3, every subsequent row shifts one position later, and the last item of page 2 is returned again as the first item of page 3 — a **duplicate**. A delete ahead of the window shifts rows the other way, and one row is **skipped entirely**. Neither event produces an error; the client sees a plausible page that omits or repeats data. Under any concurrent write traffic, offset paging is silently lossy.
 
-## Keyset / seek method: O(limit), stable
+## Keyset (seek method): O(limit) and stable
 
-Keyset pagination — Markus Winand's "No Offset," also called the *seek method* — replaces "skip N rows" with "start *after* the last row I saw." You remember the sort key of the last row returned and filter on it:
+Keyset pagination replaces "skip n rows" with "resume strictly after the last row observed". The sort key of that row is retained and used as a filter:
 
 ```sql
 SELECT id, created_at, title
@@ -60,40 +60,60 @@ SELECT id, created_at, title
  LIMIT 20;
 ```
 
-The row-value comparison `(created_at, id) < (:a, :b)` is the crux. Per the SQL standard, `X < Y` is true iff the leading components are equal and the first differing component is smaller — it evaluates left to right. That single predicate expresses "everything after this exact `(created_at, id)` pair" *without* needing the awkward `created_at < :a OR (created_at = :a AND id < :b)` expansion. PostgreSQL and modern MySQL both plan it as a range scan and use the composite index to **jump straight to the starting point** — no discarded rows. Cost is **O(limit)** regardless of how deep you are. Page 1 and page 15,001 do the same work.
+The row-value comparison is the load-bearing construct. Under the SQL standard, `X < Y` on row values is evaluated **lexicographically, left to right**: the comparison is decided by the first component in which the two rows differ, with earlier components equal. One predicate therefore expresses "everything ordered after this exact `(created_at, id)` pair" without the expansion `created_at < :a OR (created_at = :a AND id < :b)`. PostgreSQL and current MySQL plan the row-value form as a range scan and use the composite index to **descend directly to the boundary entry**, so no row is produced and discarded. The cost is **O(limit)** independent of depth: page 1 and page 15,001 perform the same work.
 
-It is also **stable**. The window is anchored to a value, not a position. Inserts and deletes ahead of your cursor change *where* the boundary lands in absolute terms but never cause you to re-see or skip a row relative to your last cursor — you always continue strictly after `(last_created_at, last_id)`.
+Stability follows from the same change. The window is anchored to a **value**, not to an ordinal position. An insert or delete elsewhere in the ordering moves rows relative to the beginning of the result set, but the next query still starts at the first row ordered strictly after `(last_created_at, last_id)`, so no row already returned reappears and no row between the cursor and the next page is jumped over.
 
-Two hard requirements make this work:
+Two conditions are required.
 
-1. **A total order.** The sort key must be unique or you must append a unique tie-breaker (the primary key). Paging on `created_at` alone breaks when two rows share a timestamp — the row-value comparison can straddle them and skip or repeat. Appending `id` guarantees determinism.
-2. **The index must match the sort.** `(created_at DESC, id DESC)` in the query wants an index ordered the same way (or exactly reversible). Otherwise the planner sorts, and you are back to scanning.
+1. **The sort key must be a total order.** A key with ties admits more than one valid ordering of the tied rows, and the row-value boundary can land inside the tied group, repeating or skipping members of it. Appending the primary key — `(created_at, id)` — makes the order total and the boundary unambiguous.
+2. **An index must supply the requested order.** `ORDER BY created_at DESC, id DESC` needs an index in that order or in its exact reverse, which the engine can scan backwards. Otherwise the planner inserts a sort over the qualifying rows and the O(limit) property is lost.
 
-## Building an opaque cursor
+## Opaque cursors
 
-Never expose raw `(created_at, id)` in your API — clients will parse it, depend on it, and break when you change the sort. Encode the last row's keyset into an **opaque token**: serialize the tuple, base64 it, hand it back as `next_cursor`. It is a bookmark the client echoes, not data.
+Exposing the raw `(created_at, id)` pair in the API invites clients to parse and depend on it, which fixes the sort order as part of the public contract. The alternative is to serialize the tuple and hand it back as an **opaque token** — a bookmark the client echoes without interpreting. Including a **version field** allows a server whose sort order has changed to reject stale tokens rather than answer them with a page computed under the wrong ordering. For untrusted clients, a message authentication code over the token prevents a forged cursor from being used to probe arbitrary key ranges, including ranges belonging to another tenant.
 
-```python
-import base64, json
+The request shape is `GET /orders?limit=20&cursor=…`; the response carries the page and a fresh cursor built from the last row of that page. A page shorter than `limit` indicates exhaustion.
 
-def encode_cursor(sort_key: str, last_id: int) -> str:
-    payload = {"k": sort_key, "i": last_id, "v": 1}  # v = schema version
-    raw = json.dumps(payload, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).decode()
+### Implementation sketch (Scala)
 
-def decode_cursor(token: str) -> tuple[str, int]:
-    raw = base64.urlsafe_b64decode(token.encode())
-    payload = json.loads(raw)
-    if payload.get("v") != 1:
-        raise ValueError("unsupported cursor version")
-    return payload["k"], payload["i"]
+```scala
+import java.util.Base64
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+final case class Cursor(createdAt: Long, id: Long, version: Int = 1)
+
+object Cursor:
+  private val enc = Base64.getUrlEncoder.withoutPadding
+  private val dec = Base64.getUrlDecoder
+
+  private def sign(body: String, key: Array[Byte]): String =
+    val mac = Mac.getInstance("HmacSHA256")
+    mac.init(SecretKeySpec(key, "HmacSHA256"))
+    enc.encodeToString(mac.doFinal(body.getBytes("UTF-8")))
+
+  def encode(c: Cursor, key: Array[Byte]): String =
+    val body = enc.encodeToString(s"${c.version}:${c.createdAt}:${c.id}".getBytes("UTF-8"))
+    s"$body.${sign(body, key)}"
+
+  def decode(token: String, key: Array[Byte]): Either[String, Cursor] =
+    token.split('.') match
+      case Array(body, tag) =>
+        // constant-time compare avoids leaking the tag one byte at a time
+        if !java.security.MessageDigest.isEqual(tag.getBytes, sign(body, key).getBytes)
+        then Left("bad signature")
+        else String(dec.decode(body), "UTF-8").split(':') match
+          case Array(v, ts, id) if v.toInt == 1 => Right(Cursor(ts.toLong, id.toLong))
+          case _                                => Left("unsupported cursor version")
+      case _ => Left("malformed cursor")
 ```
 
-The `v` field earns its keep: when you later change the sort order, you can reject stale cursors instead of returning garbage. For untrusted clients, sign the token (HMAC) so it cannot be forged into a probe of arbitrary key ranges. The request becomes `GET /orders?limit=20&cursor=eyJrIjoi...`; the response returns the page plus a fresh `next_cursor` built from the last row — or null when a page comes back short, meaning you have reached the end.
+The query then binds `c.createdAt` and `c.id` into the row-value predicate; the next cursor is built from the final row of the returned page.
 
 ## Composite sort keys and deletions
 
-**Composite keys** extend naturally — just widen the row value. Sorting by status, then priority, then id:
+**Composite keys** widen the row value without changing the mechanism. Sorting by status, then priority, then id:
 
 ```sql
 WHERE (status, priority, id) > (:last_status, :last_priority, :last_id)
@@ -101,18 +121,25 @@ ORDER BY status, priority, id
 LIMIT 20;
 ```
 
-Encode all three components into the cursor. The tie-breaker `id` stays last so the total order holds even when status and priority collide.
+All three components are encoded into the cursor. The tie-breaker `id` remains last so that the order stays total when status and priority collide.
 
-**Deletions are a non-issue** for keyset, which is one of its quiet wins. If the exact row your cursor points at gets deleted, the next query still works: `(created_at, id) < (:a, :b)` is a *range boundary*, not a lookup of a specific row. You continue from wherever that value would sit in the order, deleted or not. Offset paging, by contrast, treats a delete as a global shift and skips a live row.
+**Deletion of the cursor row is harmless.** The predicate `(created_at, id) < (:a, :b)` is a range boundary, not a lookup of a specific row: the scan resumes at the position that value occupies in the ordering, whether or not a row with that key still exists. Offset paging has no equivalent property, because a delete changes the ordinal position of every following row.
 
-## Cursor design for APIs
+## Cursor shapes in published APIs
 
-The industry has converged here. **Stripe** uses `starting_after` / `ending_before` parameters carrying an object id — a keyset cursor on the id order, returning `has_more` so clients know when to stop. **Relay's GraphQL Cursor Connections spec** formalizes the shape: a `Connection` has `edges`, each edge has a `node` and an opaque `cursor`, and `pageInfo` carries `hasNextPage`, `hasPreviousPage`, `startCursor`, and `endCursor`. Clients paginate with `first: N, after: <cursor>`. The spec is deliberate that a cursor is an *opaque string* — servers can encode whatever keyset they need and clients must not interpret it. That is exactly the base64 tuple above, dressed for GraphQL.
+**Stripe** documents `starting_after` and `ending_before` parameters carrying an object identifier — a keyset cursor over the identifier order — and returns `has_more` to signal whether further pages exist. **Relay's GraphQL Cursor Connections specification** fixes the structure: a connection exposes `edges`, each edge carrying a `node` and a `cursor`, and `pageInfo` carrying `hasNextPage`, `hasPreviousPage`, `startCursor` and `endCursor`; clients page with `first: N, after: <cursor>`. The specification requires the cursor to serialize as a **String** and treats it as opaque, which leaves the server free to encode any keyset in it. **Slack's Web API** takes the same shape under different names: a `cursor` request parameter, and a `response_metadata.next_cursor` in the reply that is empty when no further page exists.
 
-## The trade-off you must name in the interview
+## The trade-off
 
-Keyset buys O(limit) and stability, but it gives up **random access**: there is no "jump to page 500." You can only go to the next (or previous, by reversing the comparison and the `ORDER BY`) page relative to a cursor you hold. You also lose a cheap exact page count. For infinite-scroll feeds, activity logs, and API list endpoints this is a non-issue — nobody deep-links page 15,001. When the product genuinely needs numbered pages over a small, mostly-static set, offset is fine; the rule of thumb is offset for shallow bounded lists, keyset for anything that grows or takes write traffic.
+Keyset pagination gives up **random access**. Only movement relative to a held cursor is possible: forward, or backward by reversing both the comparison operator and the `ORDER BY` and then reversing the returned rows in the application. There is also no cheap exact page count, since counting requires scanning the qualifying rows. For infinite-scroll feeds, activity logs and machine-consumed list endpoints this costs nothing. Numbered pages over a small, mostly-static set remain a legitimate use of offset, where the offset term is bounded by construction.
 
-One more scale note: when a dataset outgrows a single node and is spread across shards (see [data partitioning and sharding](/articles/distributed-systems/2026-08-10-data-partitioning-sharding)), keyset cursors compose far better than offsets — each shard seeks by the same `(sort_key, id)` boundary and a merge picks the global next `limit`, whereas a global `OFFSET 300000` would force every shard to scan and discard, then coordinate the discard. The seek method keeps the per-shard work O(limit) too.
+When a dataset is spread across shards (see [data partitioning and sharding](/articles/distributed-systems/2026-08-10-data-partitioning-sharding)), the difference compounds: each shard seeks to the same `(sort_key, id)` boundary and a merge selects the global next `limit`, keeping per-shard work O(limit). A global `OFFSET 300000` has no such decomposition — the offset cannot be divided among shards without knowing the interleaving, so each shard must produce rows that the coordinator then discards.
 
-**Try next:** implement a `previous` page by flipping the comparison to `>` and the `ORDER BY` to ascending, then reversing the result set in the app — and add an HMAC signature to your cursor so a malicious client cannot craft one to walk another tenant's key range.
+## Pitfalls
+
+- **Paging on a non-unique key alone.** Two rows share a `created_at`; the boundary falls between them and one is returned twice or never, because the comparison cannot distinguish them. Append the primary key.
+- **Index order not matching the `ORDER BY`.** The plan gains a sort node over all qualifying rows, so latency again grows with the size of the tenant's data rather than with `limit`, even though the query text uses a cursor.
+- **Mixing `ASC` and `DESC` across components of the row value.** A row-value comparison is lexicographic in one direction only; `ORDER BY a ASC, b DESC` cannot be expressed as a single `(a, b) > (:a, :b)` predicate, and writing it that way returns wrong rows without error.
+- **Unsigned cursors.** A client that decodes the token can substitute arbitrary key values, including a boundary that lands in another tenant's range if the tenant predicate is derived from the cursor rather than from the authenticated session.
+- **Unversioned cursors after a sort-order change.** Tokens minted under the old ordering are still accepted and interpreted against the new one, producing pages that skip or repeat arbitrary spans instead of an error.
+- **Inferring end-of-data from an empty page rather than a short one.** A page equal to `limit` may still be the last; a page shorter than `limit` is the reliable signal, and waiting for an empty page adds one round trip to the end of every traversal.

@@ -2,8 +2,8 @@
 title: "Cache Stampede: Coalescing, XFetch, and Stale-While-Revalidate"
 date: 2026-08-10
 track: microservices
-summary: A hot cache key expires and thousands of concurrent misses hammer your database in the same millisecond. Here are three implementable defenses — single-flight, probabilistic early recomputation, and locking with stale serving — and when to reach for each.
-reading_time: 6
+summary: When a hot cache key expires, every concurrent miss falls through to the backing store at once. Three implementable defenses — single-flight coalescing, probabilistic early recomputation, and locking with stale serving — with the cost each one imposes.
+reading_time: 7
 tags:
   - caching
   - scaling
@@ -23,45 +23,40 @@ sources:
     url: "https://en.wikipedia.org/wiki/Cache_stampede"
 ---
 
-You cache the result of an expensive query — a product page, a leaderboard, a permissions blob — with a TTL of 60 seconds. It absorbs 10,000 requests per second beautifully. Then the key expires.
+**Gist.** When a heavily read cache key expires, every request arriving during the recomputation window misses simultaneously and falls through to the backing store, which was sized for the trickle of misses a warm cache normally produces. Three defenses attack this: **single-flight coalescing** collapses concurrent misses into one backend call, **probabilistic early recomputation (XFetch)** refreshes the value before expiry so the miss never occurs, and **locking with stale-while-revalidate** serves the expired value while one holder refreshes. The costs are, respectively, a shared fate among waiters, a small amount of redundant recomputation, and bounded staleness plus lock machinery.
 
-In the instant after expiry, all 10,000 of those requests find a cache miss simultaneously. All of them fall through to the database. All of them recompute the same value. Your backend, sized for the trickle of cache misses it normally sees, is suddenly asked to serve the full uncached load at once. Latency spikes, connections saturate, and if the recomputation is slow enough that the key stays empty while the herd piles up, the pileup grows until something falls over. This is a **cache stampede**, also called a **dog-pile** or a **thundering herd** on the cache.
+## The trigger is expiry, not load
 
-The nasty part is that the failure is self-inflicted and correlated with success. The hotter the key, the bigger the stampede. Caching made you fast right up until it made you fragile. Below are three defenses that actually work, with code, and the trade-offs between them.
+A **cache stampede** — also called a **dog-pile** or a **thundering herd** on the cache — is not caused by high traffic alone. Steady traffic against a warm cache produces no backend load at all. The stampede is caused by **many concurrent misses on a single key within the window it takes to recompute that key**. Two quantities set the size of the herd:
 
-## Why expiry, not load, is the trigger
+- **Arrival rate on the hot key**: requests per second directed at that one key.
+- **Recompute cost**: the time the backing store takes to produce a fresh value.
 
-It helps to be precise about the mechanism. A stampede is not caused by high traffic per se — steady traffic against a warm cache is fine. It is caused by **many concurrent misses on a single key within the window it takes to recompute that key**. Two variables matter:
+Their product bounds the number of redundant backend calls, since every request arriving during the recompute window finds the key absent. A key absorbing 10,000 requests per second with a one-second recompute admits on the order of 10,000 concurrent misses; if the recomputation is slow enough that the key stays empty while the herd accumulates, the queue at the backing store grows monotonically until a connection pool or a timeout budget is exhausted. The failure correlates with success: the hotter the key, the larger the herd.
 
-- **Concurrency** on the hot key (how many requests arrive during the recompute window).
-- **Recompute cost** (how long the backing store takes to produce a fresh value).
+Every defense below reduces one of the two factors — either collapse the concurrent misses into a single backend call, or displace the recomputation away from the exact instant of expiry so that misses do not coincide.
 
-Multiply them and you get the size of the herd. Every defense below attacks one of those two factors: either collapse the concurrent misses into a single backend call, or move the recomputation off the exact moment of expiry so the misses never coincide.
+## Defense 1: request coalescing (single-flight)
 
-## Defense 1: Request coalescing (single-flight)
-
-The simplest idea: if N callers all miss the same key at the same time, only **one** of them should actually do the work. The rest should block and share that one result. This is request coalescing, and Go ships a canonical implementation in `golang.org/x/sync/singleflight`.
-
-The core method is:
+The invariant is stated in one line: **for a given key, at most one execution of the recompute function is in flight at a time.** Callers that arrive while an execution is running block and receive the same result. Go's `golang.org/x/sync/singleflight` package is a canonical implementation:
 
 ```go
 func (g *Group) Do(key string, fn func() (any, error)) (v any, err error, shared bool)
 ```
 
-`Do` guarantees that for a given `key`, only one execution of `fn` is in flight at a time. Concurrent callers with the same key block until the first finishes, then all receive the same `v` and `err`. The `shared` boolean tells you whether the result was handed to more than one caller — useful as a stampede metric.
+`Do` runs `fn` for the first caller of a given `key` and parks every concurrent caller of the same key until it returns; all of them then receive the same `v` and `err`. The `shared` boolean reports whether the result was delivered to more than one caller, which makes it a usable stampede metric.
 
 ```go
 var group singleflight.Group
 
 func GetProduct(ctx context.Context, id string) (*Product, error) {
-    // Fast path: serve from cache.
     if p, ok := cache.Get(id); ok {
         return p, nil
     }
 
-    // Slow path: coalesce concurrent misses into one backend call.
+    // Slow path: concurrent misses on this id share one backend call.
     v, err, shared := group.Do(id, func() (any, error) {
-        p, err := db.LoadProduct(ctx, id) // the expensive recompute
+        p, err := db.LoadProduct(ctx, id)
         if err != nil {
             return nil, err
         }
@@ -78,73 +73,77 @@ func GetProduct(ctx context.Context, id string) (*Product, error) {
 }
 ```
 
-Ten thousand simultaneous misses become **one** database query; the other 9,999 goroutines park and share the answer. 
+Two limits follow from the mechanism. First, **the group is per-process**: a fleet of 50 instances admits up to 50 concurrent recomputes, not one. A shared cache narrows this, because the first instance to complete publishes the value for the others. Second, **every waiter on a key shares the fate of the single in-flight call**: a hung `fn` blocks them all, and a failure is returned to all of them. `DoChan` returns a channel, allowing a `select` on `ctx.Done()` so that waiters can abandon the call, and `Forget(key)` drops the in-flight entry so a subsequent caller starts a fresh execution rather than joining a doomed one.
 
-Two caveats. First, single-flight is per-process. In a fleet of 50 service instances you get at most 50 concurrent recomputes, not one — usually a fine reduction, but not one call. Pair it with a shared cache so the first instance to finish populates the value for the rest. Second, a slow or hung `fn` blocks every waiter on that key; consider `DoChan` with a `select` on `ctx.Done()` so callers can time out, and call `Forget(key)` if you don't want a failed computation to be shared. Coalescing attacks the *concurrency* factor and leaves expiry timing alone.
+Coalescing reduces the concurrency factor and leaves expiry timing untouched: one caller still pays the full cold-recompute latency.
 
-## Defense 2: Probabilistic early recomputation (XFetch)
+## Defense 2: probabilistic early recomputation (XFetch)
 
-Coalescing still lets the key expire and still makes some caller wait on a cold recompute. What if, instead, one lucky request refreshed the value *slightly before* it expired — while the cache is still serving the old value to everyone else? No miss ever happens, so no herd forms.
+XFetch removes the miss instead of deduplicating it. One request refreshes the value *before* expiry while the cache continues serving the existing value to everyone else. The difficulty is selecting which request refreshes early **without coordination between readers**.
 
-The trick is choosing *which* request refreshes early without coordination. Vattani, Chierichetti, and Lowenstein solved this optimally in their 2015 VLDB paper *Optimal Probabilistic Cache Stampede Prevention*. Alongside each cached value you store `delta` — the measured time the last recomputation took — and its absolute `expiry`. On every read, you roll the dice with this check:
+Vattani, Chierichetti and Lowenstein give an optimal solution in *Optimal Probabilistic Cache Stampede Prevention* (VLDB 2015). Alongside each cached value the implementation stores `delta`, the measured duration of the last recomputation, and the absolute `expiry`. Each read evaluates:
 
 ```
 time() - delta * beta * log(rand()) >= expiry   →   recompute now
 ```
 
-Here `rand()` is uniform in (0, 1), so `log(rand())` is negative and the whole term `- delta * beta * log(rand())` is a positive "look-ahead" into the future. As the clock approaches `expiry`, the probability that any given request trips the condition rises smoothly toward certainty. Crucially, expensive keys (large `delta`) and hotter keys (more rolls per second) get refreshed *earlier and more eagerly* — exactly the keys where a stampede would hurt most. `beta` tunes the eagerness; the paper shows **`beta = 1` works well in practice** and is the recommended default. Raise it above 1 to refresh earlier, lower it toward 0 to hug the expiry.
+`rand()` is uniform on (0, 1), so `log(rand())` is negative and `- delta * beta * log(rand())` is a positive exponentially distributed look-ahead. Three consequences are load-bearing. As the clock approaches `expiry` the probability that any single read trips the condition rises smoothly toward certainty, so the refresh is spread over an interval rather than concentrated at one instant. **Expensive keys refresh earlier**, because the look-ahead scales with `delta`. **Hot keys refresh earlier**, because more reads per second means more draws from the distribution. Both are the keys where a stampede does the most damage. `beta` tunes eagerness; the paper reports that **`beta = 1` works well in practice**. Values above 1 refresh earlier, values toward 0 hug the expiry.
 
-In Go:
+The scheme requires no lock and no cross-node coordination — Cloudflare describes implementing it as lock-free probabilistic caching. Two structural requirements attach to it. The recompute path should **fall back to the still-present old value on error**, since the entry has not expired yet. And **the physical time-to-live (TTL) in the store must exceed the logical `expiry` by some slack**, so that an early refresh always has an old value available to serve and to fall back on.
 
-```go
-type Entry struct {
-    Value  []byte
-    Delta  time.Duration // how long the last recompute took
-    Expiry time.Time
-}
+### Implementation sketch (Scala)
 
-func xfetchShouldRecompute(e Entry, beta float64) bool {
-    // -log(rand) with rand in (0,1) is a positive Exp(1) sample.
-    gap := float64(e.Delta) * beta * -math.Log(rand.Float64())
-    return time.Now().Add(time.Duration(gap)).After(e.Expiry)
-}
+```scala
+final case class Entry[A](value: A, delta: FiniteDuration, expiry: Instant)
 
-func GetXFetch(ctx context.Context, key string) ([]byte, error) {
-    e, ok := cache.Get(key)
-    if ok && !xfetchShouldRecompute(e, 1.0) {
-        return e.Value, nil // overwhelmingly common path
-    }
+// Exp(1) look-ahead: -log(U) for U uniform on (0,1).
+def shouldRecompute[A](e: Entry[A], beta: Double, now: Instant): Boolean =
+  val gap = e.delta.toNanos * beta * -math.log(Random.nextDouble())
+  now.plusNanos(gap.toLong).isAfter(e.expiry)
 
-    start := time.Now()
-    val, err := recompute(ctx, key)
-    if err != nil {
-        if ok {
-            return e.Value, nil // fall back to stale on error
-        }
-        return nil, err
-    }
-    delta := time.Since(start)
-    cache.Set(key, Entry{val, delta, time.Now().Add(ttl)}, ttl+slack)
-    return val, nil
-}
+def get[A](key: String, ttl: FiniteDuration, slack: FiniteDuration)(
+    recompute: String => A
+): A =
+  val now = Instant.now()
+  cache.get(key) match
+    case Some(e) if !shouldRecompute(e, beta = 1.0, now) => e.value
+    case existing =>
+      val start = System.nanoTime()
+      try
+        val fresh = recompute(key)
+        val delta = (System.nanoTime() - start).nanos
+        // Physical TTL outlives the logical expiry so an early
+        // refresh always finds a previous value to serve.
+        cache.put(key, Entry(fresh, delta, now.plusNanos(ttl.toNanos)), ttl + slack)
+        fresh
+      catch
+        case NonFatal(err) => existing.map(_.value).getOrElse(throw err)
 ```
 
-The beauty is that it needs no locks and no cross-node coordination — Cloudflare adopted exactly this scheme for lock-free probabilistic caching. The cost is that you occasionally recompute a value a little before you strictly had to, trading a small amount of wasted work for the near-elimination of stampedes. Note the two failure modes to handle: the recompute should serve stale on error (shown above), and the physical TTL in the store must outlive the logical `expiry` by some `slack` so early refreshes always have an old value to fall back on.
+`Random.nextDouble()` returns a value in [0, 1). A draw of exactly 0 makes `-math.log(0)` infinite, and `gap.toLong` then saturates at `Long.MaxValue`, which `Instant.plusNanos` rejects with an arithmetic overflow — production code clamps the gap rather than relying on the draw never being 0.
 
-## Defense 3: Locking + stale-while-revalidate
+## Defense 3: locking with stale-while-revalidate
 
-The third approach is the most operationally familiar: on a miss, one caller takes a **lock** (e.g. Redis `SET lock:key token NX PX 5000`), recomputes, and writes the value; everyone else, rather than blocking on a cold miss, is served the **stale** previous value while the refresh happens in the background. This is precisely the semantics of HTTP's `stale-while-revalidate` from RFC 5861: keep serving the expired representation for a bounded window while a single asynchronous revalidation runs.
+The third approach separates the reader path from the refresh path. On finding a stale-but-present value, a caller attempts to take a lock — in Redis, `SET lock:key token NX PX 5000`, which sets the key only if absent and attaches a 5-second expiry. The winner refreshes in the background; the loser and every other reader are served the **stale** value immediately. This is the semantics RFC 5861 defines for HTTP's `stale-while-revalidate`: continue serving the expired representation for a bounded window while an asynchronous revalidation runs; the RFC bounds the staleness window but does not itself specify how the revalidating caller is chosen.
 
-Concretely, store the value with a logical freshness timestamp but a longer physical TTL. When a request finds the value stale-but-present, it tries `SET NX` on a companion lock key. The winner refreshes asynchronously; the loser and all other readers immediately get the stale value. No reader ever waits on the backend, and only the lock winner touches it.
+The storage layout is the same one XFetch needs — a logical freshness timestamp with a longer physical TTL — but the selection of the refreshing caller is by mutual exclusion rather than by random draw. **No reader waits on the backing store**, and only the lock winner touches it.
 
-The trade-off is **staleness plus moving parts**: you need a lock with a sane expiry (so a crashed holder can't wedge the key forever), a background refresh path, and tolerance for serving data that is a few seconds old. If your data genuinely cannot be stale, this is not your tool — reach for coalescing instead.
+The costs are bounded staleness and additional moving parts: a lock whose expiry is short enough that a crashed holder cannot wedge the key indefinitely, a background refresh path with its own failure handling, and a tolerance for data some seconds old. Where the data cannot be stale, this defense does not apply.
 
 ## Choosing between them
 
-- **Single-flight** — cheapest to adopt, no staleness, in-process only. Best first move; combine with a shared cache. Attacks concurrency.
-- **XFetch** — lock-free and coordination-free, scales across nodes, prevents the miss from ever happening. Best default for hot read-heavy keys. Attacks expiry timing; costs a little redundant work.
-- **Lock + stale-while-revalidate** — zero reader latency even under refresh, at the cost of bounded staleness and more infrastructure. Best when recompute is very expensive and slightly-old data is acceptable.
+- **Single-flight** — no staleness, no additional infrastructure, per-process scope. Reduces concurrency; one caller still pays cold-recompute latency.
+- **XFetch** — lock-free and coordination-free, so it holds across nodes. Prevents the miss from occurring, at the cost of some recomputation performed earlier than strictly necessary.
+- **Lock plus stale-while-revalidate** — no reader ever blocks on the backing store, at the cost of bounded staleness and lock lifecycle management.
 
-These are not mutually exclusive. A robust setup often runs XFetch to avoid coincident misses, wraps the recompute in single-flight per node as a backstop, and serves stale on error. Each layer removes a different way the herd can form.
+The three compose. XFetch avoids coincident misses, per-node single-flight bounds the damage when one occurs anyway, and serving stale on error covers a failed recomputation. Each layer removes a different route by which the herd forms.
 
-**Try next:** Instrument your top ten cache keys with the `shared` counter from single-flight and a "recompute triggered" counter from an XFetch check, then run a load test that expires a hot key under 5,000 rps and watch how many backend calls each defense actually collapses.
+## Pitfalls
+
+- **Physical TTL equal to logical expiry under XFetch.** The early refresh finds no entry, so the read degrades to an ordinary cold miss and the stampede returns; the entry must outlive its logical expiry by a slack interval.
+- **Recompute errors evicting the entry.** A transient backend failure that clears the key converts one failed refresh into a full stampede on the next read. Both XFetch and stale-while-revalidate depend on the old value remaining present.
+- **Single-flight treated as a global guarantee.** The group is per-process, so an N-instance fleet still issues up to N concurrent recomputes on the same key.
+- **No timeout on the coalesced call.** Every waiter blocks for as long as the single in-flight `fn` runs; without `DoChan` and a context deadline, one hung recompute stalls all callers of that key.
+- **Shared failure results.** A returned error is delivered to every waiter, so a single transient failure is amplified across the whole herd unless `Forget` drops the entry.
+- **Lock TTL shorter than the recompute.** The lock expires mid-refresh, a second caller acquires it and starts a duplicate recompute, and the original holder may overwrite the newer value on completion.
+- **Uniform TTLs across many keys.** Keys populated together expire together, producing a stampede across a whole key set rather than one key; per-key defenses do not address correlated expiry.

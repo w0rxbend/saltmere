@@ -1,9 +1,9 @@
 ---
-title: "Caching Strategies and Their Failure Modes: Pick Your Staleness"
+title: "Caching Strategies and Their Failure Modes"
 date: 2026-08-15
 track: microservices
-summary: "Cache-aside, read-through, write-through, write-behind, and refresh-ahead differ in exactly one thing: who does the loading and when you pay for it. Here is a comparison table, the classic cache-aside write race that Facebook's memcache paper solves with leases, and the failure-mode vocabulary — penetration, avalanche, hot keys — interviewers expect you to have."
-reading_time: 6
+summary: "Cache-aside, read-through, write-through, write-behind, and refresh-ahead differ in one dimension: which component performs the load, and when the cost is paid. This article compares the five, walks the cache-aside write race that the Facebook memcache paper addresses with leases, and names the standard failure modes — penetration, avalanche, hot keys."
+reading_time: 7
 tags: [caching, cache-aside, write-through, ttl, invalidation, resilience]
 sources:
   - title: "Caching strategies — Amazon ElastiCache Developer Guide"
@@ -18,19 +18,21 @@ sources:
     url: "https://martinfowler.com/bliki/TwoHardThings.html"
 ---
 
-Phil Karlton's line — *"there are only two hard things in Computer Science: cache invalidation and naming things"* — survives because the first half keeps being true. Every caching strategy is really an answer to one question: **when the source of truth changes, how does the cache find out?** The five standard strategies give five different answers, and each buys its consistency with a different failure mode.
+**Gist.** A cache is a second copy of data whose source of truth changes independently, so every caching strategy is an answer to one question: **when the store changes, how does the copy find out?** The five standard strategies — cache-aside, read-through, write-through, write-behind, refresh-ahead — differ in which component performs the load and at which point in the request the cost falls. Each purchases its consistency with a distinct failure mode: an unbounded staleness window, added write latency, lost writes, or wasted load on the store.
+
+Phil Karlton's line — *"there are only two hard things in Computer Science: cache invalidation and naming things"* — persists because the first half remains true.
 
 ## The five strategies
 
-**Cache-aside (lazy loading).** The application owns both sides: read the cache, on miss read the DB and populate the cache; on write, update the DB and *invalidate* (delete, don't update) the key. It caches only what is actually requested and survives cache outages — the AWS docs' "node failures aren't fatal" — at the price of a three-trip miss penalty and staleness between DB change and cache expiry.
+**Cache-aside (lazy loading).** The application owns both sides: read the cache; on a miss read the database and populate the cache; on a write, update the database and *invalidate* (delete, not update) the key. Only requested keys are ever cached, and a cache outage degrades rather than breaks the path — the ElastiCache guide's point that node failures are not fatal. The costs are a three-trip miss penalty and a staleness window running from the database change to the invalidation or expiry.
 
-**Read-through.** Same shape, but the cache itself (or its client library) loads from the DB on miss. The application sees one API. Behaviorally identical to cache-aside; operationally it moves the loader code — and the coordination of concurrent misses — into one place.
+**Read-through.** The same shape, except the cache or its client library performs the load on a miss. The application sees a single API. Behaviourally this is cache-aside; operationally it relocates the loader — and the coordination of concurrent misses on the same key — into one component.
 
-**Write-through.** Writes go to the cache, which synchronously writes to the DB before acking. Reads never see stale data for keys written this way, but you pay write latency for every write and you cache plenty of data nobody reads ("cache churn" in the ElastiCache docs). Almost always paired with read-through, and with a TTL so unread keys eventually leave.
+**Write-through.** Writes go to the cache, which writes synchronously to the database before acknowledging. Reads of keys written this way do not observe stale data, at the cost of database write latency on every write and of caching data nobody reads — the "cache churn" of the ElastiCache guide. It is normally paired with read-through and with a time-to-live (TTL) so unread keys eventually leave.
 
-**Write-behind (write-back).** Writes hit the cache and are flushed to the DB asynchronously, often batched. Spectacular write throughput and DB load-smoothing; the trade is durability — a cache node dying takes unflushed writes with it — plus the DB is now *behind* the cache, so anything else reading the DB directly (reports, CDC, another service) sees old data.
+**Write-behind (write-back).** Writes land in the cache and are flushed to the database asynchronously, often batched, which smooths database load. The trade is durability — **a cache node lost before flush takes its unflushed writes with it** — plus an inversion of roles: the database is now behind the cache, so every other consumer reading the database directly (reporting, change data capture, another service) observes old data.
 
-**Refresh-ahead.** The cache proactively re-fetches keys shortly before expiry, so hot keys never take a miss. Works only when you can predict what will be requested; mispredict and you generate DB load for keys nobody wanted.
+**Refresh-ahead.** The cache re-fetches keys shortly before expiry so that keys predicted to be hot never take a miss. It depends on the prediction being right; keys refreshed but not requested generate database load for nothing.
 
 ## Comparison
 
@@ -42,52 +44,78 @@ Phil Karlton's line — *"there are only two hard things in Computer Science: ca
 | Write-behind | Cache, on write | Async flush to DB | DB is stale, not cache | Data loss on cache failure; DB readers see old data |
 | Refresh-ahead | Cache, pre-expiry | n/a (read-side) | ~0 for predicted keys | Wasted DB load on mispredicted keys |
 
-## The classic cache-aside write race
+## The cache-aside write race
 
-Cache-aside's staleness is usually bounded by TTL — except for one interleaving that makes it *unbounded*. Reader A misses and reads value `v1` from the DB. Writer B updates the DB to `v2` and deletes the cache key. Then A, running late, finally executes its `SET`, installing `v1`. The cache now holds stale data until the next write, potentially forever if that key is read-mostly.
+Cache-aside staleness is normally bounded by the TTL. One interleaving makes it **unbounded**:
 
-This is exactly the race the *Scaling Memcache at Facebook* paper (NSDI 2013) fixes with **leases**: on a miss, memcache hands the client a token; a delete for that key invalidates outstanding tokens, so the late `SET` from a stale read is refused. The same paper is why the invalidation is a *delete* and not an update — concurrent updates racing to `SET` can also interleave into permanent staleness, whereas delete merely costs one extra miss. Ordering matters too: as the Azure Cache-Aside docs note, update the store *before* invalidating the cache, or a reader can slip in and reload the old value into the window you just created.
+1. Reader A misses and reads value `v1` from the database.
+2. Writer B updates the database to `v2` and deletes the cache key.
+3. Reader A, delayed between its read and its write, executes its `SET`, installing `v1`.
 
-If you can't run leases, the honest mitigations are short TTLs on read-modify-write keys and versioned keys (`user:42:v{updated_at}`) that make stale entries unreachable instead of trying to delete them.
+The cache now holds `v1` with a fresh TTL and no pending invalidation. **The entry stays wrong until the next write to that key**, which for a read-mostly key may be indefinitely. The invariant the interleaving violates is that a populating `SET` must be derived from a database read that no invalidation has superseded.
+
+*Scaling Memcache at Facebook* (NSDI 2013) enforces exactly that invariant with **leases**: a miss returns a token alongside the miss, a delete of the key invalidates outstanding tokens for it, and a `SET` presenting an invalidated token is refused. Reader A's late write is rejected, and the next reader takes a miss instead of a stale hit.
+
+The same reasoning explains why the invalidation is a delete rather than an update: two writers racing to `SET` different values can interleave into permanent staleness in the same way, whereas a delete costs at most one extra miss. Ordering within the write path matters as well — the Azure Cache-Aside guidance updates the store *before* invalidating the cache. The reverse order opens a window between the invalidation and the commit in which a reader reloads the pre-update value and installs it with a full TTL.
+
+Where leases are unavailable, two mitigations hold without new infrastructure: short TTLs on read-modify-write keys, which bound the damage, and **versioned keys** such as `user:42:v{updated_at}`, which make a stale entry unreachable rather than requiring it to be deleted — the writer changes the key name, and the old entry ages out on its own TTL.
 
 ## TTLs: jitter, stale-while-revalidate, negative caching
 
-TTL is the backstop for every invalidation bug — but a *uniform* TTL is a synchronization device. Deploy a warm-up that loads 100k keys with `TTL=300` and you have scheduled 100k simultaneous misses for five minutes later (that's a **cache avalanche**). Always jitter:
+The TTL is the backstop for every invalidation bug, but a *uniform* TTL is a synchronisation device. A warm-up that loads 100k keys with `TTL=300` schedules 100k simultaneous misses five minutes later — a **cache avalanche**. Jitter breaks the correlation by spreading expiry over a window.
 
-```python
-import random, time, json
+Two refinements sit on top. **Stale-while-revalidate** serves the expired value immediately while a single background fetch refreshes it; the corpus covers it and its relatives (single-flight, XFetch) in [cache stampede: coalescing, XFetch, and stale-while-revalidate](/articles/microservices/2026-08-10-cache-stampede-request-coalescing/). **Negative caching** stores a sentinel recording that a key does not exist, with a short TTL so that a row created later becomes visible quickly.
 
-TTL, JITTER = 300, 0.1          # 10% spread
+### Implementation sketch (Scala)
 
-def get_user(cache, db, user_id):
-    key = f"user:{user_id}"
-    hit = cache.get(key)
-    if hit == b"__NEG__":        # negative cache: known-missing row
-        return None
-    if hit is not None:
-        return json.loads(hit)
-    row = db.fetch_user(user_id)             # miss: go to source
-    ttl = int(TTL * (1 + random.uniform(-JITTER, JITTER)))
-    if row is None:
-        cache.set(key, b"__NEG__", ex=60)    # short TTL for "not found"
-    else:
-        cache.set(key, json.dumps(row), ex=ttl)
-    return row
+The read path combines jittered TTL, negative caching and delete-after-write. `Cache` and `Db` stand in for whatever clients are in use.
 
-def update_user(cache, db, user_id, fields):
-    db.update_user(user_id, fields)          # 1. source of truth first
-    cache.delete(f"user:{user_id}")          # 2. then invalidate (not SET)
+```scala
+enum Entry:
+  case Present(json: String)
+  case Missing                       // negative cache sentinel
+
+final class UserReads(cache: Cache, db: Db):
+  private val Ttl        = 300
+  private val Jitter     = 0.10      // ±10% spread breaks synchronised expiry
+  private val MissingTtl = 60        // short: a created row must appear quickly
+
+  private def jittered(base: Int): Int =
+    val spread = base * Jitter
+    (base + (scala.util.Random.between(-spread, spread))).toInt
+
+  def get(userId: Long): Option[User] =
+    val key = s"user:$userId"
+    cache.get(key) match
+      case Some(Entry.Missing)       => None
+      case Some(Entry.Present(json)) => Some(User.fromJson(json))
+      case None =>
+        val row = db.fetchUser(userId)
+        row match
+          case None    => cache.set(key, Entry.Missing, MissingTtl)
+          case Some(u) => cache.set(key, Entry.Present(u.toJson), jittered(Ttl))
+        row
+
+  def update(userId: Long, fields: Map[String, String]): Unit =
+    db.updateUser(userId, fields)     // source of truth first
+    cache.delete(s"user:$userId")     // then invalidate; never SET the new value
 ```
 
-Two refinements ride on top. **Stale-while-revalidate** serves the expired value immediately while one background fetch refreshes it — the corpus covers this and its cousins (single-flight, XFetch) in [cache stampede: coalescing, XFetch, and stale-while-revalidate](/articles/microservices/2026-08-10-cache-stampede-request-coalescing/). **Negative caching** — the `__NEG__` sentinel above — remembers that a key does *not* exist, with a short TTL so real rows appear quickly once created.
+The `set` on the miss path is the statement exposed to the write race above; nothing in this sketch prevents it, which is what leases or versioned keys add.
 
 ## Failure modes by name
 
-- **Thundering herd / stampede:** one popular key expires, N concurrent misses hit the DB at once. Defenses (request coalescing, probabilistic early refresh, locks with stale serving) are in the [stampede article](/articles/microservices/2026-08-10-cache-stampede-request-coalescing/) — the strategy-level point is that read-through and refresh-ahead centralize the fix, while raw cache-aside makes every caller solve it.
-- **Cache penetration:** requests for keys that exist in neither cache nor DB (bots enumerating IDs, deleted rows). Every request is a guaranteed DB hit. Fix with negative caching and, for hostile key spaces, a Bloom filter of valid IDs in front.
-- **Cache avalanche:** mass simultaneous expiry — synchronized TTLs or a cache node restart — sends a wall of misses to the DB. Fix with TTL jitter, warm restarts/replicas, and DB-side rate limiting so the floor holds.
-- **Hot keys:** one celebrity key exceeds what a single cache shard can serve. Facebook's paper handles this with replication of hot keys across pools; the app-level version is key splitting (`key#0..N`, pick one at random) or a tiny in-process L1 cache for the top-N keys.
+- **Thundering herd / stampede:** a popular key expires and N concurrent misses reach the database together. Defences — request coalescing, probabilistic early refresh, locks with stale serving — are in the [stampede article](/articles/microservices/2026-08-10-cache-stampede-request-coalescing/). At strategy level, read-through and refresh-ahead centralise the fix in one component; raw cache-aside leaves every caller to solve it independently.
+- **Cache penetration:** requests for keys present in neither cache nor database (identifier enumeration, deleted rows). Each such request is a guaranteed database hit, because a miss is indistinguishable from a cold entry. Negative caching removes the repeat cost; for a hostile key space, a Bloom filter of valid identifiers rejects most requests before the lookup.
+- **Cache avalanche:** mass simultaneous expiry — synchronised TTLs, or a cache node restart discarding its whole working set — sends a wall of misses at the database. Mitigations are TTL jitter, warm restarts or replicas, and database-side rate limiting so the store degrades rather than collapses.
+- **Hot keys:** a single key's request rate exceeds what one cache shard can serve, so sharding by key does not help. The Facebook paper's answer is a *replication pool*: the item set is replicated across the pool's servers rather than sharded over them, so the request rate for one key is spread over several machines. The application-level equivalents are key splitting (`key#0..N` with a random choice per read) and a small in-process first-level cache for the top-N keys.
 
-The interview-ready summary: cache-aside is the default because it is resilient and caches only what's read; write-through buys read-your-writes at write-latency cost; write-behind buys write throughput at durability cost; and every one of them still needs jittered TTLs as the invalidation bug backstop.
+## Pitfalls
 
-**Try next:** reproduce the write race — two threads, one sleeping between DB read and cache `SET` — then fix it with a versioned key and confirm the stale `SET` becomes harmless.
+- Invalidating the cache before updating the database lets a concurrent reader reload the pre-update value into the gap; the entry is then stale with a full TTL ahead of it.
+- Updating the cache with the new value instead of deleting it reintroduces the race between two writers: the `SET` that lands last wins regardless of which database write committed last.
+- A uniform TTL applied during bulk warm-up produces synchronised expiry; the symptom is a periodic database load spike at exactly the TTL interval after deployment.
+- Negative-cache entries given the same TTL as real entries delay the visibility of newly created rows by the full TTL, and the row appears absent despite existing in the database.
+- Write-behind leaves the database behind the cache, so any consumer reading the database directly — reports, change data capture, a second service — observes values the cache has already superseded.
+- A cache-aside `SET` whose database read happened before an intervening invalidation installs stale data with no pending invalidation to correct it; for a read-mostly key the entry can remain wrong until the next write.
+- Refresh-ahead applied to keys that are not in fact requested converts a saved miss into recurring database load proportional to the number of mispredicted keys.

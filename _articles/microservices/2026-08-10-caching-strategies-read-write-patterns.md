@@ -2,8 +2,8 @@
 title: "Cache Read/Write Strategies: Cache-Aside, Read-Through, Write-Through, Write-Behind, Write-Around, Refresh-Ahead"
 date: 2026-08-10
 track: microservices
-summary: "Six caching patterns, defined precisely with their read path and write path, the consistency/latency/complexity trade-offs, the failure modes that bite in production, and a decision rule for picking each. With cache-aside and write-through code."
-reading_time: 7
+summary: "Six caching patterns, defined by their read path and write path, with the consistency, latency and complexity trade-offs, the failure modes they exhibit in production, and a decision rule for each. Includes cache-aside and write-through code."
+reading_time: 8
 tags:
   - caching
   - redis
@@ -21,13 +21,13 @@ sources:
     url: "https://hazelcast.com/foundations/caching/cache-access-patterns/"
 ---
 
-"Add a cache" is not one decision. It's two: how a read populates the cache, and how a write keeps it honest. Get the pairing wrong and you ship stale prices, double-write bugs, or a cache that silently eats acknowledged writes when a node dies. The vocabulary below — cache-aside, read-through, write-through, write-behind, write-around, refresh-ahead — is exactly what interviewers probe, because each name pins down a specific read path *and* a specific write path with specific failure modes. Here they are, precisely.
+**Gist.** Introducing a cache splits into two independent decisions — how a read populates the cache, and how a write keeps cache and database in agreement — and the six named patterns (cache-aside, read-through, refresh-ahead, write-through, write-behind, write-around) each fix one half of that pairing. The mechanism common to all of them is a second copy of the data with its own update path, which buys read latency by removing a database round trip. The cost is that the second copy can disagree with the authoritative one: the patterns differ only in how long the disagreement lasts, who is responsible for ending it, and whether an acknowledged write can be lost entirely.
 
-The core distinction: in **cache-aside** your *application* orchestrates the cache. In **read-through / write-through / write-behind** the *cache itself* sits inline and talks to the database on your behalf (via a loader/writer, what Hazelcast calls a `MapStore` and Coherence a `CacheStore`). That single difference drives most of the trade-offs.
+The structural distinction runs through every trade-off below. Under **cache-aside the application orchestrates the cache**, and the cache is a key-value store that knows nothing about the database. Under **read-through, write-through and write-behind the cache sits inline** and reaches the database itself through a loader/writer component — a `MapStore` in Hazelcast, a `CacheStore` in Coherence.
 
-## The read-population patterns
+## Read-population patterns
 
-**Cache-aside (lazy loading).** The application checks the cache; on a hit it returns, on a miss it reads the database, writes the value back into the cache, and returns it. The cache is a dumb key-value store that knows nothing about your database. AWS's whitepaper calls this lazy loading and names its two properties: only requested data is ever cached (lean, cheap), and a node failure is survivable — you just fall through to the database with higher latency.
+**Cache-aside (lazy loading).** The application reads the cache; on a hit it returns the cached value, on a miss it reads the database, writes the value back into the cache, and returns it. The AWS whitepaper names this pattern lazy loading and records two properties: **only requested data is ever cached**, and **a cache node failure is survivable** — requests fall through to the database at higher latency rather than failing.
 
 ```python
 import redis, json
@@ -44,31 +44,60 @@ def get_product(pid: int) -> dict:
     return row
 ```
 
-Two gotchas live in that tiny function. First, the **cache-miss penalty**: a miss costs three round trips (cache, database, cache) instead of one, so the first request after expiry is the slowest. Second, **staleness**: the cached copy only refreshes on a miss, so if the database changes underneath you, readers see the old value until the TTL expires. The TTL *is* your consistency knob — it bounds staleness without guaranteeing freshness. When a hot key expires and thousands of readers miss at once, cache-aside degrades into a [cache stampede](/articles/microservices/2026-08-10-cache-stampede-request-coalescing); handle that separately.
+Two costs are visible in that function. The **cache-miss penalty**: a miss costs three round trips (cache read, database read, cache write) where a hit costs one, so the first request after an entry expires is the slowest request in the workload. And **staleness**: the cached copy is refreshed only by a miss, so a database change made elsewhere is invisible to readers until the entry expires. **The time-to-live (TTL) is therefore the consistency knob — it bounds staleness without providing freshness.** When a hot key expires and many readers miss simultaneously, cache-aside degrades into a [cache stampede](/articles/microservices/2026-08-10-cache-stampede-request-coalescing), which requires separate handling.
 
-**Read-through** is cache-aside's logic moved *inside* the cache. The app always asks the cache; on a miss the cache's loader fetches from the database, stores, and returns — transparently. Same read path, same three-trip penalty on a miss, same staleness profile. What you buy is a single choke point for load logic (no duplicated miss-handling scattered across services) and a natural home for stampede protection. What you pay is a cache product that supports loaders and code that runs where the cache lives. Coherence and Hazelcast implement exactly this.
+**Read-through** relocates the same logic inside the cache. The application always addresses the cache; on a miss the cache's loader fetches from the database, stores the entry, and returns it. The read path, the three-trip miss penalty and the staleness profile are unchanged. What differs is placement: **miss handling exists once**, rather than being duplicated in every service, which also gives stampede protection a single home. The requirement is a cache product supporting loaders and the ability to run loader code where the cache runs. Coherence and Hazelcast both implement this pattern.
 
-**Refresh-ahead** attacks the miss penalty. The cache proactively reloads entries that are *about to* expire and are being actively read, so a popular key is refreshed in the background before anyone hits a miss. Coherence gates this on a fraction of the entry's expiry time: read an entry inside that window and it triggers an async reload. The win is latency — hot keys are effectively never cold. The costs: it only helps keys with predictable, repeated access (guess wrong and you waste database work refreshing entries nobody reads), and it's still eventually consistent within the refresh interval.
+**Refresh-ahead** targets the miss penalty. The cache reloads entries that are close to expiry and are being actively read, so a frequently read key is refreshed in the background before any request observes a miss. Coherence gates the behaviour on a refresh-ahead factor expressed as a fraction of the entry's expiry time: a read that falls inside that window triggers an asynchronous reload. The benefit is latency on hot keys. The costs are that **the pattern helps only keys with repeated, predictable access** — reloading entries nobody subsequently reads spends database work for nothing — and that the value remains eventually consistent within the refresh interval.
 
-## The write patterns
+## Write patterns
 
-The read strategy decides where a value *comes from*; the write strategy decides how the store and cache stay in agreement when data *changes*.
+The read strategy determines where a value comes from; the write strategy determines how cache and database are reconciled when the value changes.
 
-**Write-through.** Every write goes through the cache, which synchronously writes to the database before acknowledging. Cache and database are updated in lockstep, so the cache is never stale (Coherence and AWS both make this the headline benefit). The price is write latency — every write pays for two hops — and cache churn: you cache data on write that may never be read. AWS's practical advice is to *pair write-through with lazy loading and a TTL*, so writes keep hot data fresh while the TTL evicts the cold data write-through would otherwise pile up.
+**Write-through.** Every write passes through the cache, which writes synchronously to the database before acknowledging. Cache and database advance in lockstep, so the cached entry is not stale — the benefit both Coherence and AWS state. The costs are **write latency, since each write pays two hops**, and cache churn, because data is cached at write time whether or not it is ever read. AWS recommends pairing write-through with lazy loading and a TTL, so that writes keep hot data fresh while the TTL evicts the cold entries write-through would otherwise accumulate.
 
 ```python
 def update_price(pid: int, price: float) -> None:
     key = f"product:{pid}"
-    # write-through: DB first, then cache, both synchronously
+    # application-side write-through: DB then cache, synchronously, no shared transaction
     db.execute("UPDATE products SET price=%s WHERE id=%s", price, pid)
     r.set(key, json.dumps({"id": pid, "price": price}), ex=TTL)
 ```
 
-The subtle failure mode is the **double-write race**: two independent statements with no shared transaction. If the database write commits and the process dies before the `r.set`, the cache holds the old price until TTL — a write-through cache that's briefly stale, exactly what it promised not to be. Worse is the read-modify-write interleave: two concurrent updates can commit to the database in one order and land in the cache in the other, leaving the cache permanently wrong. A true write-through cache with an inline `CacheStore` closes this by making the store write part of the cache operation; hand-rolled two-statement code does not. This is why "just delete the key on write" (invalidate rather than update) is often safer — a miss reloads truth, a bad update persists a lie.
+The failure mode is the **double-write race**: the two statements share no transaction. If the database write commits and the process dies before `r.set`, the cache serves the previous price until the TTL expires — a write-through cache that is stale, contradicting the property it was chosen for. The more damaging variant is the read-modify-write interleave: **two concurrent updates can commit to the database in one order and reach the cache in the opposite order, leaving the cache permanently wrong** rather than briefly wrong, because nothing subsequently corrects it. An inline `CacheStore` narrows this by making the database write part of the cache operation on the key; hand-written two-statement code does not. This is the argument for invalidating on write rather than updating on write: a subsequent miss reloads the authoritative value, whereas an out-of-order update persists an incorrect one.
 
-**Write-behind (write-back).** The cache acknowledges the write immediately and flushes to the database asynchronously, usually batched and coalesced. This gives the best write latency and can collapse many updates to the same key into one database write — excellent for write-heavy, high-throughput workloads like counters and metrics. The failure mode is the one every interviewer wants named: **data loss on crash.** Between the acknowledgement and the flush, the authoritative copy lives only in the cache; if the node dies, acknowledged writes vanish. You've traded durability for latency. Hazelcast notes the related hazard — a failed backend write surfaces *after* the app has moved on, so error handling is asynchronous and awkward. Use it only where a bounded window of loss is acceptable, and prefer implementations that replicate the write-behind queue.
+**Write-behind (write-back).** The cache acknowledges the write immediately and flushes to the database asynchronously, typically batched and coalesced so that repeated updates to one key collapse into a single database write. Write latency is the lowest of the patterns and database write volume falls, which suits counters and metrics. The failure mode is **loss of acknowledged writes on crash**: between acknowledgement and flush the only copy of the update lives in the cache, so a node failure destroys writes the application was told had succeeded. Durability has been exchanged for latency. Hazelcast records a related consequence: **a failed backend write surfaces after the application has moved on**, so error handling is asynchronous and detached from the request that caused it. The pattern is appropriate only where a loss window is acceptable; implementations that keep backup copies of the write-behind queue on other members reduce, but do not eliminate, the exposure.
 
-**Write-around.** Writes go straight to the database and bypass the cache entirely; the cache is populated only later, by a read miss (cache-aside/read-through). This keeps write-once/read-rarely data from polluting the cache. The trade-off is a guaranteed miss on the first read after a write — good when recently written data is unlikely to be read soon (audit logs, ingest pipelines), bad for read-your-writes.
+**Write-around.** Writes go to the database and bypass the cache; the cache is populated later by a read miss under cache-aside or read-through. Write-once/read-rarely data therefore does not displace hot entries. The cost is a **guaranteed miss on the first read after a write**, which suits audit logs and ingest pipelines and conflicts directly with read-after-write expectations.
+
+### Implementation sketch (Scala)
+
+Write-behind's coalescing property — many updates to one key becoming one database write — reduces to a mutable map of pending values drained on a timer.
+
+```scala
+import scala.collection.mutable
+
+final class WriteBehindBuffer[K, V](flush: Map[K, V] => Unit):
+  private val pending = mutable.LinkedHashMap.empty[K, V]
+
+  /** Acknowledges immediately; the value exists only here until drain(). */
+  def put(key: K, value: V): Unit = synchronized:
+    pending.update(key, value)   // overwrite collapses N updates into 1 write
+
+  def drain(): Unit =
+    val batch = synchronized:
+      val snapshot = pending.toMap
+      pending.clear()
+      snapshot
+    if batch.nonEmpty then
+      try flush(batch)
+      catch case e: Exception =>
+        // the caller of put() has long since returned: no request to fail
+        synchronized:
+          batch.foreach((k, v) => pending.getOrElseUpdate(k, v))
+```
+
+Two properties are load-bearing. **`pending.update` is the coalescing step**: only the last value per key survives to the flush, so the database never observes the intermediate states. And **the window between `put` and `drain` is the loss window** — a crash inside it discards acknowledged writes, because `pending` is the only copy. The `getOrElseUpdate` in the recovery path restores failed entries without overwriting values written after the snapshot was taken.
 
 ## Comparison
 
@@ -81,8 +110,16 @@ The subtle failure mode is the **double-write race**: two independent statements
 | Write-behind | Served from fresh cache | Cache acks, DB flush async | Eventual (DB lags) | Lowest | **Data loss on crash**; async error handling |
 | Write-around | Cache filled by later miss | App writes DB, bypass cache | Stale within TTL | Low | First read after write always misses |
 
-## Picking one
+## Selection
 
-Reach for **cache-aside** by default — it's the simplest, survives cache outages, and pairs with any datastore. Move miss logic into **read-through** when you have many services hitting the same cache and want one place for loading and stampede control. Add **refresh-ahead** only for a known set of hot keys where the miss latency actually hurts. On writes, choose **write-through** when reads must never be stale and you can absorb the write latency (catalog data, config); choose **write-behind** when write throughput dominates and a small loss window is tolerable (counters, telemetry); choose **write-around** for data that's written far more often than it's read. In practice most production systems run **cache-aside + write-through-by-invalidation + TTL** — and treat the TTL as the real, honest bound on how stale a reader can ever be.
+**Cache-aside** is the default: it is the simplest, it survives cache outages, and it requires nothing of the datastore. Miss logic moves into **read-through** when many services share one cache and loading plus stampede control should exist in one place. **Refresh-ahead** applies to a known set of hot keys whose miss latency is measurably harmful. On the write side, **write-through** fits data that must not be read stale and can absorb the extra hop (catalogue entries, configuration); **write-behind** fits write-dominated workloads with a tolerable loss window (counters, telemetry); **write-around** fits data written far more often than read. The common production combination is **cache-aside with invalidation on write plus a TTL**, where the TTL is the honest bound on how stale any reader can be.
 
-**Try next:** implement the cache-aside snippet, then change `update_price` to *delete* the key instead of `set`-ing it, and reason about which stale-read and double-write races each version still allows — then layer in [consistent hashing](/articles/distributed-systems/2026-07-25-consistent-hashing-ring) to see how these patterns behave across a multi-node cache.
+## Pitfalls
+
+- **Updating the cache on write instead of invalidating it.** Symptom: a cached value that is wrong indefinitely rather than until the TTL. Cause: two concurrent writers commit to the database in one order and to the cache in the other, and nothing later corrects the losing value.
+- **Treating write-through as atomic when it is two statements.** Symptom: a stale entry after a process restart. Cause: the database write committed and the process died before the cache write; without an inline `CacheStore` the pair has no shared transaction.
+- **Relying on write-behind acknowledgements for durability.** Symptom: writes the application reported as successful are missing from the database after a node failure. Cause: between acknowledgement and flush the only copy of the update is in the cache.
+- **Handling write-behind flush errors in the request path.** Symptom: backend write failures observed only in logs, with no client ever informed. Cause: the failure occurs after the originating request has returned.
+- **Applying refresh-ahead to keys with unpredictable access.** Symptom: database load rises without a corresponding fall in read latency. Cause: entries are reloaded before expiry and then not read.
+- **Combining write-around with read-after-write expectations.** Symptom: a client reads its own write and receives the previous value or a slow response. Cause: the write bypassed the cache, so the following read is a guaranteed miss.
+- **Treating the TTL as a freshness guarantee.** Symptom: readers see data older than intended despite a short TTL. Cause: the TTL bounds how long a stale entry may persist; it does not cause any entry to be refreshed before it is requested.

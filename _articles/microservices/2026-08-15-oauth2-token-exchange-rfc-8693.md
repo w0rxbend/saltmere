@@ -2,8 +2,8 @@
 title: "OAuth 2.0 Token Exchange (RFC 8693): Passing a User's Identity Down the Call Chain"
 date: 2026-08-15
 track: microservices
-summary: "When service A calls service B calls service C on behalf of a logged-in user, what does B send to C? Forwarding the raw access token overshares scope and audience; dropping the user identity breaks authorization and audit. RFC 8693 defines a token-exchange grant that mints a fresh, correctly-scoped token while recording the delegation chain in an 'act' claim. Keycloak 26.2 and Spring Security 6.3 both ship it — here's the flow with a real curl example."
-reading_time: 5
+summary: "When service A calls service B which calls service C on behalf of a logged-in user, what does B send to C? Forwarding the raw access token overshares scope and audience; dropping the user identity breaks authorization and audit. RFC 8693 defines a token-exchange grant that mints a fresh, correctly-scoped token while recording the delegation chain in an 'act' claim. Keycloak 26.2 and Spring Security 6.3 both ship it, with the flow shown here as a curl example."
+reading_time: 6
 tags: [oauth2, rfc-8693, token-exchange, identity, delegation, keycloak]
 sources:
   - title: "RFC 8693 — OAuth 2.0 Token Exchange (IETF)"
@@ -16,17 +16,27 @@ sources:
     url: "https://developers.authlete.com/protocols-and-flows/advanced-flows/oauth-2-0-token-exchange-rfc-8693"
 ---
 
-A user calls your **API gateway**, which calls the **orders** service, which calls the **inventory** service. The user's access token arrived at the gateway. What flows to inventory? Two common answers are both wrong. **Forward the raw token** and every downstream hop gets the full scope and audience the user granted the *front door* — inventory can now call anything the gateway could, and a leak two hops deep is a leak of the original credential. **Drop the user identity** and call inventory as a machine client, and you've lost who the request is for: no per-user authorization, no honest audit trail. **RFC 8693** (OAuth 2.0 Token Exchange, an IETF Proposed Standard) is the sanctioned middle path — each hop exchanges the token it holds for a new one, correctly scoped for the next hop, that still carries the end user's identity.
+**Gist.** In a chain of services acting for a logged-in user, the intermediate hops must decide what credential to present downstream: forwarding the raw access token propagates the front door's full scope and audience to every hop, while calling downstream as a machine client discards the user's identity and with it per-user authorization and audit. **RFC 8693** (OAuth 2.0 Token Exchange, an IETF Proposed Standard) defines a grant at the authorization server's token endpoint that trades a held token for a fresh one, narrowed to the next hop's audience and scope, that still names the end user as subject. The cost is a synchronous round trip to the authorization server (AS) on every hop that exchanges, plus an exchange policy at the AS that becomes security-critical surface.
+
+## The problem stated precisely
+
+Consider an **API gateway** that receives a user's access token, calls an **orders** service, which in turn calls an **inventory** service. Two approaches fail in opposite directions.
+
+**Forwarding the raw token** preserves identity but not confinement. The token's `aud` and `scope` were issued for the front door, so any hop holding it can present it anywhere that audience is accepted. A compromise two hops deep is a compromise of the original credential for its full remaining lifetime.
+
+**Calling downstream with a client-credentials token** confines the credential but erases the subject. Inventory then sees only "orders-service", so it cannot enforce per-user authorization rules, and its audit log records the middle tier rather than the party the request was for.
+
+Token exchange separates the two properties: **identity is carried in the `sub` claim, authority is carried in `aud` and `scope`, and the exchange re-derives the second while preserving the first.**
 
 ## The token-exchange grant
 
-Token exchange is a new grant type at the authorization server's token endpoint:
+The grant is requested at the ordinary token endpoint with:
 
 ```
 grant_type = urn:ietf:params:oauth:grant-type:token-exchange
 ```
 
-The caller presents the token it already has as the **`subject_token`** — the identity being represented, the end user — and asks for a token aimed at the next service. Key parameters:
+The caller presents the token it already holds as the **`subject_token`** — the party being represented — and states what the new token is for.
 
 | Parameter | Meaning |
 |---|---|
@@ -36,11 +46,11 @@ The caller presents the token it already has as the **`subject_token`** — the 
 | `audience` / `resource` | Who the new token is *for* — the downstream service |
 | `scope` | The (usually narrowed) scopes requested for the new token |
 
-Token types are URNs: `urn:ietf:params:oauth:token-type:access_token`, `:jwt`, `:id_token`, `:refresh_token`, `:saml2`. The response echoes an **`issued_token_type`** and returns the new `access_token`, with `token_type` set to `Bearer` for access tokens (or `N_A` otherwise).
+Token types are identified by URNs: `urn:ietf:params:oauth:token-type:access_token`, `:jwt`, `:id_token`, `:refresh_token`, `:saml2`. **RFC 8693 makes `subject_token` and `subject_token_type` the only required parameters beyond `grant_type`;** `requested_token_type`, `audience`, `resource` and `scope` are all optional, and `actor_token_type` is required whenever `actor_token` is present. The response echoes an **`issued_token_type`**, which need not equal `requested_token_type` — the request expresses a preference, and the AS reports which type it minted. `token_type` is `Bearer` for access tokens and `N_A` otherwise.
 
 ## A concrete exchange
 
-The orders service holds the user's access token and needs one scoped for inventory. It authenticates as a client and exchanges:
+The orders service holds the user's access token and requires one scoped for inventory. It authenticates as a client and exchanges:
 
 ```bash
 curl -X POST https://auth.saltmere.dev/realms/shop/protocol/openid-connect/token \
@@ -63,16 +73,18 @@ curl -X POST https://auth.saltmere.dev/realms/shop/protocol/openid-connect/token
 }
 ```
 
-The new token still has `sub` = the user, but its `aud` is `inventory-service` and its scope is trimmed to `inventory:read`. If it leaks, it can't be replayed against the gateway or anything else — it's a narrow, short-lived credential minted for exactly one hop.
+The issued token retains `sub` = the user, but its `aud` is `inventory-service` and its scope is trimmed to `inventory:read`. **Two independent checks therefore reject a replay of this token against the gateway: audience validation at the resource server, and scope evaluation at the endpoint.** The `expires_in` of 300 seconds bounds the window in which even a correctly-addressed replay succeeds.
 
-## Impersonation vs. delegation
+Note the second authentication in the request: the exchange carries **both** the client credentials of the caller (`-u orders-service:…`) and the user's token. The AS is thus in a position to decide the exchange on the pair, not on the subject token alone.
 
-RFC 8693 draws a sharp line between two shapes of exchanged token.
+## Impersonation versus delegation
 
-- **Impersonation:** the new token looks like it came straight from the user. Same `sub`, no trace of the calling service. Downstream can't tell — and can't audit — that a middle tier was involved.
-- **Delegation:** the new token names *both* parties. The subject stays the user, and an **`act`** (actor) claim records who is acting on their behalf. You send both a `subject_token` and an `actor_token`, and the AS composes the delegation.
+RFC 8693 distinguishes two shapes of issued token.
 
-The `act` claim is a JSON object identifying the current actor, and it **nests** to represent a multi-hop chain — each new actor wraps the previous `act`:
+- **Impersonation:** the new token is indistinguishable from one issued directly to the user. Same `sub`, no record of the intermediate. A downstream service cannot determine, and therefore cannot log, that a middle tier was involved.
+- **Delegation:** the token names both parties. The subject remains the user, and an **`act`** (actor) claim identifies the party acting on the user's behalf. Where the caller supplies an `actor_token` alongside the `subject_token`, the AS composes the delegation from the two.
+
+The `act` claim is a JSON object identifying the current actor, and it **nests** to represent a multi-hop chain, each new actor wrapping the previous `act`:
 
 ```json
 {
@@ -87,12 +99,51 @@ The `act` claim is a JSON object identifying the current actor, and it **nests**
 }
 ```
 
-Read outward-in: the gateway acted, then orders acted on top of it, all on behalf of the user — a verifiable provenance chain. A companion **`may_act`** claim can be embedded in a token to declare, up front, which party is *permitted* to become an actor for that subject, letting the AS refuse unauthorized exchanges.
+The nesting is read outermost-first: the **current** actor is the outer `act`, and each inner `act` is the actor that preceded it. **The invariant is that `sub` never changes along the chain — only the actor stack grows** — which is what makes the structure a provenance record rather than an identity substitution.
 
-## Real support, and the caveats
+A companion **`may_act`** claim may be embedded in a token to declare which party is permitted to become an actor for that subject. It moves the authorization decision for the exchange into the subject token itself, allowing the AS to refuse an exchange whose caller is not the named party.
 
-This isn't spec-only. **Keycloak 26.2** (May 2025) promoted **standard token exchange** — the RFC 8693 grant — to officially supported, replacing its older non-standard mechanism. **Spring Security 6.3** (the client side, via `TokenExchangeOAuth2AuthorizedClientProvider`) and **Spring Authorization Server 1.3** (the AS side) both implement the grant, so a Spring resource server can exchange the incoming token before calling downstream. Authlete and other commercial servers support it as well.
+### Implementation sketch (Scala)
 
-The caveats are operational. Every hop that exchanges adds a round trip to the authorization server, so cache the issued tokens for their short lifetime. Impersonation tokens erase the audit chain — prefer delegation with `act` when you need traceability. And the AS's exchange policy is now security-critical surface: gate *which* clients may exchange *which* subjects with `may_act` and per-client policy, or you've built a lateral-movement machine instead of a delegation one.
+The load-bearing logic on the resource-server side is validating the actor chain rather than trusting `sub`. The nesting is a linked list, so both the push performed by the AS and the flattening performed by the verifier are short:
 
-**Try next:** stand up Keycloak 26.2, enable standard token exchange on a client, and exchange a user access token for a downstream-audience one — then decode both JWTs and diff the `aud`, `scope`, and `act` claims.
+```scala
+final case class Actor(sub: String, act: Option[Actor])
+final case class Claims(
+    sub: String, aud: String, scope: Set[String],
+    act: Option[Actor], mayAct: Option[String])
+
+/** The AS side: the new actor becomes the outermost `act`, wrapping the prior chain. */
+def push(claims: Claims, newActor: String, audience: String, scopes: Set[String]): Claims =
+  claims.copy(aud = audience, scope = claims.scope & scopes,   // narrowing only: never widens
+              act = Some(Actor(newActor, claims.act)))
+
+/** Outermost first: head is the most recent actor, last is the original front door. */
+def chain(claims: Claims): List[String] =
+  List.unfold(claims.act)(a => a.map(x => (x.sub, x.act)))
+
+def admit(claims: Claims, self: String, allowedActors: Set[String]): Either[String, String] =
+  chain(claims) match
+    case Nil                                  => Left("impersonation token: no act claim")
+    case current :: _ if !allowedActors(current) =>
+      Left(s"actor $current not permitted to act for ${claims.sub}")
+    case _ if claims.mayAct.exists(_ != chain(claims).head) =>
+      Left("subject token names a different permitted actor")
+    case _ if claims.aud != self              => Left(s"audience ${claims.aud} is not $self")
+    case _                                    => Right(claims.sub)   // authorize as the user
+```
+
+Signature verification, issuer and expiry checks are omitted; they are unchanged from ordinary JSON Web Token (JWT) validation and are prerequisites, not substitutes, for the checks above.
+
+## Implementation status
+
+The grant is implemented, not spec-only. **Keycloak 26.2** (May 2025) promoted **standard token exchange** — the RFC 8693 grant — to officially supported status, replacing an older non-standard mechanism. **Spring Security 6.3** provides the client side via `TokenExchangeOAuth2AuthorizedClientProvider`, and **Spring Authorization Server 1.3** provides the AS side, so a Spring resource server can exchange an incoming token before calling downstream. Authlete documents the grant among its supported advanced flows.
+
+## Pitfalls
+
+- **Forwarding the exchanged token to a second downstream service fails audience validation.** The token was minted with a single `aud`; the second service rejects it, and the symptom is a 401 that looks like a signature problem but is an addressing problem.
+- **Exchanging on every request adds an AS round trip to every hop.** The issued token's lifetime (300 seconds in the example above) is the cache window; without caching keyed by subject, audience and scope, the AS becomes a synchronous dependency on the request path.
+- **An impersonation exchange leaves no `act` claim, so downstream audit logs attribute the call to the user with no record of the intermediate.** The absence is silent — nothing errors — and is only detectable by decoding an issued token and observing the missing claim.
+- **A client permitted to exchange arbitrary subject tokens for arbitrary audiences can reach every service in the mesh.** The symptom is lateral movement that appears in logs as legitimate per-user access; the cause is exchange policy that constrains neither the subject nor the target audience per client.
+- **Omitting `scope` may yield a token with the subject token's original scopes rather than a narrowed set,** removing the confinement the exchange was performed to obtain. Decoding the response is the only way to confirm the narrowing occurred.
+- **`may_act` is only enforced if the AS reads it.** Embedding the claim in a subject token does not by itself prevent an exchange; the restriction holds only where the authorization server implements the check.

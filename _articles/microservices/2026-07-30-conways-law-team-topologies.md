@@ -1,9 +1,9 @@
 ---
-title: "Conway's Law is not a warning, it's a design tool: the Inverse Conway Maneuver in practice"
+title: "Conway's Law as a design tool: the Inverse Conway Maneuver in practice"
 date: 2026-07-30
 track: microservices
-summary: "Your service boundaries will mirror your org chart whether you plan for it or not. Here's a worked example of how a functionally-siloed org produces layered, wrong-grained services, and how re-orging into stream-aligned teams (Team Topologies) fixes the boundaries at the source."
-reading_time: 6
+summary: "Service boundaries mirror the org chart whether or not that is planned for. A worked example of how a functionally-siloed organisation produces layered, wrong-grained services, and how re-organising into stream-aligned teams (Team Topologies) moves the boundaries to the source."
+reading_time: 7
 tags: [conways-law, team-topologies, org-design, service-boundaries, stream-aligned-teams, microservices]
 sources:
   - title: "How Do Committees Invent? — Melvin E. Conway, Datamation, April 1968 (melconway.com)"
@@ -18,23 +18,25 @@ sources:
     url: "https://itrevolution.com/articles/visualize-team-dependencies-with-a-team-api/"
 ---
 
-In 1968, Melvin Conway published a paper in *Datamation* with a thesis buried near the end:
+**Gist.** A system's module boundaries tend to reproduce the communication structure of the organisation that built it, so a boundary drawn on a whiteboard against the grain of the organisation degrades back towards the org chart. The Inverse Conway Maneuver treats that tendency as a lever: change the communication structure first — teams aligned to business capabilities rather than technical layers — so the desired architecture becomes the path of least resistance. The cost is that re-organising is slower, more disruptive and less reversible than redrawing a diagram, and it relocates specialists (database, platform, security) whose expertise previously concentrated in one place.
+
+## The constraint
+
+Melvin Conway's 1968 *Datamation* paper states the thesis directly:
 
 > "organizations which design systems (in the broad sense used here) are constrained to produce designs which are copies of the communication structures of these organizations."
 
-Read that as an engineering constraint, not a proverb. It says the shape of your software is *downstream* of who talks to whom. Newman's organizational-structures chapter in *Building Microservices* leans on exactly this: you cannot draw clean service boundaries on a whiteboard and expect them to survive contact with an org that's structured a different way. The org wins. Every time.
-
-So the useful question isn't "how do I fight Conway's Law?" It's "how do I aim it?"
+The operative word is **constrained**. The claim is not that architecture and organisation happen to resemble each other; it is that the design activity itself is bounded by who can talk to whom at what cost. An interface between two components is negotiated by the people who own those components. Where negotiation is cheap — same team, same standup — interfaces are renegotiated freely and boundaries move to wherever the problem wants them. Where negotiation is expensive — a ticket queue between departments — the interface **freezes at whatever shape it had when the two groups last agreed**, and subsequent design work routes around it rather than through it. Newman's treatment of organisational structures in *Building Microservices* works from the same constraint, arguing for aligning service ownership with the teams that deliver a capability.
 
 ## A worked example: three siloed teams, three wrong services
 
-Say you're breaking up a monolithic e-commerce app. Your engineering org is structured by *technical function* — the way a lot of shops still are:
+Consider a monolithic e-commerce application being decomposed by an engineering organisation structured by *technical function*:
 
-- a **DBA / data team** that owns all schemas and stored procedures,
-- a **middleware / backend team** that owns the application servers and business logic,
-- a **frontend team** that owns the web and mobile UI.
+- a **database administration (DBA) / data team** owning all schemas and stored procedures,
+- a **middleware / backend team** owning application servers and business logic,
+- a **frontend team** owning web and mobile user interfaces.
 
-Each team communicates well *internally* and hands off *across* the boundary via tickets. Conway's Law predicts the architecture those communication paths will produce, and it's depressingly precise:
+Communication is cheap inside each team and mediated by tickets across team boundaries. The predicted architecture follows the cheap paths:
 
 ```
 Client ─▶ [ Frontend Service ]   ← frontend team
@@ -49,44 +51,38 @@ Client ─▶ [ Frontend Service ]   ← frontend team
            one shared DB
 ```
 
-You didn't get microservices. You got a **layered monolith with network calls between the layers** — the worst of both worlds. Look at what happens when a product manager asks for a change to *checkout*:
+The result is not a set of microservices but a **layered monolith with network calls between the layers**. It carries the coupling of the monolith — every layer must agree on a change — plus the operational cost of distribution.
 
-- The frontend team changes the checkout screen.
-- The middleware team changes checkout logic.
-- The DBA team adds a column and a stored proc.
-
-One business feature, three teams, three backlogs, three deploys, and a release train to sequence them. Latency is now stacked across three network hops that used to be in-process calls. Nobody owns "checkout" — they own *a horizontal slice of everything*. The boundaries are real; they're just cut along the wrong axis. They copy the org chart, exactly as Conway said they would.
+The failure mode is visible in the change path for a single feature. A modification to *checkout* requires the frontend team to change the checkout screen, the middleware team to change checkout logic, and the DBA team to add a column and a stored procedure. **One business capability crosses three teams, three backlogs and three deployments**, sequenced by a release train because the three changes are not independently deployable. In-process calls that were previously function invocations are now network hops, so request latency accumulates across the layers and each hop adds a failure mode the monolith did not have. No team owns "checkout"; each owns **a horizontal slice of every capability**. The boundaries are real and enforced — they are cut along the wrong axis, and they copy the org chart precisely as the constraint predicts.
 
 ## The Inverse Conway Maneuver
 
-Thoughtworks named the fix on their Technology Radar: the **Inverse Conway Maneuver** — *"evolving your team and organizational structure to promote your desired architecture."* Instead of accepting the org as fixed and grieving the architecture it forces, you change the org so its communication structure matches the boundaries you actually want.
+The Thoughtworks Technology Radar names the technique the **Inverse Conway Maneuver**, describing it as evolving team and organisational structure so as to promote the desired architecture. Rather than treating the organisation as fixed and the architecture as freely chosen, it fixes the architecture as the goal and treats the organisation as the variable. The target for the example above is a **checkout** service, a **catalog** service and a **payments** service — vertical slices, each a business capability owned end-to-end by one team — so the teams are reshaped to match.
 
-You want a **checkout** service, a **catalog** service, a **payments** service — vertical slices, each a business capability, each owned end-to-end by one team. So you build teams shaped like that.
+## Team Topologies: the shapes to re-organise into
 
-## Team Topologies: the shapes you re-org *into*
+Skelton and Pais supply a concrete target for the maneuver: four fundamental team types wired together by three defined interaction modes.
 
-Skelton and Pais give the Inverse Conway Maneuver a concrete target. Don't just say "cross-functional teams"; pick from four fundamental team types and wire them with three defined interaction modes.
-
-| Team type | Owns | In our example |
+| Team type | Owns | In this example |
 |---|---|---|
-| **Stream-aligned** | A single value stream / business capability, end-to-end | `checkout`, `catalog`, `payments` teams — each with front-to-back skills |
-| **Platform** | Internal self-service products that reduce load on stream teams | CI/CD, k8s, observability, the shared DB-as-a-service |
-| **Enabling** | Coaching stream teams over a capability gap, then leaving | An ex-DBA group teaching teams to own their own schemas |
-| **Complicated-subsystem** | A part needing deep specialist knowledge | A pricing/fraud engine too gnarly for every stream team to hold |
+| **Stream-aligned** | A single value stream / business capability, end-to-end | `checkout`, `catalog`, `payments` teams, each with front-to-back skills |
+| **Platform** | Internal self-service products that reduce load on stream teams | Continuous integration and delivery, Kubernetes, observability, database-as-a-service |
+| **Enabling** | Coaching stream teams over a capability gap, then withdrawing | Former DBAs teaching teams to own their own schemas |
+| **Complicated-subsystem** | A part requiring deep specialist knowledge | A pricing or fraud engine no stream team can hold entirely |
 
-The **stream-aligned team is the default and the majority** — the DBA and middleware silos dissolve *into* the stream teams (or become a platform/enabling team). Now the checkout team has a UI dev, a service dev, and someone who knows the data model, and it ships checkout without a cross-team ticket.
+The **stream-aligned team is the default and the majority type**; the other three exist to keep it viable. The DBA and middleware silos dissolve into the stream teams or convert into platform and enabling teams. The checkout team then contains user-interface, service and data-model skills, and ships checkout without a cross-team ticket.
 
-The three **interaction modes** keep the wiring explicit:
+The three **interaction modes** make the remaining communication paths explicit rather than ambient:
 
-- **Collaboration** — two teams work closely for a short time to figure out new terrain (high bandwidth, high cost — use sparingly).
-- **X-as-a-Service** — one team consumes another with minimal fuss (the checkout team just *uses* the platform's database-as-a-service; no meetings).
-- **Facilitation** — an enabling team helps another remove an impediment.
+- **Collaboration** — two teams work closely for a bounded period on unfamiliar terrain. High bandwidth, high cost, and the coupling it creates is exactly what Conway's constraint will imprint on the architecture, so it is used sparingly and ended deliberately.
+- **X-as-a-Service** — one team consumes another's product through a stable interface with minimal ongoing discussion; the checkout team uses the platform's database-as-a-service without meetings.
+- **Facilitation** — an enabling team helps another remove an impediment, then leaves.
 
-The whole point of Team Topologies is managing **cognitive load**: overloaded teams make poor decisions and move slowly. A stream-aligned team owning one capability with a good platform underneath can hold its whole domain in its head. The old middleware team, owning a horizontal slice of *twelve* domains, never could.
+The organising constraint behind the model is **cognitive load**: a team responsible for more domain than it can hold makes poor decisions and moves slowly. A stream-aligned team owning one capability, sitting on a platform that absorbs infrastructure concerns, can hold its domain. The former middleware team, owning a horizontal slice of a dozen domains, could not.
 
-## Make the boundary legible: a team API
+## Making the boundary legible: a team API
 
-A re-org only produces good architecture if the new boundaries are *explicit*. Team Topologies suggests each team publish a **team API** — the interface other teams integrate against. Keep it in the repo, version it, keep it honest:
+A re-organisation produces the intended architecture only if the new boundaries are explicit. Team Topologies proposes that each team publish a **team API** — a written description of what the team owns and how other teams interact with it, kept where the team's work lives and revised as those interactions change:
 
 ```markdown
 # Team API — Checkout
@@ -112,6 +108,13 @@ Mission:     Own the checkout journey, cart → confirmed order.
 - Collaboration w/ Payments — new refund flow — until Aug 15
 ```
 
-That one file tells any other team *what we own, what we lean on, and how to reach us* — which is exactly the communication structure Conway said would become your architecture. Make it the structure you want.
+The file states what the team owns, what it depends on, and the cost and channel of reaching it — a written description of the communication structure that, by Conway's constraint, becomes the architecture. Writing it down makes the structure auditable: a team whose "owns" section lists a horizontal layer rather than a capability, or a collaboration entry with no end date, is a boundary drifting back towards the org chart.
 
-**Try next:** List your current services in one column and the team that owns each in the next. Flag every service owned by more than one team, and every team that owns a *horizontal layer* rather than a business capability — those are your Conway hotspots. For the worst one, sketch the stream-aligned team that *should* own it end-to-end, and write its team API.
+## Pitfalls
+
+- **Renaming silos as stream-aligned teams without moving ownership.** The team is called `checkout` but still files a ticket for every schema change; the delivery path still crosses three backlogs because the data model did not move with the label.
+- **Splitting teams before a platform exists.** Each new stream team rebuilds deployment pipelines, monitoring and database provisioning, so cognitive load rises rather than falls and delivery slows immediately after the re-organisation.
+- **Leaving collaboration mode open-ended.** Two teams intended to collaborate for one quarter remain coupled indefinitely; their services acquire a shared release cadence and stop being independently deployable.
+- **Retaining a shared database under separated services.** The teams are vertical but the schema is common, so a column change still requires cross-team coordination and the old horizontal boundary survives beneath the new service boundaries.
+- **Enabling teams that never withdraw.** An enabling team that stays permanently becomes a dependency in the delivery path, which reproduces the specialist silo it was created to dissolve.
+- **A stale team API.** The document lists an interaction that ended and omits one that started, so other teams route requests through a path nobody owns and requests are dropped.

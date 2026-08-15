@@ -2,8 +2,8 @@
 title: "The Coupling Taxonomy: Domain, Pass-Through, Common, and Content Coupling"
 date: 2026-08-15
 track: microservices
-summary: "Chapter 2 of Newman's Building Microservices gives coupling a vocabulary most engineers lack: domain coupling (fine), pass-through coupling (you're a courier for someone else's contract), common coupling (three writers, one row, no invariants), and content coupling (reaching into another service's database — just don't). Here is each one with a concrete service example, the fix, and the two ideas underneath: information hiding and 'code that changes together stays together.'"
-reading_time: 5
+summary: "Chapter 2 of Newman's Building Microservices gives coupling a vocabulary: domain coupling (expected), pass-through coupling (a service acts as courier for another service's contract), common coupling (several writers, one row, no owner of the invariants), and content coupling (direct writes into another service's database). Each rung is presented with a service example, its failure mode, its fix, and the two underlying ideas: information hiding and 'code that changes together stays together.'"
+reading_time: 6
 tags: [coupling, cohesion, information-hiding, service-boundaries, newman, ddd]
 sources:
   - title: "Sam Newman — Building Microservices, 2nd Edition (O'Reilly)"
@@ -16,23 +16,23 @@ sources:
     url: "https://samnewman.io/books/building_microservices_2nd_edition/"
 ---
 
-Everyone agrees microservices should be "loosely coupled" and nobody defines it. Chapter 2 of **Building Microservices** (2nd ed.) fixes that by resurrecting a taxonomy from 1970s structured programming — Constantine and Yourdon's coupling levels — and translating it to services. The payoff: instead of "these services feel too coupled," you can say *which kind* of coupling you have, and each kind has a known fix.
+**Gist.** "Loosely coupled" is asserted about microservice architectures far more often than it is defined, which leaves teams unable to say what is wrong with a boundary they dislike. Chapter 2 of **Building Microservices** (2nd ed.) supplies a definition by adapting the coupling levels of Yourdon and Constantine's *Structured Design* to services. Four of its named rungs — **domain, pass-through, common, content** — are treated here, each with a distinct failure mode and a distinct fix; the chapter also names temporal coupling, which is a synchronous-call concern rather than a data-ownership one and is left aside. The cost of the taxonomy is that its remedies all push work outward: contracts must be owned, state machines must be centralised in one service, and back doors into another service's storage must be closed, which converts cheap direct access into API calls, events, or replicated data.
 
-## The two ideas underneath
+## The two underlying ideas
 
-**Information hiding** is Parnas's 1972 criterion: a module boundary should hide the decisions most likely to change, exposing the smallest stable interface. For services, the hidden thing is above all the **database schema** — the single most change-prone decision a service owns. Newman's formulation: share as little as you can get away with.
+**Information hiding** is Parnas's 1972 criterion: a module boundary should hide the decisions most likely to change and expose the smallest stable interface. For a service, the decision most in need of hiding is the **database schema**, because it is the part a service changes most freely while believing nobody else depends on it. Newman applies the criterion directly to services: expose as little as the collaboration requires and hide the rest.
 
-**Cohesion** is the flip side: *"the code that changes together, stays together."* A service boundary is good when a typical product change lands inside one service; it is bad when adding a field to an invoice touches four repos and needs a choreographed deploy. Coupling and cohesion are the same force measured in two places — weak cohesion inside a boundary shows up as tight coupling across it.
+**Cohesion** is the complementary measurement — *"the code that changes together, stays together."* A boundary is well placed when a typical product change lands inside a single service, and badly placed when adding one field to an invoice touches four repositories and requires a choreographed deployment order. Coupling and cohesion are one property observed from two sides: **weak cohesion inside a boundary is observable as tight coupling across it**, because the change that could not be contained has to cross the line.
 
-Now the spectrum, loosest to tightest.
+The four rungs follow, loosest first.
 
-## Domain coupling: fine, minimize anyway
+## Domain coupling: expected, still worth minimising
 
-**Domain coupling** is one service using another's functionality because the business domain demands it: Order Processor calls Warehouse to reserve stock and Payment to take money. This is unavoidable — it *is* the system working. It becomes a smell only in degree: a service that talks to everything (an Order Processor that also calls Loyalty, Fraud, Email, and Recommendations synchronously) is a sign logic is centralizing that belongs elsewhere. Mitigate with events — emit `OrderPlaced` and let interested parties subscribe — and by sending only what the callee needs, not your whole internal order object.
+**Domain coupling** is one service invoking another because the business domain requires it — an Order Processor calling Warehouse to reserve stock and Payment to take money. This is not a defect; it is the system performing its function. It becomes a signal only in degree: a service that synchronously calls Loyalty, Fraud, Email, and Recommendations in addition to Warehouse and Payment indicates that logic belonging to those domains has centralised in the caller. Two mitigations apply. **Emitting an event** such as `OrderPlaced` and letting interested services subscribe inverts the direction of knowledge — the emitter no longer names its consumers. **Sending only the fields the callee needs**, rather than the caller's whole internal order representation, narrows the surface whose change can break the callee.
 
-## Pass-through coupling: you're a courier
+## Pass-through coupling: the courier
 
-**Pass-through coupling** is a service passing data through itself untouched because a downstream service needs it. Example: Order Processor accepts a `ShippingManifest` from the UI and forwards it, unread, to Shipping. Now a change to Shipping's manifest format ripples through Order Processor — a service that doesn't even *use* the field must be redeployed for it.
+**Pass-through coupling** is a service transporting data through itself, untouched, because a service further downstream needs it. In the worked example, Order Processor accepts a `ShippingManifest` from the user interface and forwards it unread to Shipping. The failure mode is precise: **a change to Shipping's manifest format forces a release of Order Processor, a service that never reads the field**. The middleman's deployment cadence is now bound to a contract it does not participate in.
 
 ```text
 BEFORE  UI --{order, ShippingManifest}--> OrderProcessor --{ShippingManifest}--> Shipping
@@ -43,17 +43,53 @@ FIX B   UI talks to Shipping directly for the manifest concern
 FIX C   Treat the manifest as an opaque blob OrderProcessor never parses
 ```
 
-The real fix is A: **let the downstream service own its contract** and construct its own internal representations from meaningful domain fields. C at least stops the middleman from breaking when the format changes; B rearranges the domain coupling honestly.
+Fix A is the one Newman recommends: **the downstream service owns its contract** and constructs its internal representation from meaningful domain fields such as address and line items, which change on the domain's schedule rather than on Shipping's. Fix C removes the recompilation dependency without moving the ownership — Order Processor stops breaking when the format changes, but still carries data it cannot interpret. Fix B eliminates the hop by making the coupling between the user interface and Shipping direct and visible, converting pass-through coupling into domain coupling.
 
-## Common coupling: three writers, one row
+## Common coupling: several writers, one row
 
-**Common coupling** is multiple services reading and *writing* the same data — a shared `order_status` column, a shared config table, a shared file. Reads are survivable; writes are the poison. When Warehouse, Payment, and Fulfillment each flip order state, nobody owns the state machine: Warehouse can set `DESPATCHED` on an order Payment just moved to `PAYMENT_FAILED`, because no single place enforces which transitions are legal. You also get operational contention — every writer serializing on one hot row.
+**Common coupling** is multiple services reading and, critically, **writing** the same data: a shared `order_status` column, a shared configuration table, a shared file. Shared reads are survivable; shared writes are the failure. When Warehouse, Payment, and Fulfilment each set order state independently, **no single component enforces which transitions are legal**, so Warehouse can write `DESPATCHED` to an order that Payment has already moved to `PAYMENT_FAILED`. The state machine exists in the team's collective head and in no executable location. A second, operational cost accompanies the correctness one: every writer contends on the same row, serialising updates that have no logical reason to be ordered.
 
-Fix: the **single writer principle**. Exactly one service — Order — owns the status and its state machine. Everyone else *requests* a change through Order's API and can be told no ("invalid transition `PAYMENT_FAILED → DESPATCHED`"). The invariants get a home, and the schema underneath goes back to being hidden.
+The fix is the **single writer principle**. Exactly one service — Order — owns the status field and its transition rules. Other services *request* a transition through Order's application programming interface (API) and can be refused, with the rejection naming the illegal transition (`PAYMENT_FAILED → DESPATCHED`). Two properties follow: the invariants acquire a single home that can be tested, and the underlying schema returns to being hidden, restoring the information-hiding property that the shared column destroyed.
 
-## Content coupling: reaching into someone's DB
+### Implementation sketch (Scala)
 
-**Content coupling** is a service reaching into another's internals and modifying them directly — the canonical case being writing to another service's database tables, bypassing its API. It looks like common coupling but is worse in kind, not degree: with common coupling the shared thing is at least *known* to be shared; with content coupling, Order's team believes its schema is private and refactors it, and Finance's nightly job silently corrupts or crashes. All the validation Order's API performs is bypassed. Newman's verdict is blunt, and the rule is absolute: **never reach into another service's database.** If you need the data, ask for an API, subscribe to its events, or consume a published data product — anything that goes through a contract the owner deliberately exposed.
+The load-bearing part of the single writer principle is that the legal transition set is data owned by one service, and every external request is checked against it before any write occurs.
+
+```scala
+enum OrderStatus:
+  case Placed, PaymentFailed, Paid, Despatched, Cancelled
+
+final case class IllegalTransition(from: OrderStatus, to: OrderStatus)
+
+object OrderStateMachine:
+  import OrderStatus.*
+
+  // The only place in the system that knows which transitions exist.
+  private val allowed: Map[OrderStatus, Set[OrderStatus]] = Map(
+    Placed        -> Set(Paid, PaymentFailed, Cancelled),
+    PaymentFailed -> Set(Paid, Cancelled),   // a retried payment may still succeed
+    Paid          -> Set(Despatched, Cancelled),
+    Despatched    -> Set.empty,
+    Cancelled     -> Set.empty
+  )
+
+  def transition(from: OrderStatus, to: OrderStatus): Either[IllegalTransition, OrderStatus] =
+    if allowed.getOrElse(from, Set.empty).contains(to) then Right(to)
+    else Left(IllegalTransition(from, to))
+
+// Callers hold no write access to the column; they submit a requested target state.
+def requestTransition(orderId: String, to: OrderStatus): Either[IllegalTransition, OrderStatus] =
+  val current = loadStatus(orderId)              // owning service's own storage
+  OrderStateMachine.transition(current, to).map: next =>
+    storeStatus(orderId, expected = current, next = next)  // compare-and-set on the row
+    next
+```
+
+The compare-and-set on the stored value matters because `loadStatus` and `storeStatus` are not atomic together: **without the expected-value check, two concurrent requests can each read `Paid`, each find their target legal, and both write**, reproducing the lost-update behaviour the single writer was introduced to remove.
+
+## Content coupling: writing another service's database
+
+**Content coupling** is a service reaching into another service's internals and modifying them directly, the canonical instance being writes to another service's database tables that bypass its API. It resembles common coupling but differs in kind rather than degree. Under common coupling the shared item is *known* to be shared, so its owner expects other writers. Under content coupling **the owning team believes the schema is private and refactors it accordingly**, at which point the intruding job either fails or writes rows that violate constraints the API would have rejected — every validation the owner performs at its boundary is skipped. The rule Newman states is absolute: **do not reach into another service's database**. Data required from elsewhere is obtained through an API, an event subscription, or a published data product — some contract the owner exposed deliberately and therefore maintains.
 
 ## The ladder
 
@@ -62,8 +98,17 @@ Fix: the **single writer principle**. Exactly one service — Order — owns the
 | **Domain** | Order calls Warehouse's API | Loose — expected | Events over calls; send minimal payloads |
 | **Pass-through** | Order forwards Shipping's manifest unread | Moderate | Downstream owns its contract; or bypass/opaque blob |
 | **Common** | Several services write one shared table | Tight | Single writer owns state + invariants |
-| **Content** | Service writes another's DB directly | Tightest — never OK | An actual API, events, or data replication |
+| **Content** | Service writes another's DB directly | Tightest — never acceptable | An actual API, events, or data replication |
 
-The interview move is to name the rung. "We share a database" is ambiguous between common and content coupling, and the fixes differ: common coupling needs an owner appointed; content coupling needs the back door bricked up. And the test for whether any fix worked is cohesion's slogan run in reverse — after the change, does the code that changes together finally live together?
+Naming the rung is what makes the diagnosis actionable. "The services share a database" is ambiguous between common and content coupling, and the two remedies are different: common coupling requires an owner to be appointed for the shared state, whereas content coupling requires the unsanctioned access path to be removed. The test for whether a remedy worked is the cohesion slogan applied in reverse — after the change, does the code that changes together live together?
 
-**Try next:** grep your infrastructure for cross-service DB grants (`GRANT ... ON orders.* TO finance_svc`) — each one is content coupling in production today; pick the worst and replace it with an event subscription.
+A concrete audit follows from the definition of content coupling: cross-service database grants in the infrastructure configuration (`GRANT ... ON orders.* TO finance_svc`) are content coupling that is live in production, and each one is a candidate for replacement by an event subscription.
+
+## Pitfalls
+
+- **A shared read-only view is treated as safe and then acquires writers.** The read grant does not enforce read-only over time; once a second service writes through it, the state machine has no owner and illegal transitions become possible without any schema change to signal the shift.
+- **Pass-through coupling is "fixed" by making the payload opaque, and the domain problem is left in place.** The middleman stops recompiling, but the field still traverses a service that cannot validate it, so a malformed manifest is detected only at the final hop.
+- **The single writer is introduced without a compare-and-set.** Concurrent transition requests both read the same current state, both pass the legality check, and both write; the lost update looks identical to the common-coupling symptom the change was meant to remove.
+- **Events are added on top of the synchronous calls rather than replacing them.** The caller still names every consumer in its call graph, so the coupling is unchanged while the failure surface has grown by one asynchronous path.
+- **Full internal entities are published as event payloads.** Every field of the emitter's internal model becomes part of its public contract by consumption, and a field renamed for internal reasons breaks subscribers the emitter does not know about.
+- **Content coupling is discovered only when the owning team refactors.** The intruding job runs correctly for as long as the private schema happens to be stable, so the absence of failures is not evidence that the access path is sanctioned.

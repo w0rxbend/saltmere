@@ -2,8 +2,8 @@
 title: "Choreography vs orchestration: who owns the workflow?"
 date: 2026-08-13
 track: microservices
-summary: "Choreography lets services react to each other's events with no central brain; orchestration gives one component the workflow and lets it command the rest. The trade is coupling vs visibility — and the pragmatic answer is hybrid: orchestrate within a bounded context, choreograph between them."
-reading_time: 5
+summary: "Choreography lets services react to each other's events with no central component; orchestration gives one component the workflow and lets it command the rest. The trade is coupling against visibility, and the common compromise is hybrid: orchestrate within a bounded context, choreograph between them."
+reading_time: 7
 tags: [choreography, orchestration, sagas, event-driven, workflow]
 sources:
   - title: "Chris Richardson — Pattern: Saga (microservices.io)"
@@ -16,14 +16,18 @@ sources:
     url: "https://learn.microsoft.com/en-us/azure/architecture/patterns/choreography"
 ---
 
-A multi-service business flow needs coordination. There are exactly two places the coordination logic can live: **nowhere in particular** (choreography) or **somewhere specific** (orchestration).
+**Gist.** A business flow that spans several services needs its steps sequenced and its failures compensated, and that coordination logic has to be located somewhere. Choreography distributes it: each service publishes events and each interested service subscribes, so the flow exists only as the sum of subscriptions. Orchestration concentrates it in one component that issues commands and tracks progress, which buys a queryable workflow state at the price of a component that knows every participant's interface and must itself stay available.
 
-- **Choreography:** each service publishes *events* — facts about what happened — and other services subscribe and react. Nobody owns the flow; it *emerges* from subscriptions.
-- **Orchestration:** one component owns the flow and sends *commands* — imperatives — to participants, collects replies, and decides the next step.
+## The distinction is event versus command
 
-The event/command distinction is the tell. An event (`OrderPlaced`) is a past-tense fact that doesn't know or care who listens. A command (`ReserveInventory`) is an imperative that names its target and expects an answer. If your "events" name the receiver and demand action, you have built an orchestrator and called it choreography — a common design-review catch.
+The two styles differ in the kind of message that crosses the wire.
 
-## One flow, modeled both ways
+- **Choreography:** a service publishes an *event* — a past-tense fact, such as `OrderPlaced` — that does not name a recipient. Other services subscribe and react. No component owns the flow.
+- **Orchestration:** one component owns the flow and sends *commands* — imperatives such as `ReserveInventory` — to named participants, collects replies, and decides the next step.
+
+**The message shape is the reliable test, not the transport.** An event carries no addressee and no expectation of a reply; a command names its target and expects one. A system whose "events" name the receiver and demand an action is an orchestration with event-shaped naming, and the coupling it was meant to avoid is still present.
+
+## One flow, modelled both ways
 
 Order placement: charge payment, reserve inventory, arrange shipping.
 
@@ -60,28 +64,70 @@ Failure:  step 2 returns OutOfStock
           --> marks order rejected
 ```
 
-Same business flow, same failure case — but look where the failure logic sits. In choreography it's smeared across Payment and Order (each must know what `OutOfStock` means *for them*). In orchestration it's three consecutive lines in one state machine.
+The business flow and the failure case are identical; the location of the failure logic is not. **In the choreographed version the meaning of `OutOfStock` is encoded separately in Payment and in Order, each of which must interpret the event for itself. In the orchestrated version it is a single branch in one state machine.**
 
-## The actual trade-offs
+## The trade-offs
 
-**Visibility.** With an orchestrator, "where is order #42 stuck?" is a state lookup. With choreography it's a distributed-tracing archaeology dig: the workflow exists only in your head and in ten services' subscription lists. Azure's own write-up of the choreography pattern flags exactly this — the business flow becomes hard to monitor because no component knows it.
+**Visibility.** With an orchestrator, "where is order #42 stuck?" is a lookup of that instance's state. Under choreography **there is no component that holds the flow**, so the same question is answered only by reconstructing it from distributed traces and from the subscription lists of every participant. The Azure Architecture Center's write-up of the choreography pattern records this consequence directly: the overall business transaction becomes difficult to monitor because no single component is responsible for it.
 
-**Failure handling.** Orchestrators centralize timeouts, retries, and compensation ordering. In choreography, every service must handle every failure event that concerns it, and *compensations run in reverse order of a sequence no one wrote down*. Adding "cancel order" to the choreographed version touches four services; in the orchestrated one it's a new branch in the state machine.
+**Failure handling.** An orchestrator centralises timeouts, retries and — importantly — **compensation ordering**, because it holds the record of which steps have already committed. Under choreography each service must react to every failure event that concerns it, and the reverse-order unwinding is implicit in a sequence no artefact records. The cost shows up on change: adding a "cancel order" path to the choreographed flow touches every participant that has to react to it; in the orchestrated flow it is a new branch in one state machine.
 
-**Coupling.** Choreography wins here. Payment doesn't know Shipping exists. New consumers (fraud scoring, analytics, email) attach to `OrderPlaced` without anyone's permission. An orchestrator, by contrast, knows every participant's API and becomes a change bottleneck — and, done badly, a "distributed monolith brain" that reduces services to dumb CRUD endpoints.
+**Coupling.** Choreography is stronger here. Payment need not know that Shipping exists, and new consumers — fraud scoring, analytics, notification — attach to `OrderPlaced` without any change to the publisher. **An orchestrator, by contrast, holds a reference to every participant's interface**, so it changes whenever any participant's contract changes, and when it also absorbs the participants' decision logic the services degrade into create/read/update/delete endpoints.
 
-**Availability.** The orchestrator is one more thing that can be down mid-flow. This is exactly the problem durable-execution engines solve — [Temporal-style event-sourced workflow state](/articles/microservices/2026-07-31-temporal-durable-execution/) makes the orchestrator crash-proof rather than a single point of failure.
+**Availability.** The orchestrator is an additional component that can be unavailable partway through a flow. Durable-execution engines address this by persisting workflow state as an event history and replaying it after a crash; see [Temporal-style event-sourced workflow state](/articles/microservices/2026-07-31-temporal-durable-execution/).
 
 ## Mapping to sagas
 
-Both are coordination styles for the same underlying pattern: a [saga](/articles/microservices/2026-07-24-sagas-over-two-phase-commit/) — a sequence of local transactions with compensations instead of a distributed lock. Richardson names the two variants directly: *choreography-based sagas* (events trigger the next local transaction) and *orchestration-based sagas* (a saga orchestrator issues commands). His rule of thumb: choreography is fine for simple sagas with few steps; once the saga has real branching and compensation, orchestrate. Either way, every step still needs reliable event publication — the [transactional outbox](/articles/microservices/2026-07-26-transactional-outbox-pattern/) applies to both styles.
+Both styles are coordination mechanisms for the same underlying pattern: a [saga](/articles/microservices/2026-07-24-sagas-over-two-phase-commit/), a sequence of local transactions with compensating transactions in place of a distributed lock. Richardson names the two variants explicitly — **choreography-based sagas**, in which each local transaction publishes an event that triggers the next, and **orchestration-based sagas**, in which a saga orchestrator issues commands to participants. His guidance is that choreography suits simple sagas with few steps, and that sagas with branching and compensation are better orchestrated. Either style still requires that a local transaction and the publication of its event commit atomically, which is what the [transactional outbox](/articles/microservices/2026-07-26-transactional-outbox-pattern/) provides.
 
-## The hybrid reality
+## The hybrid position
 
-The clean interview answer is Yan Cui's: **orchestrate within a bounded context, choreograph between bounded contexts.** Inside "order fulfillment," the steps are one team's business logic — make the workflow explicit in an orchestrator you can read, test, and monitor. Between contexts — fulfillment, notifications, analytics, fraud — publish domain events and let other teams subscribe, because a central orchestrator spanning team boundaries couples their release cycles to yours.
+Yan Cui's formulation is to **orchestrate within a bounded context and choreograph between bounded contexts**. Within a context such as order fulfilment the steps are one team's business logic, and an explicit orchestrator makes that logic readable, testable and queryable. Across contexts — fulfilment, notification, analytics, fraud — domain events let other teams subscribe without a shared component, whereas an orchestrator spanning team boundaries couples those teams' release cycles to the orchestrator's.
 
-## Anti-pattern: pinball architecture
+### Implementation sketch (Scala)
 
-The failure mode to name is the **implicit workflow**: a ten-step business process expressed as ten consumers each reacting to the previous event — the request ricochets through the system like a pinball. Symptoms: nobody can draw the flow; onboarding requires reading every consumer; a "simple" reorder of two steps takes a multi-team change; and a stuck flow produces no error anywhere, just silence. If you find yourself *simulating* an orchestrator by passing growing "process state" inside events, the workflow wants to be explicit — write the state machine.
+A saga orchestrator is a fold over a step list that records committed steps so that compensation can run in reverse. The load-bearing part is the accumulator, not the transport.
 
-**Try next:** pick one multi-service flow you own and try to draw it end-to-end from the code alone, failure paths included. If you can't, that flow is choreographed by accident, not by choice — write the sequence down and decide deliberately which half deserves an orchestrator.
+```scala
+final case class Step(
+    name: String,
+    invoke: () => Either[String, Unit],
+    compensate: () => Unit
+)
+
+enum SagaResult:
+  case Committed
+  case Compensated(failedAt: String, reason: String)
+
+def runSaga(steps: List[Step]): SagaResult =
+  // `done` is the reverse-ordered record of steps that committed;
+  // without it the unwinding order is unknown when a later step fails.
+  // It lives in memory here, so a crash still loses it: a durable
+  // orchestrator persists the equivalent record.
+  def loop(remaining: List[Step], done: List[Step]): SagaResult =
+    remaining match
+      case Nil => SagaResult.Committed
+      case step :: rest =>
+        step.invoke() match
+          case Right(_)     => loop(rest, step :: done)
+          case Left(reason) =>
+            done.foreach(_.compensate())   // already reverse order
+            SagaResult.Compensated(step.name, reason)
+
+  loop(steps, Nil)
+```
+
+The choreographed equivalent has no `done` list: each participant infers from an incoming failure event whether its own step needs undoing, so the same ordering knowledge is spread across the participants rather than held in one accumulator.
+
+## Anti-pattern: the implicit workflow
+
+The failure mode worth naming is the **implicit workflow**: a process of many steps expressed as many consumers, each reacting to the event emitted by the previous one. **No artefact states the sequence**, so it can only be recovered by reading every consumer. The observable symptoms are a flow no one can draw, onboarding that requires reading all participants, a reordering of two steps that becomes a multi-team change, and a stalled flow that produces silence rather than an error, because the component that would have detected a missing reply does not exist. A related signal is a growing "process state" payload carried inside events: that payload is an orchestrator's state, held in messages instead of in a component.
+
+## Pitfalls
+
+- **Events that name their recipient.** A message called `OrderPlaced` whose payload includes the handler to run couples publisher to subscriber exactly as a command does, while losing the orchestrator's central state.
+- **Compensation without a commit record.** In a choreographed saga a participant that crashes between committing its local transaction and publishing its event leaves no record that the step happened, so no compensation is triggered for it; the transactional outbox exists to close this window.
+- **Compensations assumed to be ordered.** Failure events reach participants concurrently, so a refund may be issued before the inventory release it logically follows; correctness must not depend on an ordering the design does not enforce.
+- **The orchestrator absorbing participant logic.** When branch conditions that belong to a participant are encoded in the orchestrator, every rule change becomes a change to a component shared by all participants.
+- **A non-durable orchestrator.** An orchestrator holding workflow state only in memory loses in-flight flows on restart, and the participants that already committed their local transactions are never compensated.
+- **Retries without idempotency keys.** An orchestrator that re-sends a command after a timeout charges twice unless the participant deduplicates on a key supplied by the caller; the timeout says nothing about whether the first attempt committed.

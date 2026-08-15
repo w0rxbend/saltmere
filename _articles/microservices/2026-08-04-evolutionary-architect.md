@@ -1,9 +1,9 @@
 ---
-title: "The evolutionary architect: zone the city, don't design every building"
+title: "The evolutionary architect: zone the city, not every building"
 date: 2026-08-04
 track: microservices
-summary: "Sam Newman's town-planner metaphor reframes the architect's job from making decisions to setting principles and constraints, then guiding evolution. The practical half is making those constraints executable: here's a runnable ArchUnit fitness function that fails CI when one service reaches across a forbidden boundary."
-reading_time: 5
+summary: "Sam Newman's town-planner metaphor reframes the architect's job from making decisions to setting principles and constraints, then guiding evolution. The practical half is making those constraints executable: an ArchUnit fitness function that fails continuous integration when one service reaches across a forbidden boundary."
+reading_time: 7
 tags: [evolutionary-architecture, fitness-functions, archunit, governance, paved-road, microservices]
 sources:
   - title: "Building Microservices, 2nd ed. — Sam Newman (Ch. 16, The Evolutionary Architect)"
@@ -16,27 +16,35 @@ sources:
     url: "https://www.archunit.org/userguide/html/000_Index.html"
 ---
 
-The word "architect" carries a lie borrowed from the construction industry. A building architect produces a blueprint precise enough that a structure gets built once, correctly, and then stands mostly unchanged for fifty years. Software is not like that, and pretending it is produces the failure mode everyone recognises: an architect who tries to specify every class, every framework, every table up front, hands the drawing to teams, and then spends the next two years watching reality diverge from the picture and calling the divergence "technical debt."
+**Gist.** An architecture specified once, up front, diverges from the code the moment teams start building, and the divergence is invisible until someone reads the whole repository. Newman's *Evolutionary Architect* chapter replaces the blueprint with a small set of principles and constraints about what happens *between* services, and Ford, Parsons and Kua supply the enforcement mechanism: the **fitness function**, an automated check that answers "is this architectural characteristic still intact?" on every change. The cost is that every constraint worth holding must be reduced to something a machine can evaluate, and constraints that resist that reduction stay unenforced.
 
-Sam Newman, in the *Evolutionary Architect* chapter of *Building Microservices*, swaps the metaphor. The better model isn't the architect who designs one building; it's the **town planner**. A town planner does not decide what goes inside each house. They zone the city — this district is residential, this one industrial, here is where the water and power run — and then let the buildings within each zone come and go as the inhabitants see fit. In microservice terms, the zones are the services, and the planner's attention belongs to *what happens between the zones*, not inside them. You care intensely about how services talk to each other, about the pipes and the protocols; you stay deliberately liberal about what any one team does inside its own boundary. Newman's rule of thumb is that inside the box you should be relaxed, and about the box's edges you should be firm.
+The construction metaphor imported with the word "architect" assumes a blueprint precise enough that a structure is built once and then stands mostly unchanged. The corresponding software failure mode is an architect who specifies classes, frameworks and tables up front, hands the drawing to teams, and then reclassifies every subsequent deviation as technical debt.
+
+Newman substitutes the **town planner**. A planner does not decide what goes inside each house; the planner zones the city — residential here, industrial there, water and power along these routes — and lets buildings within a zone come and go. In microservice terms the zones are the services, and the planner's attention belongs to the traffic between zones rather than the contents of any one. Newman's rule of thumb: **be relaxed about what happens inside the box and firm about what happens at its edges**.
 
 ## From making decisions to setting constraints
 
-That reframing changes the job description. The architect stops being the person who makes the technical decisions and becomes the person who defines the space in which teams make their own. Newman splits that space into three tiers, and keeping them distinct is most of the discipline.
+The reframing changes the job description. The architect stops making the technical decisions and starts defining the space in which teams make their own. Newman splits that space into three tiers, and keeping them distinct is most of the discipline.
 
-**Principles** are the small set of rules — he suggests fewer than ten — that align with what the organisation is actually trying to achieve. "We favour services that can be deployed independently" is a principle. **Practices** are the concrete, changeable ways you honour a principle right now: use HTTP/JSON for synchronous calls, emit logs in this structured format, run each service in its own container. Practices churn as tools change; principles should outlive them. **Constraints** are the things you genuinely cannot move — a regulator's data-residency rule, the one mainframe you must integrate with, the language your platform team can realistically support. The value of naming a constraint is that you can then *challenge* it honestly, rather than mistaking a temporary limitation for a law of nature. (This is also where the architect's real leverage over Conway's Law lives: the constraints you set on inter-service communication quietly shape the org that grows around them.)
+**Principles** are the small set of rules — he suggests around ten or fewer — aligned with what the organisation is trying to achieve. "Services must be independently deployable" is a principle. **Practices** are the concrete, changeable ways a principle is honoured at present: HTTP with JSON for synchronous calls, a specified structured log format, one container per service. Practices churn as tooling changes; principles are meant to outlive them. **Constraints** are the immovable facts — a regulator's data-residency rule, a mainframe that must be integrated with, the languages a platform team can support. Naming a constraint makes it available to be challenged, which distinguishes a temporary limitation from a fixed one.
+
+The tiers fail when they are conflated. A practice mislabelled as a principle freezes a tool choice for years; a temporary limitation mislabelled as a constraint is never re-examined.
 
 ## The paved road
 
-Principles that live in a wiki get ignored. The move Newman pushes is to make the right way the *easy* way — what platform teams now call a **paved road** or golden path. Instead of a document telling teams to add health checks, metrics, structured logging and a circuit breaker, you ship an **exemplar** service that already has all of it, and a **service template** teams generate from. A team that takes the paved road gets observability and resilience for free; a team with an unusual need can still leave the road, they just carry the cost of paving their own. Governance stops being a review meeting and becomes something baked into the tools people already use.
+Principles that live only in a wiki are not enforced by anything. The mechanism Newman pushes is to make the correct path the path of least resistance — what platform teams call a **paved road** or golden path. Rather than a document instructing teams to add health checks, metrics, structured logging and a circuit breaker, the platform ships an **exemplar** service that already contains them and a **service template** from which teams generate new services. A team on the paved road inherits observability and resilience; a team with an unusual requirement may leave the road and absorb the cost of paving its own. Governance moves out of the review meeting and into the tooling teams already run.
+
+The paved road covers what can be pre-packaged inside a service. It does not cover relationships *between* services, because no template can observe what a team imports six months later. That gap is what fitness functions close.
 
 ## Make the architecture testable
 
-Here is the part that separates aspiration from architecture. A principle you cannot check is a suggestion. Ford, Parsons and Kua, in *Building Evolutionary Architectures*, give the missing mechanism: the **fitness function**, borrowed from evolutionary computing. Their definition is deliberately plain — a fitness function "provides an objective integrity assessment of some architectural characteristic(s)." It answers, for one quality you care about, the question "are we still okay?" with a number or a pass/fail, automatically, on every change. They classify them along several axes — atomic versus holistic, triggered versus continual, static versus dynamic, automated versus manual — but the ones that actually protect an architecture are the automated, continual kind that run in CI and go red the moment someone drifts.
+A principle that cannot be checked is a suggestion. Ford, Parsons and Kua define a fitness function as something that "provides an objective integrity assessment of some architectural characteristic(s)" — for one quality, a pass/fail or a number, produced automatically. They classify fitness functions along several axes: **atomic versus holistic** (one characteristic in isolation versus several in combination), **triggered versus continual**, **static versus dynamic**, and **automated versus manual**. The variants that protect a boundary in practice are the **automated, triggered ones wired into continuous integration**, because they turn red at the commit that causes the drift rather than at the audit months later.
 
-Newman's principles map straight onto this. "Services must not reach into each other's internals" isn't a paragraph in a standards doc; it's a test. On the JVM, the cleanest way to write that test is **ArchUnit** — a library that imports your compiled bytecode as data and lets you assert rules about packages and dependencies as ordinary JUnit tests.
+Newman's principles map onto this directly. "Services must not reach into each other's internals" is expressible as a test. On the Java Virtual Machine (JVM) the mechanism is **ArchUnit**, a library that imports compiled bytecode as data and evaluates rules about packages and dependencies inside ordinary JUnit tests.
 
-Suppose your codebase is organised by bounded context — `com.acme.orders`, `com.acme.payments`, and so on — and the principle is that a context's `internal` package is private: other contexts talk to it only through its published API or via events. Encode it:
+Working on bytecode rather than source is the load-bearing property: **the rule sees the dependency edges the compiler emitted**, including those introduced through field types, method signatures, thrown exceptions and constant references, not only the ones visible as import statements.
+
+Given a codebase organised by bounded context — `com.acme.orders`, `com.acme.payments` — with the invariant that a context's `internal` package is reachable only through that context's published application programming interface (API) or via events:
 
 ```java
 package com.acme.arch;
@@ -71,8 +79,52 @@ public class ArchitectureFitnessTest {
 }
 ```
 
-`@AnalyzeClasses` tells ArchUnit which packages to import (skipping test classes); each `@ArchTest` field is a rule evaluated against the real bytecode. The first rule fails the build the instant any class outside `payments` imports, calls, or even references a type in `payments.internal`. The second uses ArchUnit's slice API to carve the code into one slice per context and assert there are no dependency cycles between them — the structural knot that quietly turns a distributed system back into a distributed monolith.
+`@AnalyzeClasses` selects the packages to import and excludes test classes; each `@ArchTest` field is a rule evaluated against the imported bytecode. The first rule fails as soon as any class outside `com.acme.payments` depends on a type in `com.acme.payments.internal`. The second uses the slice API to partition the code into one slice per context and asserts the absence of dependency cycles between slices — a cycle between two contexts means neither can be changed or released without regard for the other.
 
-Wire this into CI as a normal test and the effect is that the principle now has teeth. A pull request that violates the boundary goes red before review, with a message naming the offending class and the exact forbidden access. The architect wrote the rule once; the pipeline enforces it on every commit forever, with no meeting. That is the whole shift Newman is arguing for, made concrete: you stopped policing an unwritten intention and started running an executable one, and the architecture is now free to evolve *underneath* a constraint that holds.
+Run as a normal test in the pipeline, the rule fails a pull request before review, naming the offending class and the forbidden access. The architect states the constraint once; the pipeline evaluates it on every commit. The architecture remains free to evolve underneath a constraint that continues to hold.
 
-**Try next:** Pick the one cross-service boundary in your codebase you most wish people would stop crossing. Add `archunit-junit5` to a module, write a single `noClasses().that()...should().dependOnClassesThat()...` rule for it, and run it against `main` — if it's already red, you've just found your first fitness function's backlog; if it's green, you've locked the boundary in before it rots.
+### Implementation sketch (Scala)
+
+The cycle check is a strongly connected component search over the slice graph. Tarjan's algorithm finds every cycle in **O(V + E)** for V slices and E inter-slice edges:
+
+```scala
+type Slice = String
+
+/** Returned components with more than one member are dependency cycles. */
+def stronglyConnected(edges: Map[Slice, Set[Slice]]): List[Set[Slice]] =
+  var index = 0
+  val idx, low = scala.collection.mutable.Map.empty[Slice, Int]
+  val onStack = scala.collection.mutable.Set.empty[Slice]
+  val stack = scala.collection.mutable.Stack.empty[Slice]
+  val out = scala.collection.mutable.ListBuffer.empty[Set[Slice]]
+
+  def visit(v: Slice): Unit =
+    idx(v) = index; low(v) = index; index += 1
+    stack.push(v); onStack += v
+    for w <- edges.getOrElse(v, Set.empty) do
+      if !idx.contains(w) then
+        visit(w)
+        low(v) = low(v) min low(w)
+      // an edge to a node still on the stack closes a cycle
+      else if onStack(w) then low(v) = low(v) min idx(w)
+    if low(v) == idx(v) then
+      val component = Set.newBuilder[Slice]
+      var w = stack.pop(); onStack -= w; component += w
+      while w != v do
+        w = stack.pop(); onStack -= w; component += w
+      out += component.result()
+
+  edges.keys.foreach(v => if !idx.contains(v) then visit(v))
+  out.result().filter(_.size > 1)
+```
+
+A slice with a self-edge is excluded by the `size > 1` filter, so intra-context dependencies do not register as violations.
+
+## Pitfalls
+
+- A rule written against source-level imports misses dependencies created by field types, method return types and thrown exception types; the boundary reads as clean while the bytecode carries the edge.
+- A fitness function added to a codebase that already violates it fails on the first run, and the common response — deleting the rule — leaves the boundary permanently unguarded. The alternative is to freeze the existing violations explicitly and forbid new ones.
+- A practice recorded as a principle outlives the tool it names: the transport or log format becomes non-negotiable years after the reason for choosing it has gone.
+- Package-level rules do not constrain runtime coupling. Two contexts with no compile-time dependency can still be knotted together through a shared database table or a synchronous call built from a string URL, and no bytecode rule observes either.
+- Cycle detection over slices reports the component, not the single edge that closed it; a component of eight contexts gives no indication of which recent dependency introduced the cycle.
+- Constraints that resist automation — data residency, vendor lock-in — remain manual checks, and an architecture whose enforced rules are exactly the automatable ones drifts along every axis nobody could encode.

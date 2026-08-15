@@ -2,7 +2,7 @@
 title: "WASI Preview 2 and the Component Model: Portable Services Without a Container"
 date: 2026-08-14
 track: microservices
-summary: "WASI 0.2 gave WebAssembly a real host interface and the Component Model gave it polyglot composition. With WASI 0.3 shipping native async in June 2026 and Wasmtime at v47, you can run capability-secured services with millisecond cold starts — no container image required. Here's the current state and how to run one."
+summary: "WASI 0.2 gave WebAssembly a typed host interface and the Component Model gave it polyglot composition. WASI 0.3, launched June 2026, moves async into the canonical ABI. A survey of the mechanism, the capability model it enforces, and the ecosystem cost of adopting it."
 reading_time: 6
 tags: [webassembly, wasi, component-model, wasmtime, spin, wit]
 sources:
@@ -18,15 +18,19 @@ sources:
     url: "https://wasmcloud.com/blog/wasi-preview-2-officially-launches/"
 ---
 
-A container ships an entire userland to run one process. A WebAssembly component ships a sandboxed module that imports exactly the host capabilities it declares and nothing else. For a microservice that does one job, the second model is smaller, starts in milliseconds, and is deny-by-default secure. WASI 0.2 (Preview 2), launched in January 2024, is what made that practical for real services; the Component Model is what makes those services composable across languages.
+**Gist.** A container image ships an entire userland in order to run one process, and the process it runs holds whatever ambient authority the kernel and the image grant it. A WebAssembly component instead ships a sandboxed module whose imports enumerate every host capability it can reach, so authority is a property of the module's type signature rather than of a policy layer applied afterwards. The cost is ecosystem maturity: guest toolchains, debuggers and long-running stateful workloads are all better served by a conventional operating system today.
 
-## What WASI Preview 2 actually changed
+## What WASI 0.2 changed
 
-WASI 0.1 was a flat list of POSIX-ish syscalls baked into a module's imports. WASI 0.2 rebuilt the interface on top of the **Component Model**: capabilities are now typed interfaces — `wasi:cli`, `wasi:http`, `wasi:filesystem`, `wasi:sockets` — that a component *imports* by name. Nothing is ambient. If a component never imports `wasi:sockets`, it physically cannot open a socket. As the Wasmtime docs put it, "by default, Wasmtime denies the component access to all system resources" — you grant filesystem or env access explicitly at launch. That is capability-based security enforced by the ABI, not by a policy layer bolted on top.
+The WebAssembly System Interface (WASI) 0.1 exposed a flat list of POSIX-shaped system calls compiled directly into a module's import list. WASI 0.2 — also called Preview 2, launched in January 2024 — rebuilt that interface on top of the **Component Model**, so that capabilities became typed interfaces named and versioned like packages: `wasi:cli`, `wasi:http`, `wasi:filesystem`, `wasi:sockets`.
 
-## WIT: the interface, not the implementation
+The load-bearing consequence is that **nothing is ambient**. A component that does not import `wasi:sockets` has no instruction sequence available to it that opens a socket; there is no descriptor table to guess at and no syscall number to invoke, because the linear-memory sandbox contains no path to the host except through resolved imports. The Wasmtime documentation describes the default as denying the component access to host resources, with filesystem and environment access granted explicitly at launch. Capability enforcement therefore lives in the application binary interface (ABI) and in the link step, not in a runtime check that a bug could bypass.
 
-Components describe their boundary in **WIT** (Wasm Interface Type). A `world` is the full contract — what a component imports and exports; an `interface` groups typed functions and records. This is the polyglot glue: a Rust component and a Go component that agree on a WIT world can be linked without either knowing the other's language.
+The invariant to hold onto: **an unlinkable import is a load-time failure, not a runtime denial**. If a host refuses to supply an interface a component declares, instantiation fails before the first guest instruction executes. That converts a class of permission errors from an intermittent production fault into a deterministic deployment-time one.
+
+## WIT: the boundary, not the implementation
+
+Components describe their boundary in **WIT** (Wasm Interface Type). A `world` is the complete contract — everything a component imports and everything it exports. An `interface` groups typed functions and records that a world can reference. Because both sides of a link are described in the same type language, a Rust component and a Go component that agree on a world can be linked without either knowing the other's source language or memory layout.
 
 ```wit
 package saltmere:pricing@1.0.0;
@@ -37,46 +41,54 @@ interface pricing {
 }
 
 world service {
-    import wasi:http/incoming-handler@0.2.0;
+    export wasi:http/incoming-handler@0.2.0;
     export pricing;
 }
 ```
 
-Compile any language that has a component toolchain (Rust, Go via TinyGo, Python, JS via `jco`, C) against that world and you get a `.wasm` component with a machine-checkable interface — no shared SDK, no gRPC stubs to regenerate by hand.
+Any language with a component toolchain — Rust, Go via TinyGo, Python, JavaScript via `jco`, C — compiles against that world and produces a `.wasm` component carrying a machine-checkable interface. No shared software development kit (SDK) is required on both sides, and no gRPC stubs have to be regenerated by hand when the record gains a field.
 
 ## Running one, and composing many
 
-Wasmtime (v47 as of August 2026) runs a component directly. There is no image to build or registry to pull — the artifact is the `.wasm` file:
+Wasmtime runs a component directly. The artifact is the `.wasm` file; there is no image to build and no registry to pull from.
 
 ```sh
-# deny-by-default: this component gets no FS, no env, no network
+# deny-by-default: no filesystem, no environment, no network
 wasmtime run ./pricing.wasm
 
-# grant only what it needs
+# grant exactly the two capabilities the component declares
 wasmtime run --dir ./data --env TIER=prod ./pricing.wasm
 
-# serve an HTTP component (wasi:http)
+# serve a component whose world exports wasi:http/incoming-handler
 wasmtime serve ./pricing.wasm
 ```
 
-Composition happens *before* runtime with `wac`: link a component that exports `pricing` into one that imports it, producing a single fused component with no network hop between them.
+The first and second invocations run **the same bytes**; the difference is entirely in which host implementations are supplied at instantiation. That property is what makes the security boundary auditable — the grant list is on the command line, not distributed through the guest's source.
+
+Composition happens *before* runtime, with `wac`. Linking a component that exports `pricing` into a component that imports it yields a single fused component:
 
 ```sh
 wac plug ./checkout.wasm --plug ./pricing.wasm -o ./app.wasm
 ```
 
-Higher-level platforms build on the same primitives. **Fermyon Spin 3.0** wraps this into a serverless developer flow (`spin new`, `spin up`), and **wasmCloud** distributes components across a mesh with capabilities supplied by pluggable host "providers." Fermyon's Spin runtime was acquired by Akamai and now runs Wasm Functions at edge scale — the pitch throughout is the same: cold starts in single-digit milliseconds because there's no OS to boot, just a module to instantiate.
+The fused artifact contains no network hop between the two halves: what was a call across a service boundary becomes a call across a component boundary, resolved at link time. The corresponding loss is that **the two halves now share a deployment and a version**, so an independent rollback of one is no longer possible without re-plugging and redeploying the pair.
+
+Higher-level platforms build on the same primitives rather than replacing them. **Fermyon Spin 3.0** wraps the flow in a serverless developer experience (`spin new`, `spin up`), and **wasmCloud** distributes components across a mesh with capabilities supplied by pluggable host providers. The claim common to all of these is millisecond-scale cold start, on the grounds that instantiation initialises a module rather than booting an operating system.
 
 ## WASI 0.3 and native async
 
-The big 2026 milestone: **WASI 0.3 launched June 11, 2026**, adding native async to the Component Model. Preview 2's async story was a manual `start`/`finish`/`subscribe` poll dance. WASI 0.3 puts `stream<T>`, `future<T>`, and `async func` directly in the canonical ABI, so — per the Bytecode Alliance — "the runtime, not each component, drives the scheduling," letting components share one host event loop. Wasmtime 46+ ships WASI 0.3 with async enabled by default; you opt in at the CLI:
+**WASI 0.3 launched in June 2026**, adding native asynchrony to the Component Model. Under 0.2, concurrency was expressed through the poll-based primitives of `wasi:io`, with each guest driving its own polling loop. WASI 0.3 places `stream<T>`, `future<T>` and `async func` directly in the canonical ABI, so that scheduling is driven by the runtime rather than open-coded in every guest.
 
-```sh
-wasmtime run -Sp3 -W component-model-async=y ./pricing.wasm
-```
+Wasmtime ships WASI 0.3 support behind an opt-in flag rather than as the default target.
 
-WASI 0.2 remains the stable, widely-supported target — most guest toolchains and platforms speak 0.2 today, with 0.3 guest support still rolling out language by language. For production services in 2026, target 0.2 and watch 0.3 land.
+WASI 0.2 remains the stable and widely supported target: most guest toolchains and hosting platforms speak 0.2 today, and 0.3 guest support is arriving language by language. For services deployed in 2026 the conservative target is 0.2.
 
-The trade-offs are real: the guest-toolchain ecosystem is younger than containers', debugging tools are thinner, and long-running stateful workloads still favor a full OS. But for stateless, security-sensitive, fast-scaling services — request handlers, plugins, edge functions — a WASI component is a smaller and tighter unit of deployment than an image.
+The trade-offs remain material. The guest-toolchain ecosystem is younger than the container ecosystem, debugging tooling is thinner, and long-running stateful workloads are still better served by a full operating system. For stateless, security-sensitive, fast-scaling units — request handlers, plugins, edge functions — a component is a smaller and more tightly bounded deployment unit than an image.
 
-**Try next:** install `wasmtime` and `cargo component`, write the `world` above, and run the resulting `.wasm` twice — once plain and once with `--dir` — to watch capability-based security deny and then grant filesystem access.
+## Pitfalls
+
+- **A component whose world imports an interface the host does not supply fails at instantiation.** WIT identifiers carry package versions, and linking matches on the versioned name, so a version or shape mismatch surfaces as a load-time error rather than as a degraded runtime path.
+- **Granting `--dir ./data` grants the whole subtree.** The preopened directory is the unit of filesystem capability; there is no finer per-file restriction at the command line, so a secret placed inside the granted subtree is readable.
+- **Assuming 0.2 concurrency composes like 0.3 concurrency.** Under 0.2 each guest drives its own polling loop, so two composed components can each block progress of the other's I/O; the shared-scheduler property is a 0.3 addition.
+- **Plugging with `wac` erases independent deployability.** After fusion the exporter and importer are one artifact, so patching the exporter requires rebuilding and redeploying the fused binary.
+- **Cold-start figures cited for platforms measure instantiation, not the full request path.** Module instantiation excludes connection setup, capability provisioning by the host and any guest-side initialisation the component performs on first request.

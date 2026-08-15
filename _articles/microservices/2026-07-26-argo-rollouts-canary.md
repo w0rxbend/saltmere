@@ -2,8 +2,8 @@
 title: "Progressive delivery with Argo Rollouts: canary deploys that promote or roll back on their own"
 date: 2026-07-26
 track: microservices
-summary: "Replace the Kubernetes Deployment with a Rollout CRD to ship canaries that shift traffic in weighted steps, query Prometheus between steps, and auto-abort when the numbers look wrong — no human at the promote button."
-reading_time: 5
+summary: "The Rollout custom resource replaces the Kubernetes Deployment to ship canaries that shift traffic in weighted steps, query Prometheus between steps, and abort automatically when a success condition is breached."
+reading_time: 6
 tags: [progressive-delivery, canary, argo-rollouts, kubernetes, prometheus, analysis]
 sources:
   - title: "Argo Rollouts Releases (GitHub)"
@@ -18,13 +18,13 @@ sources:
     url: "https://samnewman.io/books/building_microservices_2nd_edition/"
 ---
 
-A rolling update is binary at the level that matters: once a new pod passes its readiness probe, it takes full production traffic. If the regression only shows up under real load — a p99 that creeps, an error rate that climbs at 3% of requests — the rollout keeps marching and you find out from your pager.
+**Gist.** A Kubernetes rolling update is binary at the level that matters: once a new pod passes its readiness probe it receives full production traffic, so a regression that appears only under real load is discovered by an alert rather than by the release process. Argo Rollouts replaces the `Deployment` with a `Rollout` custom resource (CR) whose canary strategy advances through **declared traffic weights** and, between weights, runs metric queries whose verdict promotes or aborts the release. The cost is that the release now has duration measured in the analysis interval times the measurement count, and that **the correctness of the gate is entirely the correctness of the query** written into an `AnalysisTemplate`.
 
-Progressive delivery is the fix. James Governor of RedMonk coined the term in 2018, framing it as "Continuous Delivery++": you deploy to a small slice of traffic, control the *blast radius*, watch the metrics, then widen. Sam Newman folds the same idea into the deployment chapter of *Building Microservices* — canary release and parallel run as ways to decouple deployment from release. Argo Rollouts is the Kubernetes controller that automates the loop.
+James Governor of RedMonk named *progressive delivery* in a 2018 post, framing it as continuous delivery extended with control over the blast radius: release to a small slice of traffic, observe, then widen. Sam Newman treats the same idea in the deployment chapter of *Building Microservices* (2nd ed.), where canary release and parallel run are mechanisms for decoupling deployment from release. Argo Rollouts is the Kubernetes controller that automates the loop.
 
-## The Rollout CRD replaces your Deployment
+## The Rollout resource replaces the Deployment
 
-Argo Rollouts (current stable on the **v1.9** line, released March 2026) ships a controller plus a `Rollout` custom resource that is a near drop-in for a `Deployment`: same `replicas`, `selector`, and `template`. What changes is `spec.strategy` — instead of `RollingUpdate` you declare `canary` (or `blueGreen`), and the controller manages two ReplicaSets, shifting traffic between them.
+Argo Rollouts ships a controller plus a `Rollout` custom resource that is a near drop-in replacement for a `Deployment`: the same `replicas`, `selector` and `template` fields. What differs is `spec.strategy`. In place of `RollingUpdate` the resource declares `canary` (or `blueGreen`), and the controller manages **two ReplicaSets — stable and canary — shifting traffic between them** rather than replacing pods in place.
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -60,19 +60,19 @@ spec:
             templates:
               - templateName: success-rate
         - setWeight: 50
-        - pause: {}          # pause with no duration = wait for manual promote
+        - pause: {}          # pause with no duration: wait for manual promote
         - setWeight: 100
 ```
 
-`setWeight` tells the traffic router what percentage of requests hit the canary. `pause` with a `duration` waits and moves on; `pause: {}` with no duration halts until a human runs `kubectl argo rollouts promote checkout`. Between weight bumps you drop in an `analysis` step — that is where the automation earns its keep.
+The step list is the state machine. `setWeight` instructs the traffic router what percentage of requests reaches the canary. `pause` with a `duration` waits for that interval and then advances; **`pause: {}` with no duration halts indefinitely** until an operator runs `kubectl argo rollouts promote checkout`. An `analysis` step interposes a metric verdict between two weights.
 
 ## Traffic shaping is delegated, not simulated
 
-Without a traffic router, the canary weight is approximated by pod count (5% ≈ 1 of 20 replicas). That is coarse and wasteful. Point `trafficRouting` at a mesh or ingress — Istio, Linkerd, NGINX, AWS ALB, Gateway API — and Argo Rollouts writes the actual weight into that provider's config. In the example above it patches the Istio `VirtualService` so the mesh splits requests 5/95 between the `checkout-canary` and `checkout-stable` services. Real traffic, real percentages, no extra pods spun up just to hit a ratio.
+Without a traffic router the canary weight is approximated by pod count: **5% is realised as one replica out of twenty**, so the achievable granularity is bounded below by `1/replicas` and small weights force extra pods into existence purely to hit a ratio. Configuring `trafficRouting` against a supported provider — among them Istio, NGINX, AWS Application Load Balancer (ALB) and the Service Mesh Interface (SMI), with further providers such as Gateway API available as plugins — makes the controller write the weight into that provider's own configuration instead. In the example above it patches the Istio `VirtualService` so the mesh splits requests 5/95 between the `checkout-canary` and `checkout-stable` services, independently of how many pods back each one.
 
 ## AnalysisTemplate turns metrics into a promote/abort decision
 
-An `AnalysisTemplate` is a reusable query-and-verdict spec. At each `analysis` step the controller spawns an `AnalysisRun` that polls a metric provider on an interval and compares results against a condition. Here is a Prometheus-backed success-rate check:
+An `AnalysisTemplate` is a reusable query-and-verdict specification. At each `analysis` step the controller creates an `AnalysisRun`, which polls a metric provider on a fixed interval and evaluates each result against a condition expression.
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -96,16 +96,25 @@ spec:
             sum(rate(http_requests_total{app="checkout"}[2m]))
 ```
 
-The mechanics: each measurement runs the PromQL, `successCondition` decides pass/fail, and every failing reading increments a counter. Cross `failureLimit` and the `AnalysisRun` goes **Failed** — the controller aborts the rollout, shifts traffic back to 100% stable, and marks the Rollout **Degraded**. Stay under it for all `count` measurements and the run is **Successful**, so the canary proceeds to the next step. No dashboards watched, no manual judgment call — the SLO *is* the gate.
+The mechanism is a counting rule over a bounded number of samples. Each measurement executes the PromQL query; `successCondition` classifies the result as pass or fail; **every failing measurement increments a failure counter**. Once that counter exceeds `failureLimit` the `AnalysisRun` enters the terminal state **Failed**, and the controller aborts the rollout: traffic returns to 100% stable and the `Rollout` is marked **Degraded**. If the counter stays at or below the limit across all `count` measurements, the run terminates **Successful** and the canary advances to the next step. With `interval: 1m` and `count: 5` the step therefore occupies roughly five minutes of wall-clock time, and the earliest possible abort is after `failureLimit + 1` failing measurements — three of the five in this configuration.
 
-Two patterns worth knowing. Run analysis in the *background* (`strategy.canary.analysis` rather than a step) to monitor continuously across every weight, aborting the moment metrics degrade instead of only at checkpoints. And parameterize templates with `args` (e.g. `service-name`) so one `AnalysisTemplate` serves every service in the fleet.
+Two structural variants are worth naming. Placing the analysis at `strategy.canary.analysis` rather than in a step runs it **in the background across every weight**, so degradation is detected between checkpoints rather than only at them. Parameterising a template with `args` — for example a `service-name` argument substituted into the query — lets one `AnalysisTemplate` serve many services instead of one copy per service.
 
-Watch it live:
+The controller's progress is observable from the plugin:
 
 ```bash
 kubectl argo rollouts get rollout checkout --watch
 ```
 
-You'll see each step, the current weight, and the `AnalysisRun` verdict stream past — and, when a metric breaches, the automatic rollback happen without you touching anything.
+The output reports the current step, the current weight, and the state of each `AnalysisRun`, including the transition to `Degraded` when a metric breaches its condition.
 
-**Try next:** Deploy the `checkout` Rollout above against a local `kind` cluster with the Argo Rollouts plugin and a Prometheus, then push an image build that returns HTTP 500 on ~5% of requests. Watch `kubectl argo rollouts get rollout checkout --watch` catch the breached `successCondition`, abort at 20% weight, and revert to stable — then flip the query to a latency histogram (`histogram_quantile(0.95, ...)`) and gate on p95 instead.
+**Try next:** deploy the `checkout` Rollout above against a local `kind` cluster running the Argo Rollouts plugin and a Prometheus, then push an image that returns HTTP 500 on approximately 5% of requests. The watch command shows the breached `successCondition`, the abort at 20% weight, and the reversion to stable. Substituting a latency histogram query (`histogram_quantile(0.95, ...)`) converts the same gate into a p95 latency budget.
+
+## Pitfalls
+
+- **A weight below `1/replicas` is unattainable without a traffic router.** `setWeight: 5` against eight replicas cannot be expressed in pod counts, so the realised split differs from the declared one and the analysis measures a different exposure than intended.
+- **A query that does not distinguish canary from stable pods measures the fleet average.** With 5% of traffic on a broken canary, a fleet-wide success rate barely moves and the `successCondition` never trips; the label selectors must isolate the canary workload.
+- **Short PromQL ranges over low-traffic services return no data or a noisy ratio.** A `rate(...[2m])` window on a service receiving few requests per minute yields measurements dominated by sampling noise, producing both spurious aborts and missed regressions.
+- **`pause: {}` blocks the rollout indefinitely.** A step with no `duration` waits for an explicit `promote` command, so an unattended pipeline stops there rather than completing.
+- **An abort returns traffic to stable but leaves the `Rollout` Degraded.** The failed revision is not reverted by deleting anything; the resource remains in the degraded state until a new revision is applied or the rollout is explicitly undone.
+- **Background analysis and step analysis have different abort points.** An analysis declared only as a step observes nothing during the weights between steps, so a regression appearing at 50% weight is not detected until the next `analysis` step is reached.

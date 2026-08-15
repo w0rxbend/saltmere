@@ -2,7 +2,7 @@
 title: "Design a Rate Limiter: Five Algorithms and the Distributed Problem"
 date: 2026-08-10
 track: microservices
-summary: "The canonical system-design question, answered. Fixed-window, sliding-window log, sliding-window counter, token bucket, and leaky bucket — what each gets right, where each leaks, and how you enforce one global limit across a fleet with an atomic Redis script instead of a race."
+summary: "Fixed-window, sliding-window log, sliding-window counter, token bucket, and leaky bucket — what each enforces, where each leaks, and how one global limit is held across a fleet with an atomic Redis script rather than a read-modify-write race."
 reading_time: 7
 tags: [rate-limiting, system-design, redis, token-bucket, sliding-window, distributed-systems]
 sources:
@@ -10,7 +10,7 @@ sources:
     url: "https://blog.cloudflare.com/counting-things-a-lot-of-different-things/"
   - title: "Stripe — Scaling your API with rate limiters"
     url: "https://stripe.com/blog/rate-limiters"
-  - title: "IETF draft-ietf-httpapi-ratelimit-headers-11 — RateLimit header fields for HTTP"
+  - title: "IETF draft-ietf-httpapi-ratelimit-headers — RateLimit header fields for HTTP"
     url: "https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers"
   - title: "Redis Docs — Rate limiter patterns (INCR / token bucket)"
     url: "https://redis.io/docs/latest/develop/use-cases/rate-limiter/"
@@ -18,85 +18,91 @@ sources:
     url: "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429"
 ---
 
-"Design a rate limiter" is the interview question that looks like a five-minute answer and turns into forty. Anyone can say "token bucket." The signal the interviewer wants is whether you know *why* a fixed-window counter lets 2x traffic through at the window edge, when the memory cost of exact counting is worth it, and how you make one shared limit hold across fifty stateless instances without them racing each other. This article is the algorithm-comparison answer. If you want the operational side — when to shed load and return 503 instead of 429 — see the companion piece, [rate limiting and load shedding](/articles/microservices/2026-07-31-rate-limiting-load-shedding-token-bucket/).
+**Gist.** A rate limiter must answer one boolean per request — admit or reject — under a limit that is defined over a time window and, in a fleet, shared by every instance. The five classic algorithms differ in how much state per key they retain and therefore how faithfully they reproduce a true rolling window; enforcing the decision globally requires that read, update and decision happen as one indivisible operation. The cost is a network round-trip per request to a shared store, or, if that round-trip is refused, a limit that is only approximately global.
 
-## What a rate limiter actually decides
+The operational counterpart — when to shed load and return 503 rather than 429 — is treated in [rate limiting and load shedding](/articles/microservices/2026-07-31-rate-limiting-load-shedding-token-bucket/).
 
-For each incoming request keyed by some identity (API key, user ID, IP), the limiter answers one boolean: *allow or reject*. Everything else — the algorithm, the storage, the headers — is machinery around that boolean and the trade-off it encodes: **accuracy versus cost**. An exact limiter never admits the N+1th request in any window; a cheap limiter admits it sometimes and saves you memory or a network hop in exchange. There is no free lunch, only a lunch you have chosen.
+## What the limiter decides
+
+For each request keyed by an identity (application programming interface key, user identifier, internet protocol address), the limiter returns *allow* or *reject*. The algorithm, the storage and the response headers are machinery around that boolean and around the trade-off it encodes: **accuracy against cost**. An exact limiter never admits the N+1th request within any window position. A cheaper limiter admits it under some arrival patterns and returns memory or a network hop in exchange.
 
 ## The five classic algorithms
 
 ### 1. Fixed-window counter
 
-Bucket time into fixed intervals — say each calendar minute — and keep one integer per key per window. Increment on each request; reject when the count exceeds the limit; the counter resets when the clock ticks to the next window. It is one `INCR` and one `EXPIRE`, which is why it is everywhere.
+Time is bucketed into fixed intervals — for instance each calendar minute — with one integer per key per window. Each request increments the counter; the request is rejected once the count exceeds the limit; the counter is discarded when the clock enters the next window. The whole mechanism is one `INCR` and one `EXPIRE`.
 
-The flaw is the **window boundary**. With a limit of 100/min, a client can send 100 requests in the last second of 12:00 and another 100 in the first second of 12:01 — 200 requests in a two-second span, double the intended rate, entirely within the rules. The counter has no memory of what happened just before the reset.
+The defect is the **window boundary**. Under a limit of 100 per minute, a client may send 100 requests in the final second of 12:00 and 100 more in the first second of 12:01 — **200 requests inside a two-second span, twice the intended rate, without violating the rule as stated**. The counter carries no memory across the reset, so the interval over which the limit binds is the calendar window, not any rolling window.
 
 ### 2. Sliding-window log
 
-Store a timestamp for every request in a sorted set. To decide, drop everything older than `now - window` and count what remains. This is **exact**: the limit is enforced over a true rolling window with no edge burst. The cost is that you store one entry per request and do a range-trim on every call, so a hot key under attack is exactly when memory and CPU balloon. Correct, but it scales with traffic instead of with the limit.
+One timestamp per request is stored in a sorted set. A decision drops every entry older than `now - window` and counts the remainder. This is **exact**: the limit is enforced over a true rolling window and no boundary burst exists. The cost is one stored entry per admitted request plus a range-trim on every call, so **state grows with traffic rather than with the limit** — memory and central processing unit cost peak on precisely the hot key that is under attack.
 
 ### 3. Sliding-window counter
 
-The production compromise, and the one Cloudflare [described building](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) to scale across millions of domains. Keep just two integers — the count for the current window and the count for the previous one — and estimate the rolling rate by weighting the previous window by how much of it still overlaps the sliding window:
+The compromise Cloudflare [described building](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) to scale across millions of domains. Two integers per key are retained — the count in the current window and the count in the previous one — and the rolling rate is estimated by weighting the previous window by the fraction of it that still overlaps the sliding window:
 
 ```
 weight = (window - elapsed_in_current) / window
 rate   = previous_count * weight + current_count
 ```
 
-Worked example, 50 req/min, 15 seconds into the current minute, 42 requests last minute and 18 so far this minute:
+Worked example at 50 requests per minute, 15 seconds into the current minute, with 42 requests in the previous minute and 18 so far in the current one:
 
 ```
 rate = 42 * ((60 - 15) / 60) + 18
      = 42 * 0.75 + 18
-     = 49.5   →  one more request trips the limit
+     = 49.5   →  one further request trips the limit
 ```
 
-Two numbers per key, no per-request storage, and it smooths the boundary burst instead of ignoring it. Cloudflare measured only **0.003% of requests wrongly allowed or limited** against an exact log — the approximation assumes a uniform request distribution in the previous window, which is close enough in practice. This is the common default.
+State is two counters per key, independent of request volume, and the boundary burst is smoothed rather than ignored. **The estimate assumes requests were uniformly distributed within the previous window**; where they were not, the weighted term misstates the true rolling count. Cloudflare measured **0.003% of requests wrongly allowed or limited** against an exact log.
 
 ### 4. Token bucket
 
-A bucket holds up to `B` tokens (the burst capacity), starts full, and refills at `R` tokens/sec. Each request removes one token; an empty bucket means reject or wait. Over any long span the admitted rate converges to `R`, but the bucket lets a momentary burst of up to `B` through — which matches real traffic, which is bursty. This is the most popular choice and what [Stripe uses](https://stripe.com/blog/rate-limiters): "every Stripe user has a bucket, and every time they make a request we remove a token from that bucket." Good implementations accrue tokens continuously rather than in lumps:
+A bucket holds at most `B` tokens (the burst capacity), starts full, and refills at `R` tokens per second. Each request removes one token; an empty bucket yields a reject or a wait. Over a long span the admitted rate converges to `R`, while **a momentary burst of up to `B` requests is admitted at once**. [Stripe describes this shape](https://stripe.com/blog/rate-limiters): each user has a bucket, and each request removes a token from it. Tokens are accrued continuously from the elapsed time rather than added in lumps by a timer:
 
 ```
 tokens = min(B, tokens + (now - last_refill) * R)
 ```
 
+The `min` is load-bearing: without the cap, an idle key accumulates unbounded credit and its next burst is unbounded too.
+
 ### 5. Leaky bucket
 
-A queue drained at a fixed rate. Requests enter the queue; the server processes them at a constant `R` regardless of arrival bursts; a full queue overflows and rejects. Where the token bucket *permits* bursts, the leaky bucket *absorbs and smooths* them into a perfectly even output stream — ideal when you are shielding a fragile downstream that cannot tolerate spikes, worse for latency-sensitive callers who now wait in line. It is the token bucket's mirror image: same steady-state rate, opposite burst behavior.
+A queue drained at a fixed rate. Requests enter the queue; the server removes them at a constant `R` irrespective of arrival bursts; a full queue overflows and the overflowing requests are rejected. Where the token bucket *permits* bursts, the leaky bucket *absorbs* them and emits an even output stream — appropriate when the downstream cannot tolerate spikes, and worse for latency-sensitive callers, who now wait in the queue. Steady-state rate matches the token bucket; burst behaviour is its mirror image.
 
 ## Decision table
 
-| Algorithm | State per key | Boundary burst | Accuracy | Best when |
+| Algorithm | State per key | Boundary burst | Accuracy | Applicable when |
 |---|---|---|---|---|
-| Fixed window | 1 counter | Up to 2x at edge | Coarse | Cheapest; approximate is fine |
+| Fixed window | 1 counter | Up to 2x at edge | Coarse | Cheapest; approximation acceptable |
 | Sliding-window log | N timestamps | None | Exact | Correctness matters, low volume |
-| Sliding-window counter | 2 counters | Smoothed | ~99.997% | The general-purpose default |
-| Token bucket | tokens + timestamp | Burst up to B | Exact rate + burst | APIs that want to allow bursts |
-| Leaky bucket | queue + timestamp | None (smoothed out) | Constant output | Protecting a fragile downstream |
+| Sliding-window counter | 2 counters | Smoothed | 0.003% misclassified (Cloudflare) | General-purpose default |
+| Token bucket | tokens + timestamp | Burst up to B | Exact rate plus burst | Bursts are to be admitted |
+| Leaky bucket | queue + timestamp | None (smoothed out) | Constant output | Downstream cannot absorb spikes |
 
 ## The distributed problem
 
-One process with a local counter is trivial. The real question: how do fifty stateless instances enforce a *single global* limit of 1000 req/min for one customer? Two answers, and they are the accuracy-vs-latency trade-off in the large.
+A single process with a local counter is straightforward. The substantive question is how fifty stateless instances enforce a *single global* limit of 1000 requests per minute for one customer. Two answers, and they restate the accuracy-against-latency trade-off at fleet scale.
 
-**Central exact.** Every instance reads and writes one shared store — Redis. Accurate to the request, but every request pays a network round-trip, and a naive read-modify-write races: two instances read the same count, both decide "allowed," both write back, and the limit is breached. The fix is **atomicity** — do the whole check-and-decrement in one server-side operation.
+**Central exact.** Every instance reads and writes one shared store, typically Redis. The decision is accurate per request, but each request pays a network round-trip, and a read-modify-write split into separate commands races: **two instances read the same count, both evaluate the predicate as allowed, both write back the same incremented value, and one admission is lost from the count**. The repair is atomicity — the check and the decrement execute as one server-side operation.
 
-**Local approximate.** Each instance rate-limits against its own share (e.g. 1000/50 = 20 each), syncing counts periodically. No per-request hop, so it is fast and it survives a Redis outage, but it is loose at the edges — an uneven load balancer, or a customer whose traffic all lands on one instance, gets throttled early or admitted late.
+**Local approximate.** Each instance limits against its own share (1000/50 = 20 each) and reconciles counts periodically. No per-request hop, and the path survives a Redis outage, but the limit is loose at the edges: an uneven load balancer, or a customer whose traffic lands mostly on one instance, produces early throttling on that instance and unused quota elsewhere.
 
-### Atomic sliding window with Redis
+### Atomic window counter with Redis
 
-The fixed/sliding-window counter is two commands, and pipelining or `MULTI` keeps them together. The `EXPIRE` is what garbage-collects idle keys:
+`INCR` is itself atomic, so the increment never races; the second command exists to garbage-collect the key. A `MULTI`/`EXEC` transaction runs the pair without another client's commands interleaving. Pipelining alone only saves round-trips — it batches the commands but does not make them one unit:
 
 ```
+MULTI
 INCR   ratelimit:{key}:{window}
-EXPIRE ratelimit:{key}:{window} 60   # only meaningful on first INCR
+EXPIRE ratelimit:{key}:{window} 60   # intended for the first INCR of the window
+EXEC
 ```
 
 ### Atomic token bucket with a Lua script
 
-Redis runs a Lua script atomically — no other command interleaves — so the read, refill, and decrement cannot race. This is the standard distributed token bucket:
+Redis executes a Lua script atomically — no other command interleaves — so read, refill and decrement cannot race:
 
 ```lua
 -- KEYS[1] = bucket key
@@ -122,10 +128,51 @@ redis.call('EXPIRE', KEYS[1], math.ceil(capacity / rate))
 return { allowed and 1 or 0, tokens }
 ```
 
-The script returns the decision and the remaining tokens in one hop, the `EXPIRE` reclaims buckets that go idle, and because Redis is single-threaded per script there is no lock and no race. Under a Redis outage you fall back to local approximate limiting — fail open or fail closed is your call, and it is a real decision, not a footnote.
+The script returns the decision and the residual token count in one hop; the `EXPIRE` reclaims buckets that fall idle. During a Redis outage the fallback is local approximate limiting, and whether that fallback fails open or fails closed is an explicit design decision.
 
-## Tell the client what happened
+### Implementation sketch (Scala)
 
-A rejected request should return **HTTP 429 Too Many Requests** with a **`Retry-After`** header (seconds, or an HTTP date) so well-behaved clients back off instead of hammering. Increasingly, servers also advertise the live quota with the **`RateLimit`** and **`RateLimit-Policy`** fields from [draft-ietf-httpapi-ratelimit-headers-11](https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers), which standardize the ad-hoc `X-RateLimit-*` headers every API invented independently. When both `Retry-After` and the RateLimit fields are present, the draft says `Retry-After` takes precedence. Send these on *successful* responses too, so clients can self-throttle before they ever hit a 429.
+The same invariant expressed in-process: refill is derived from elapsed time at read, never from a background timer, and the compare-and-set retry supplies the atomicity that the Lua script gets from single-threaded execution.
 
-**Try next:** Stand up the Lua token bucket on a local Redis, point a load generator at it from three processes at once, and confirm the global rate holds; then swap in the naive `GET`/`SET` version and watch the same test breach the limit — the gap you just measured is exactly why atomicity is the whole game.
+```scala
+import java.util.concurrent.atomic.AtomicReference
+
+final case class Bucket(tokens: Double, tsNanos: Long)
+
+final class TokenBucket(capacity: Double, ratePerSec: Double, now: () => Long):
+  private val state = AtomicReference(Bucket(capacity, now()))
+
+  /** Returns true if `want` tokens were removed. Either way the refill is committed. */
+  def tryAcquire(want: Double = 1.0): Boolean =
+    var decided = false
+    var result  = false
+    while !decided do
+      val cur     = state.get()
+      val t       = now()
+      val elapsed = math.max(0L, t - cur.tsNanos) / 1e9
+      val refilled = math.min(capacity, cur.tokens + elapsed * ratePerSec)
+      val next =
+        if refilled >= want then Bucket(refilled - want, t)
+        else Bucket(refilled, t)          // timestamp advances even on reject
+      if state.compareAndSet(cur, next) then
+        result  = refilled >= want
+        decided = true
+    result
+```
+
+`math.max(0L, ...)` matters where `now` is a wall clock: a backwards step would otherwise produce a negative elapsed term and remove tokens that were never spent.
+
+## Signalling the outcome
+
+A rejected request returns **HTTP 429 Too Many Requests** with a **`Retry-After`** header — a delay in seconds or an HTTP date — so conforming clients defer instead of retrying immediately. Servers may also advertise the live quota with the **`RateLimit`** and **`RateLimit-Policy`** fields from the IETF draft [RateLimit header fields for HTTP](https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers), which cover the ground that ad-hoc `X-RateLimit-*` headers covered in individual application programming interfaces. The draft is a work in progress and its field names have changed between revisions, so a server that emits them cannot assume a client parses them. Emitting the fields on successful responses as well allows a client to self-throttle before it reaches a 429.
+
+## Pitfalls
+
+- **Fixed-window limits are breached by design at the boundary.** Traffic doubles across the reset instant because the counter retains nothing from the preceding window; a monitoring dashboard averaged per minute will not show it.
+- **A sliding-window log grows with request volume, not with the limit.** The key that is being attacked is the key whose sorted set consumes the most memory and the most trim work per call.
+- **The sliding-window counter's estimate degrades when the previous window was non-uniform.** A burst concentrated at the end of the previous minute is spread evenly by the weighting, so the estimated rate understates the true rolling count.
+- **An uncapped token refill converts idleness into an unbounded burst.** Omitting the `min(B, ...)` cap lets a key that was quiet for an hour admit an hour's worth of tokens at once.
+- **Split `GET` then `SET` against Redis loses admissions under concurrency.** Two instances read the same value, both admit, and both store the same incremented count, so the store records one request where two were served.
+- **`EXPIRE` issued unconditionally on every request refreshes the window.** For the fixed-window key the expiry is meant to fire at the end of the interval; re-setting it on each increment extends the window for as long as traffic continues.
+- **A wall clock that steps backwards corrupts elapsed-time refill.** Negative elapsed time subtracts tokens in the naive expression, so a bucket can be emptied by a clock adjustment rather than by traffic.
+- **`Retry-After` omitted from a 429 invites immediate retry.** The client has no advertised delay and falls back to its own policy, which concentrates the retries that the limiter was rejecting.

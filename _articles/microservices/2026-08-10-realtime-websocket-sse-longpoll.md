@@ -2,8 +2,8 @@
 title: 'Real-Time to the Browser: Polling vs SSE vs WebSockets'
 date: 2026-08-10
 track: microservices
-summary: The "design a live feed / chat / notifications" interview asks one thing under the hood — how do bytes get from server to client without a page refresh? Short polling, long polling, Server-Sent Events, and WebSockets, compared by direction, transport, overhead, reconnection, and proxy-friendliness, with a decision table and working snippets.
-reading_time: 6
+summary: How bytes reach a browser from a server without a page refresh. Short polling, long polling, Server-Sent Events and WebSockets compared by direction, transport, per-message overhead, reconnection semantics and proxy behaviour, with a decision table and minimal working code.
+reading_time: 9
 tags:
 - realtime
 - websocket
@@ -34,72 +34,61 @@ sources:
   url: https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API
 ---
 
-Every "design a live feed," "design chat," or "design notifications" question collapses to one problem: HTTP was built for the client to ask and the server to answer, but you need the server to talk first. There are four production answers, and interviewers want you to reach for the cheapest one that meets the requirement — not the most impressive. Here they are in ascending order of power and cost.
+**Gist.** HTTP is a request/response protocol in which the client speaks first, yet live feeds, chat and notifications require the server to deliver data the client did not ask for. Four mechanisms bridge that gap — short polling, long polling, Server-Sent Events (SSE) and WebSockets — by progressively converting per-request state into per-connection state. The cost is that the connection becomes long-lived and pinned to one server process, so reconnection, heartbeats, idle timeouts and cross-node fan-out become application concerns.
 
 ## Short polling
 
-The client asks on a timer: `GET /messages?since=...` every N seconds. If there's nothing new, the server returns an empty result and you paid for a full request/response round trip anyway.
+The client issues `GET /messages?since=...` on a timer. When nothing is new the server returns an empty result and the round trip has still been paid for.
 
-- **Direction:** client-initiated pull, one shot per request.
-- **Transport:** ordinary HTTP request/response. Nothing special.
-- **Overhead:** worst of the bunch. Every poll carries full headers, cookies, and TLS resumption cost; most polls return nothing. Latency is bounded by your interval — a 5-second poll means up to 5 seconds of staleness.
-- **Reconnection / back-pressure:** trivially handled — each request is independent, and a slow client just polls less often. There's no connection to drop.
-- **Proxy/firewall friendliness:** perfect. It's plain HTTP; every cache, proxy, and corporate firewall understands it.
+- **Direction:** client-initiated pull, one exchange per request.
+- **Transport:** ordinary HTTP request/response.
+- **Overhead:** highest of the four. Every poll carries full headers and cookies, and most return nothing. **Staleness is bounded above by the poll interval**: a 5-second interval admits up to 5 seconds of delay.
+- **Reconnection and back-pressure:** neither arises; each request is independent and there is no connection to drop.
+- **Proxy behaviour:** unremarkable HTTP, understood by every intermediary in the path.
 
-Choose it when updates are infrequent and slightly stale is fine (a dashboard that refreshes every 30s, checking a job's status). It's also the honest baseline you compare everything else against.
+Short polling suits infrequent updates with bounded staleness, and is the baseline for the other three.
 
 ## Long polling
 
-The client sends a request and the server *holds it open* until data is available (or a timeout fires), then responds. The client immediately issues the next request. You've simulated push over request/response.
+The client sends a request and the server **holds the response open** until an event occurs or a hold timeout fires; the client then issues the next request. Push is thereby simulated over request/response.
 
-- **Direction:** still client-initiated, but the response is deferred to the moment of a real event — so effective latency approaches real-time.
-- **Transport:** HTTP request/response with a held connection. Each message is one response; then you reconnect.
-- **Overhead:** far better than short polling for low-frequency events (no empty responses), but every message still costs a fresh request with full headers, and a burst of events degrades toward short polling.
-- **Reconnection / back-pressure:** the reconnect loop is built into the pattern. Back-pressure is naturally applied — the client can't be flooded because it only re-arms after processing the last response.
-- **Proxy/firewall friendliness:** excellent, again because it's normal HTTP; just make sure intermediary read timeouts are longer than your hold window.
+- **Direction:** client-initiated, but the response is deferred to the instant of a real event, so effective latency approaches that of a push channel.
+- **Transport:** HTTP request/response with a held connection: one message per response, then a reconnect.
+- **Overhead:** no empty responses, so it improves on short polling at low event rates. Every message still costs a fresh request with full headers, and **as the event rate rises the pattern degrades toward short polling**.
+- **Reconnection and back-pressure:** the reconnect loop is the pattern, and back-pressure is intrinsic — the client re-arms only after processing the previous response.
+- **Proxy behaviour:** normal HTTP, with one constraint: **intermediary read timeouts must exceed the server's hold window**, or the proxy severs the request before the event arrives.
 
-Long polling's real modern role is a **fallback**: when SSE or WebSockets are blocked by a hostile proxy, libraries like Socket.IO downgrade to long polling so the feature still works. Know it for that.
+Its remaining role is as a fallback: where SSE or WebSockets are blocked by an intermediary, a client that can also speak long polling still reaches the server.
 
-## Server-Sent Events (SSE)
+## Server-Sent Events
 
-SSE is a one-way, server→client stream over a single long-lived HTTP response with `Content-Type: text/event-stream`. The server never closes the body; it keeps writing newline-delimited events. The browser side is the built-in `EventSource`.
+SSE is a one-way server-to-client stream carried in a single long-lived HTTP response with `Content-Type: text/event-stream`. The server does not close the body; it keeps writing newline-delimited events. The browser-side interface is the built-in `EventSource`.
 
-- **Direction:** **one-way, server→client only.** The client still uses ordinary HTTP requests for anything it wants to send upstream.
-- **Transport:** one long-lived HTTP/1.1 or HTTP/2 response — HTTP *streaming*, not a protocol upgrade. It stays HTTP the whole way.
-- **Overhead:** one connection amortizes all messages; each event is a few bytes of `data:`/`event:`/`id:` text plus the payload. Text only (UTF-8); binary needs base64, which is a real downside for media.
-- **Reconnection / back-pressure:** SSE's superpower. **Reconnection is automatic** — if the connection drops, the browser reconnects on its own. Each event may carry an `id:`; on reconnect the browser sends a `Last-Event-ID` HTTP request header so the server can resume where it left off, and the `retry:` field sets the reconnection delay in milliseconds. Resumable delivery for free — exactly what a live feed wants.
-- **Proxy/firewall friendliness:** good — it's HTTP — but the classic gotcha is the **per-domain connection cap**. On HTTP/1.1 a browser allows only about **6 open connections per domain**, and each `EventSource` eats one; open a few tabs and you exhaust the pool (Chrome and Firefox both mark this "won't fix"). Under **HTTP/2 this limit effectively disappears**: streams are multiplexed over one TCP connection, the max negotiated between client and server (commonly defaulting to 100). If you ship SSE, ship it over HTTP/2.
+- **Direction:** **server to client only.** Upstream traffic uses ordinary HTTP requests.
+- **Transport:** one long-lived HTTP/1.1 or HTTP/2 response. This is HTTP *streaming*, not a protocol upgrade; HTTP semantics hold throughout.
+- **Overhead:** one connection amortizes all messages; each event costs a few bytes of `data:`, `event:` and `id:` framing plus the payload. **The payload is UTF-8 text only**; binary must be base64-encoded, inflating media transfers.
+- **Reconnection and back-pressure:** **reconnection is automatic.** When the connection drops the browser reopens it. Each event may carry an `id:`; on reconnect the browser sends the last one in a `Last-Event-ID` request header, allowing the server to resume from that point, and a `retry:` field sets the reconnection delay in milliseconds. Resumability is part of the protocol rather than of the application.
+- **Proxy behaviour:** good, with one structural limit. **On HTTP/1.1 a browser permits roughly six connections per domain**, and each `EventSource` consumes one, so several open tabs exhaust the pool; Chrome and Firefox have both marked this as not to be fixed. **Under HTTP/2 the limit effectively disappears**: streams are multiplexed over one TCP connection, with a maximum negotiated between the endpoints that commonly defaults to 100.
 
-Choose SSE for feeds, notifications, live scores, log tailing, progress bars, and token-streaming LLM output — anything where the data flows *down* and the client rarely needs a low-latency upstream channel.
-
-A concrete endpoint (Node/Express), including a keep-alive comment and resumable ids:
+SSE suits feeds, notifications, live scores, log tailing, progress reporting and token-streaming model output. An endpoint with a heartbeat and resumable identifiers (Node/Express):
 
 ```js
 app.get("/events", (req, res) => {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-  });
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+  let id = Number(req.headers["last-event-id"] || 0);   // resume point after reconnect
 
-  // Resume support: client sends Last-Event-ID on reconnect
-  const lastId = Number(req.headers["last-event-id"] || 0);
-
-  let id = lastId;
   const timer = setInterval(() => {
-    res.write(`id: ${++id}\n`);
-    res.write(`event: price\n`);
+    res.write(`id: ${++id}\nevent: price\n`);
     res.write(`data: ${JSON.stringify({ id, value: Math.random() })}\n\n`);
   }, 1000);
-
-  // Comment line = heartbeat that keeps proxies from idling us out
+  // a comment line is a heartbeat that keeps proxies from idling the stream out
   const ka = setInterval(() => res.write(`: keep-alive\n\n`), 15000);
 
   req.on("close", () => { clearInterval(timer); clearInterval(ka); });
 });
 ```
 
-Client side is three lines, with reconnection handled for you:
+The client side carries no reconnection logic:
 
 ```js
 const es = new EventSource("/events");
@@ -108,47 +97,65 @@ es.addEventListener("price", (e) => render(JSON.parse(e.data)));
 
 ## WebSockets
 
-WebSocket (RFC 6455) gives you **full-duplex** communication — both sides send at any time — over a single persistent TCP connection. It begins life as HTTP: the client sends an `Upgrade: websocket` / `Connection: Upgrade` request with a `Sec-WebSocket-Key`, the server answers **101 Switching Protocols** with the hashed `Sec-WebSocket-Accept`, and after that the socket speaks the WebSocket framing protocol, not HTTP.
+WebSocket, specified in RFC 6455, provides **full-duplex** communication over a single persistent TCP connection. It begins as HTTP: the client sends an `Upgrade: websocket` and `Connection: Upgrade` request carrying `Sec-WebSocket-Key`, the server answers **101 Switching Protocols** with the derived `Sec-WebSocket-Accept`, and the connection then speaks WebSocket framing rather than HTTP.
 
-- **Direction:** **bidirectional.** This is the only option where the client can push to the server with the same low latency the server pushes to it.
-- **Transport:** a persistent, upgraded TCP connection. After the handshake, HTTP semantics are gone — no per-request headers, no status codes, no HTTP caching. Frames carry **text or binary** natively (client→server frames are masked; server→client frames are not).
-- **Overhead:** lowest per-message cost — a few bytes of frame header, no HTTP headers or cookies re-sent. Ideal for chatty, high-frequency, small messages.
-- **Reconnection / back-pressure:** **you build this yourself.** The protocol gives you ping/pong control frames, but heartbeat cadence, reconnect-with-backoff, and message replay after a drop are your code. There's no `Last-Event-ID` equivalent. Flow control exists at the TCP level, but application back-pressure (a slow consumer, an unbounded send buffer) is your responsibility — see the companion note on [backpressure and flow control](/articles/sys-patterns/2026-07-31-backpressure-flow-control).
-- **Proxy/firewall friendliness:** the weakest. Some older proxies and corporate firewalls don't understand the Upgrade and will break or buffer the connection; `wss://` (TLS) fares much better because intermediaries can't inspect and mangle the stream. This is why you keep long polling as a fallback.
+- **Direction:** **bidirectional** — the only mechanism in which the client pushes upstream at the latency the server pushes downstream.
+- **Transport:** a persistent upgraded TCP connection; after the handshake there are no per-request headers, status codes or HTTP caching. Frames carry **text or binary** natively, and **client-to-server frames are masked, server-to-client frames are not**.
+- **Overhead:** lowest per message — a small frame header, with no headers or cookies retransmitted, which favours frequent small messages.
+- **Reconnection and back-pressure:** **both are application responsibilities.** The protocol supplies ping and pong control frames, but heartbeat cadence, reconnect with backoff and replay after a drop are application code; there is no `Last-Event-ID` equivalent. TCP provides transport-level flow control, but a slow consumer accumulating an unbounded server-side send buffer is an application problem — see the companion note on [backpressure and flow control](/articles/sys-patterns/2026-07-31-backpressure-flow-control).
+- **Proxy behaviour:** the weakest of the four. Some older proxies and corporate firewalls do not handle the upgrade and either break or buffer the connection; `wss://` fares better, because an intermediary cannot inspect or rewrite an encrypted stream. Hence the long-polling fallback.
 
-Choose WebSockets when you genuinely need a low-latency *upstream* channel: chat, multiplayer games, collaborative editing, trading, live cursors.
+WebSockets are warranted where a low-latency upstream channel is required: chat, multiplayer games, collaborative editing, trading.
 
-A minimal server handler (`ws`):
+## Scaling the stateful mechanisms
 
-```js
-import { WebSocketServer } from "ws";
-const wss = new WebSocketServer({ port: 8080 });
+Short and long polling scale as any stateless HTTP endpoint does. SSE and WebSockets differ because the connection is **long-lived and pinned to one server process**, imposing two requirements.
 
-wss.on("connection", (ws) => {
-  ws.isAlive = true;
-  ws.on("pong", () => { ws.isAlive = true; });   // heartbeat you own
-  ws.on("message", (buf) => {
-    const msg = JSON.parse(buf);
-    // fan out to everyone (see scaling note below)
-    for (const c of wss.clients) if (c.readyState === 1) c.send(JSON.stringify(msg));
-  });
-});
+1. **Sticky routing.** A client's connection must remain on the process holding it; the load balancer routes per connection rather than per request.
+2. **A publish/subscribe backplane.** A message for a user attached to a different node cannot be delivered locally. A broker — Redis publish/subscribe, NATS or Kafka — sits between: every gateway subscribes to the relevant channels and pushes only to the sockets it owns locally. Sticky routing then matters for in-flight session state rather than for correctness.
 
-// You write the liveness sweep; the protocol won't do it for you
-setInterval(() => {
-  for (const ws of wss.clients) {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false; ws.ping();
-  }
-}, 30000);
+## The cost of a million connections
+
+Persistent connections move cost from per message to per connection *state*: a file descriptor, kernel socket buffers, a TLS session, a heartbeat timer and a session object per client. Every load balancer in the path holds equivalent state, and **each load-balancer-to-backend pair draws from a roughly 64K ephemeral port space**. Deployment is the difficult case: restarting a gateway drops every connection it holds, and simultaneous reconnection is a thundering herd aimed at the authentication tier. Slack's [Envoy migration](https://slack.engineering/migrating-millions-of-concurrent-websockets-to-envoy/) account concerns draining millions of WebSockets slowly and surviving mass-reconnect storms.
+
+Idle timeouts terminate quiet connections: **AWS Application Load Balancer defaults to a 60-second idle timeout, and nginx applies `proxy_read_timeout` similarly**. WebSockets therefore require ping/pong traffic inside that window, and SSE periodic `: keepalive` comment lines plus buffering disabled (`X-Accel-Buffering: no` for nginx), otherwise events accumulate in a proxy buffer.
+
+Backfill after reconnect is the sharpest asymmetry. SSE supplies `Last-Event-ID`; WebSocket supplies nothing, so the application implements a resume token — a per-session monotonic sequence number echoed on reconnect, from which the server replays a short retained buffer.
+
+### Implementation sketch (Scala)
+
+The resume contract reduced to its invariant: **a bounded ring keyed by a monotonic sequence, plus an explicit "too old, resynchronize" answer** when the requested point has been evicted.
+
+```scala
+final case class Event(seq: Long, payload: String)
+
+enum Resume:
+  case Replay(events: Vector[Event])
+  case Resync                       // requested seq evicted; client must refetch state
+
+/** Per-session buffer retaining at most `capacity` most-recent events. */
+final class ResumeBuffer(capacity: Int):
+  private var next: Long = 0L
+  private var ring: Vector[Event] = Vector.empty
+
+  def append(payload: String): Event =
+    val e = Event(next, payload)
+    next += 1
+    ring = (ring :+ e).takeRight(capacity)
+    e
+
+  /** `lastSeen` is the highest seq the client acknowledges having processed. */
+  def since(lastSeen: Option[Long]): Resume = lastSeen match
+    case None => Resume.Resync                       // fresh session: no baseline
+    case Some(s) if s + 1 == next => Resume.Replay(Vector.empty)
+    case Some(s) =>
+      ring.headOption match
+        // the oldest retained event is already past the client's cursor
+        case Some(oldest) if oldest.seq > s + 1 => Resume.Resync
+        case _ => Resume.Replay(ring.filter(_.seq > s))
 ```
 
-## Scaling the stateful ones
-
-Short and long polling scale like any stateless HTTP endpoint — put them behind a load balancer and forget them. SSE and WebSockets are different: the connection is **long-lived and pinned to one server process**, so you need two things.
-
-1. **Sticky sessions.** A given client's connection must stay on the server that holds it. The load balancer routes by connection, not per-request.
-2. **A pub/sub fan-out.** With connections spread across many servers, a message that must reach a user connected to *another* box can't be delivered by that box alone. Put a broker in the middle — **Redis pub/sub**, NATS, or Kafka — where every WS/SSE server subscribes to the relevant channels and publishes inbound events. The broker fans out; each server pushes only to the sockets it locally owns. This is the standard "many WS servers behind one Redis" topology.
+`Resync` is returned rather than a silently truncated replay: a gap delivered as if contiguous leaves the client permanently divergent with no signal that it occurred.
 
 ## Decision table
 
@@ -159,47 +166,19 @@ Short and long polling scale like any stateless HTTP endpoint — put them behin
 | Payload | text/JSON | text/JSON | text only (UTF-8) | text **or** binary |
 | Latency | ~poll interval | near real-time | real-time | real-time |
 | Per-msg overhead | high (full headers) | medium | low | lowest |
-| Reconnect | n/a | built into loop | **automatic + `Last-Event-ID`** | **DIY** |
-| Proxy friendliness | best | best | good (HTTP/2!) | weakest (`wss://` helps) |
+| Reconnect | n/a | built into loop | **automatic + `Last-Event-ID`** | **application-implemented** |
+| Proxy friendliness | best | best | good (HTTP/2) | weakest (`wss://` helps) |
 | Conn limit gotcha | none | none | ~6/domain on HTTP/1.1 | none |
-| Best for | rare updates | fallback | feeds, notifications, LLM tokens | chat, games, collab |
+| Best for | rare updates | fallback | feeds, notifications, token streams | chat, games, collaboration |
 
-The interview-grade summary: default to **SSE** for server→client feeds (auto-reconnect and resumability are gifts; just serve it over HTTP/2), reach for **WebSockets** only when you need low-latency *client→server*, keep **long polling** in your pocket as the universal fallback, and use **short polling** when "slightly stale" is genuinely acceptable. Naming the cheap option first is the signal that you've done this before.
+The resulting ordering: SSE for server-to-client feeds over HTTP/2, since reconnection and resumability are protocol-provided; WebSockets where low-latency client-to-server traffic is required; long polling as the universal fallback; short polling where bounded staleness is acceptable.
 
-**Try next:** work through how a slow WebSocket consumer creates unbounded server-side send buffers, and the flow-control strategies that prevent it, in the companion article on [backpressure and flow control](/articles/sys-patterns/2026-07-31-backpressure-flow-control).
+## Pitfalls
 
-## What a million connections actually costs
-
-Persistent connections shift cost from per-message to per-connection *state*: a file descriptor, kernel socket buffers, TLS session, heartbeat timer, and userspace session object per client — tens of KB each, so 1M idle clients is tens of GB of mostly-idle state spread across a gateway tier. The real limits are operational. Every LB in the path holds the same state, and each LB↔backend pair has ~64K ephemeral ports. Deploys become the hard part: restarting a gateway drops every connection it holds, and a million clients reconnecting at once is a thundering herd aimed at your auth stack — Slack's [Envoy migration](https://slack.engineering/migrating-millions-of-concurrent-websockets-to-envoy/) write-up is largely about exactly this: draining millions of WebSockets slowly and surviving mass-reconnect storms.
-
-Proxy behavior differs per mechanism. Idle timeouts kill quiet connections: AWS ALB defaults to 60 s idle, nginx `proxy_read_timeout` likewise — so WebSockets need ping/pong inside the timeout, and SSE needs periodic `: keepalive` comment lines. SSE additionally requires buffering off (`X-Accel-Buffering: no` for nginx), or your events sit in a proxy buffer. And because a client's connection lands on *one* gateway node but a message for them can originate anywhere, you need a **pub/sub backplane** (Redis pub/sub, Kafka, NATS): publishers write to a channel, every gateway subscribes and fans out to its local sockets. Sticky routing then matters only for in-flight session state, not correctness.
-
-Reconnect/backfill is the part candidates forget. SSE gives you `Last-Event-ID` natively. WebSocket gives you nothing: you implement resume tokens — a per-session monotonically increasing sequence number the client echoes on reconnect so the server can replay from a short retained buffer, falling back to full state resync when the buffer has aged out.
-
-## Minimal working SSE (Node, no dependencies)
-
-```js
-// server.mjs — run: node server.mjs
-import http from "node:http";
-let id = 0;
-http.createServer((req, res) => {
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    "x-accel-buffering": "no",              // stop nginx buffering the stream
-  });
-  const last = req.headers["last-event-id"]; // resume point after reconnect
-  if (last) res.write(`: client resumed after event ${last}\n\n`);
-  const t = setInterval(() =>
-    res.write(`id: ${++id}\nevent: tick\ndata: {"ts":${Date.now()}}\n\n`), 2000);
-  req.on("close", () => clearInterval(t));   // client gone: free the state
-}).listen(8080);
-```
-
-```js
-// client (browser console) — reconnection and Last-Event-ID are automatic
-const es = new EventSource("http://localhost:8080/");
-es.addEventListener("tick", e => console.log(e.lastEventId, e.data));
-```
-
-Kill the server mid-stream and restart it: the browser reconnects on its own and you'll see the resume comment with the last delivered ID. That's the whole backfill contract, handed to you by the protocol.
+- **Several SSE tabs on one domain stop receiving events.** Each `EventSource` occupies one of the ~6 HTTP/1.1 connections per domain; once the pool is exhausted, further streams never open.
+- **An SSE stream produces nothing until much data has accumulated.** A reverse proxy is buffering the response body; nginx requires `X-Accel-Buffering: no`.
+- **Connections die every 60 seconds with no application error.** The load balancer's idle timeout — 60 seconds by default on AWS ALB — elapsed without traffic; ping/pong or `: keepalive` lines must fire inside that window.
+- **Long polling returns errors under low event rates.** The intermediary's read timeout is shorter than the server's hold window, so the proxy severs the request before an event arrives.
+- **A WebSocket client silently misses messages after a reconnect.** No `Last-Event-ID` equivalent exists; without a sequence number and replay buffer, everything sent during the disconnection is lost.
+- **A gateway restart saturates the authentication tier.** Every connection it held drops at once and all clients reconnect simultaneously.
+- **Server memory grows while a client stalls.** A slow WebSocket consumer does not stop the producer; the send buffer grows unbounded unless the application applies back-pressure.

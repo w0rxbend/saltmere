@@ -1,9 +1,9 @@
 ---
-title: "Load Balancing: Layers, Algorithms, and Why Two Random Choices Wins"
+title: "Load Balancing: Layers, Algorithms, and the Power of Two Random Choices"
 date: 2026-08-10
 track: microservices
-summary: "The interview-staple tour of load balancing: L4 versus L7 and their trade-offs, the algorithm zoo from round-robin to least-connections to consistent hash, and a proper explanation of why power-of-two random choices beats both plain random and round-robin with only O(1) state."
-reading_time: 6
+summary: "A tour of load balancing: layer 4 versus layer 7 and their trade-offs, the algorithm space from round-robin to least-connections to consistent hash, and why power-of-two random choices improves on both plain random and greedy selection with O(1) state per decision."
+reading_time: 7
 tags: [load-balancing, l4-l7, power-of-two-choices, consistent-hashing, microservices]
 sources:
   - title: "Mitzenmacher, The Power of Two Choices in Randomized Load Balancing (IEEE TPDS 2001)"
@@ -18,67 +18,91 @@ sources:
     url: "https://nginx.org/en/docs/http/ngx_http_upstream_module.html"
 ---
 
-"How would you load balance this?" is a question that rewards two moves: pick the right *layer*, then pick the right *algorithm*. Candidates who conflate the two — or who reach for round-robin reflexively — leave a lot on the table. The interesting part of load balancing is that the naive choices fail in specific, explainable ways, and the fixes are cheap.
+**Gist.** A load balancer must place each unit of work on a backend without global knowledge of every backend's current load. Two decisions determine behaviour: the *layer* at which the balancer operates, which fixes the granularity of the unit (connection or request), and the *selection rule*, which trades state and coordination against the resulting maximum load. Every rule pays for its balance quality somewhere — in per-host measurement, in stale-data herding, or in a longer tail on the fullest backend.
 
-## L4 versus L7: what the balancer can see
+## Layer 4 versus layer 7: what the balancer can observe
 
-A **Layer 4 (transport) load balancer** operates on TCP/UDP. It makes one decision per *connection*, using only the 5-tuple (src/dst IP, src/dst port, protocol). It cannot see the HTTP request inside, so it cannot route by path or header — but it is cheap, fast, and protocol-agnostic (it balances anything: gRPC streams, databases, raw TCP).
+A **layer 4 (transport) load balancer** operates on TCP and UDP. It makes one decision per *connection*, using only the 5-tuple: source and destination address, source and destination port, and protocol. It cannot observe the HTTP request carried inside, so it cannot route by path or header. It is correspondingly cheap and protocol-agnostic: it balances gRPC streams, database connections and raw TCP alike.
 
-Two common L4 datapaths:
+Two common layer 4 datapaths:
 
-- **NAT mode**: the balancer rewrites the destination IP and sits in the return path, so replies flow back through it. Simple, but the balancer is a bottleneck for response bytes.
-- **DSR (Direct Server Return)**: the balancer rewrites only the L2 destination and the backend replies *directly* to the client, bypassing the balancer entirely on the way out. Since responses are usually far larger than requests, DSR lets a modest balancer front enormous egress. The cost is operational: backends need the VIP configured on a loopback and ARP suppressed, and you lose per-response visibility.
+- **Network address translation (NAT) mode**: the balancer rewrites the destination address and remains in the return path, so replies traverse it. **Response bytes therefore consume balancer capacity.**
+- **Direct server return (DSR)**: the balancer rewrites only the layer 2 destination, and the backend replies directly to the client, bypassing the balancer on egress. Where responses are larger than requests, this removes the response volume from the balancer's budget. The costs are operational: **each backend needs the virtual IP (VIP) configured on a loopback interface with Address Resolution Protocol (ARP) suppression**, and the balancer observes no responses, so passive per-response signals are unavailable.
 
-A **Layer 7 (application) load balancer** terminates the connection and parses HTTP. Now it can route by URL path, `Host`, header, cookie, or method; do TLS termination, retries, per-request timeouts, and header-based canary routing; and — crucially — balance at the granularity of *requests*, not connections. That matters enormously for HTTP/2 and gRPC, where thousands of requests multiplex over one long-lived connection: an L4 balancer would pin all of them to whichever backend won the connection lottery. The cost is CPU (parsing, TLS) and that it only understands the protocols it implements.
+A **layer 7 (application) load balancer** terminates the connection and parses HTTP. It can route on URL path, `Host`, header, cookie or method; terminate TLS; apply retries and per-request timeouts; and select a backend per *request* rather than per connection. **That granularity is load-bearing for HTTP/2 and gRPC, where many requests multiplex over one long-lived connection**: a layer 4 balancer binds all of them to the single backend that won the connection's placement, and the imbalance persists for the connection's lifetime. The costs are CPU for parsing and TLS, and coverage limited to the protocols the proxy implements.
 
-The interview one-liner: **L4 is per-connection and blind but fast; L7 is per-request and smart but expensive.** Real stacks often chain them — an L4 balancer spreads connections across a fleet of L7 proxies.
+The compact statement: **layer 4 is per-connection and blind; layer 7 is per-request and protocol-aware at higher CPU cost.** The two compose — a layer 4 tier spreading connections across a fleet of layer 7 proxies.
 
-## The algorithm zoo
+## The selection rules
 
-Once you have picked a layer, you pick how to choose a backend. The honest framing is *how much state does the algorithm need, and how does it behave under variance* (uneven request costs, slow backends, a freshly deployed instance with a cold cache).
+The useful axis is *how much state the rule requires* and *how it behaves under variance* — unequal request costs, a degrading backend, or a freshly started instance with a cold cache.
 
 | Algorithm | State needed | When it wins | Failure mode |
 |---|---|---|---|
-| Round-robin | none (a counter) | uniform request cost, homogeneous backends | ignores actual load; a slow request still gets its "turn" |
-| Weighted round-robin | static weights | heterogeneous instance sizes | weights are static; can't react to live load |
-| Least-connections | live conn/req count | variable request durations | thundering herd onto a fresh/empty node (see below) |
-| Least-response-time (EWMA) | smoothed latency | latency matters, backends differ | needs measurement; stale estimates cause herding |
-| Random | none | large fleets, want statelessness | high variance; unlucky node gets a burst |
-| Power of two choices (P2C) | O(1) per pick | near-optimal balance, cheap | still needs a load signal per host |
-| Consistent / IP hash | ring / key | session or cache affinity | uneven keys → hot shards |
+| Round-robin | none (a counter) | uniform request cost, homogeneous backends | ignores actual load; a slow backend still receives its turn |
+| Weighted round-robin | static weights | heterogeneous instance sizes | weights are static and do not react to live load |
+| Least-connections | live connection or request count | variable request durations | herding onto a freshly started, empty node |
+| Least-response-time (EWMA) | smoothed latency per host | backends with genuinely different speeds | stale estimates cause herding |
+| Random | none | large fleets, no per-host state | high variance; an unlucky node receives a burst |
+| Power of two choices (P2C) | O(1) per decision | balance close to greedy, without a scan | still requires a load signal per host |
+| Consistent or IP hash | ring or key mapping | session or cache affinity | skewed keys produce hot shards |
 
-A few notes. **Least-connections** is the default smart choice and, in HAProxy's own testing, beats P2C by roughly 4% on response time when the live counts are accurate. **Least-response-time** (NGINX's `least_time`, using an EWMA over header or last-byte latency) is what you want when backends have genuinely different speeds — a smoothed latency estimate reacts to a degrading node that connection counts alone miss. **Hashing** is the odd one out: it exists not to balance load but to create *affinity*.
+**Least-connections** is the common default among load-aware rules; in HAProxy's own test drive of power-of-two random choices, least-connections remained the stronger performer where a single balancer held accurate live counts, with P2C close behind and well ahead of plain random. **Least-response-time** — NGINX's `least_time`, using an exponentially weighted moving average (EWMA) over header or last-byte latency — carries information that connection counts do not: a node that is slow but not saturated. **Hashing is not a balancing rule at all**; it exists to produce affinity, and its load distribution is whatever the key distribution happens to be.
 
-## Why power of two random choices wins
+## Power of two random choices
 
-Here is the result worth memorizing. Plain random has bad tail behavior: with *n* balls into *n* bins, the fullest bin holds about `log n / log log n` balls. Mitzenmacher's **power of two choices** result: if instead you pick **two** bins at random and place the ball in the *less loaded* one, the max load drops to `log log n / log 2 + O(1)` — an *exponential* improvement, from logarithmic to double-logarithmic. Going from two choices to three barely helps; the big jump is from one to two.
+The result is about maximum load, not mean load. Placing *n* balls into *n* bins uniformly at random leaves the fullest bin holding about `log n / log log n` balls. The two-choice result, surveyed by Mitzenmacher: sampling **two** bins at random and placing the ball in the less loaded one drops the maximum to `log log n / log 2 + O(1)` — a reduction from logarithmic to double-logarithmic. Sampling *d* bins instead of two replaces `log 2` with `log d` in the denominator, so **the jump is from one sample to two; further samples move only a constant factor.**
 
-The intuition (Marc Brooker put it well) is that P2C threads a needle. Plain **random** wastes capacity because it ignores load — an idle node and an overloaded node are equally likely to be picked. Greedy **"query everyone, pick the emptiest"** looks ideal but, with any stale load data, *herds*: every balancer sees the same node as least-loaded and stampedes it, then the crowd swings to the next quiet node — oscillation. **P2C uses real load information (unlike random) but rejects herding (unlike greedy):** because each request samples a different random pair, no single "winner" attracts the whole fleet at once.
+The qualitative comparison, as Brooker states it, is that P2C occupies the space between two failing extremes. Plain **random** discards load information entirely: an idle backend and a saturated one are equally likely. Greedy **scan-and-pick-the-emptiest** uses all the information but, when load data is stale — which it is whenever several balancers decide independently — every balancer identifies the same minimum and directs traffic there simultaneously, then to whichever node becomes quietest next. **P2C uses the load signal but decorrelates the decisions**: each request samples a different random pair, so no single node is the minimum of every balancer's comparison at once.
 
-And it needs only **O(1) state per decision** — no global scan, no coordination. That is why it is the workhorse in production proxies: Envoy's "least request" load balancer with equal weights *is* P2C by default (it calls the full scan "O(N)" and P2C "nearly as good" with "resistance to herding behavior"), and NGINX's `random two` picks two servers at random and breaks the tie with `least_conn`.
+The cost side is small: **one comparison and two random draws, with no global scan and no coordination between balancers.** Envoy's least-request load balancer with equal weights performs P2C by default, describing the full scan as O(N) and P2C as nearly as good with resistance to herding behaviour. NGINX's `random two` selects two servers at random and resolves the pair with `least_conn`.
 
-```text
-# Power of two choices (P2C)
-# hosts: list of healthy backends; load(h): active requests / conns / EWMA latency
-function pick(hosts):
-    if hosts is empty: reject
-    a = random_choice(hosts)
-    b = random_choice(hosts)      # sample with replacement is fine at scale
-    while b == a and len(hosts) > 1:
-        b = random_choice(hosts)
-    return a if load(a) <= load(b) else b
+### Implementation sketch (Scala)
+
+```scala
+final case class Host(id: String, inFlight: java.util.concurrent.atomic.AtomicLong)
+
+final class P2C(hosts: IndexedSeq[Host], rng: scala.util.Random):
+
+  /** Load signal read per decision; any monotone "busier is larger" metric works. */
+  private def load(h: Host): Long = h.inFlight.get()
+
+  def pick(): Option[Host] = hosts.size match
+    case 0 => None
+    case 1 => Some(hosts(0))
+    case n =>
+      val i = rng.nextInt(n)
+      // Draw the second index from n-1 slots and skip i: uniform over the
+      // distinct hosts, and terminates, unlike rejection sampling in a loop.
+      val j = { val k = rng.nextInt(n - 1); if k >= i then k + 1 else k }
+      val a = hosts(i)
+      val b = hosts(j)
+      Some(if load(a) <= load(b) then a else b)
+
+  def dispatch[A](call: Host => A): Option[A] =
+    pick().map: h =>
+      h.inFlight.incrementAndGet()
+      try call(h) finally h.inFlight.decrementAndGet()
 ```
 
-That is the whole algorithm. No sort, no global counter, no locks.
+The counter must be incremented before the call and decremented in a `finally`; **a leaked increment makes a healthy host look permanently busy and removes it from selection.**
 
-## Health checks and the deploy gotcha
+## Health checking and the empty-node case
 
-None of this matters if you route to a dead node. Balancers run **active** health checks (periodic probes to a `/healthz`-style endpoint) and **passive** checks (eject a host after N consecutive request failures, a circuit-breaker style outlier detection). The subtlety: a health check should test *readiness to serve*, not mere liveness — a node with a cold cache or a warming JIT is "up" but slow, and dumping traffic on it is a self-inflicted latency spike.
+Selection is only correct over hosts that can serve. Balancers run **active** health checks — periodic probes of an endpoint — and **passive** checks, ejecting a host after consecutive request failures, in the style of outlier detection. The distinction that matters is between liveness and readiness: **a node with a cold cache or an unwarmed JIT compiler (a runtime compiler that optimizes code only after observing it execute) answers a probe while still serving slowly**, and routing full traffic to it produces a latency spike.
 
-Which is the classic **least-connections thundering herd**. When you deploy or autoscale a new instance, its active-connection count is *zero* — the global minimum. A least-connections (or naive least-request) balancer therefore routes *every* new request to it, because it looks emptiest, until it drowns. The fixes: **slow-start**, ramping a new host's effective weight from 0 to full over a window (HAProxy and NGINX both do this), and preferring P2C, which by construction only ever sends a fresh node the requests where it happens to win one of two random draws — a trickle, not a flood.
+That is the mechanism behind the least-connections herd on deployment. A newly started instance has an active-connection count of zero, which is the global minimum. **A least-connections or least-request rule directs every arriving request to it until its count rises above the others' — and the count only rises as requests are accepted, so the correction lags the flood.** Two mitigations exist: **slow-start**, which ramps a new host's effective weight from zero to full over a window (HAProxy's `slowstart`; NGINX documents `slow_start` as part of its commercial subscription), and P2C, which by construction sends the new node only the requests where it is drawn as one of two candidates.
 
-## Consistent hashing: balancing for affinity
+## Consistent hashing: placement for affinity
 
-Sometimes you *want* the same key to land on the same backend — to hit a warm cache, keep a session sticky, or shard state. Plain modulo hashing remaps almost everything when the fleet changes size. **Consistent hashing** (and **rendezvous/HRW**) remap only the minimum, which is why they front cache tiers and sharded stores. Envoy's ring-hash and Maglev balancers, and NGINX's `hash $key consistent`, exist for exactly this. The tension: affinity fights balance — a hot key makes a hot shard, and no clever hash saves you from a skewed keyspace. For the mechanics, see [consistent hashing](/articles/distributed-systems/2026-07-25-consistent-hashing-ring) and [rendezvous (HRW) hashing](/articles/distributed-systems/2026-08-10-rendezvous-hrw-hashing).
+Where the same key should reach the same backend — to hit a warm cache, to keep a session on one node, or to shard state — the placement rule must be stable under fleet changes. Plain modulo hashing remaps nearly every key when the host count changes. **Consistent hashing** and **rendezvous (highest random weight, HRW) hashing** remap close to the minimum number of keys, which is why they front cache tiers and sharded stores. Envoy's ring-hash and Maglev balancers and NGINX's `hash $key consistent` implement this class. The tension is structural: **affinity and balance are opposed — a hot key produces a hot shard, and no choice of hash function corrects a skewed keyspace.** For the mechanics, see [consistent hashing](/articles/distributed-systems/2026-07-25-consistent-hashing-ring) and [rendezvous (HRW) hashing](/articles/distributed-systems/2026-08-10-rendezvous-hrw-hashing).
 
-**Try next:** wire a P2C balancer in front of three backends, give one an artificial 200 ms delay, and watch how it starves that node of traffic that round-robin would happily keep feeding it.
+## Pitfalls
+
+- **Layer 4 balancing in front of gRPC or HTTP/2 leaves backends unevenly loaded even under uniform traffic**, because placement happens once per long-lived connection and every multiplexed request inherits it.
+- **Least-connections concentrates traffic on a newly deployed instance**, because zero in-flight requests is the global minimum and the counter rises only after requests have already been accepted.
+- **A liveness probe that returns success before caches or the JIT compiler are warm admits a slow node into rotation**; the symptom is a latency spike correlated with deploys rather than with traffic.
+- **A leaked in-flight counter increment (an exception path that skips the decrement) permanently inflates a host's apparent load** and silently removes it from least-connections and P2C selection.
+- **Greedy least-loaded selection across multiple independent balancers oscillates** rather than converging, because all of them read the same stale minimum and act on it simultaneously.
+- **Direct server return removes response traffic from the balancer's view**, so passive health signals derived from responses no longer exist and misconfigured loopback VIP or ARP settings on a backend appear as unexplained connection blackholing.
+- **Consistent hashing does not balance load**; a skewed key distribution produces a hot shard whose only remedies are key splitting or replication, not a different hash function.

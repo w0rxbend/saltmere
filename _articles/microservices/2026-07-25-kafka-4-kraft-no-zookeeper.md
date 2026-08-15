@@ -1,8 +1,8 @@
 ---
-title: "Kafka 4.0: ZooKeeper is gone, KRaft is the only mode"
+title: "Kafka 4.0: ZooKeeper removed, KRaft the only mode"
 date: 2026-07-25
 track: microservices
-summary: "Apache Kafka 4.0 (18 March 2025) is the first major release to run entirely without ZooKeeper. KRaft — a Raft-based controller quorum that stores metadata in Kafka itself — is now the only mode. Here's what changes operationally: no separate ensemble, a formatted cluster UUID, and process.roles on every node."
+summary: "Apache Kafka 4.0 (18 March 2025) is the first major release to run entirely without ZooKeeper. KRaft — a Raft-based controller quorum that stores metadata in Kafka itself — is the only mode. The operational consequences: no separate ensemble, a formatted cluster UUID, and process.roles on every node."
 reading_time: 5
 tags: [kafka, kraft, zookeeper, kip-500, kip-848, operations]
 sources:
@@ -16,25 +16,37 @@ sources:
     url: "https://www.confluent.io/blog/latest-apache-kafka-release/"
 ---
 
-For a decade, running Kafka meant running *two* distributed systems: the brokers, and a ZooKeeper ensemble holding cluster metadata — topics, partitions, ACLs, controller elections. Two failure domains, two upgrade cadences, two things to page you at 3am. **Apache Kafka 4.0**, released **18 March 2025**, ends that. It's the first major release to operate entirely without ZooKeeper. KRaft (KIP-500) isn't just the default now — it's the *only* mode. There is no ZooKeeper code to fall back to.
+**Gist.** Running Apache Kafka historically meant operating two distributed systems: the brokers, and a ZooKeeper ensemble holding cluster metadata — topics, partitions, access control lists (ACLs), controller elections — with two failure domains and two upgrade cadences. **Kafka 4.0, released 18 March 2025**, removes ZooKeeper entirely: metadata now lives in an internal Kafka log replicated by a Raft-based **controller quorum** (KRaft, specified in KIP-500), which is the only supported mode. The cost is that cluster identity and quorum membership become explicit operator inputs — storage must be formatted with a cluster UUID before first start, every node must declare `process.roles`, and a ZooKeeper-based cluster cannot be upgraded directly to 4.0.
 
-## What KRaft actually replaces
+## What KRaft replaces
 
-KRaft moves metadata *into Kafka*. A subset of nodes form a **controller quorum** that runs a Raft consensus protocol over an internal `__cluster_metadata` topic. The active controller is the quorum leader; brokers replicate the metadata log like any other topic and cache it locally. The upshot: leader elections and metadata propagation stop being a ZooKeeper round-trip and become a log fetch, so a cluster with millions of partitions recovers in seconds instead of minutes. Every node now declares what it is via `process.roles`.
+Under ZooKeeper, metadata was held outside Kafka in a separate replicated store, and a single elected controller broker read that state and pushed changes to the other brokers. Under KRaft the metadata **is a Kafka log**: an internal topic named `__cluster_metadata`, replicated by a designated set of controller nodes running the Raft consensus protocol among themselves.
 
-Because there's no ensemble to point at, a cluster is bootstrapped by *formatting storage* with a shared cluster UUID before first start — a step ZooKeeper used to do implicitly.
+The structure that follows from this is worth stating precisely:
+
+- **The active controller is the Raft leader of the metadata quorum.** A metadata change — a topic creation, a partition leader change, an ACL update — is an append to the metadata log. It is committed once a majority of voters have replicated it, and only then does it become visible cluster state.
+- **Brokers are observers of that log, not participants in the election.** A broker fetches `__cluster_metadata` the way a follower fetches any partition and applies the records to a local in-memory view. **Metadata propagation therefore becomes a log fetch rather than a round trip to an external store**, and a broker's position in the log — its metadata offset — is a measurable indication of how stale its view is.
+- **State transfer is incremental.** Because the log is ordered, a rejoining broker resumes from its last applied offset instead of re-reading a full snapshot of cluster state. KIP-500 gives scaling to clusters with a far larger number of partitions than the ZooKeeper arrangement supported as a goal of the design; the release material does not publish a recovery-time measurement to accompany it.
+
+The invariant that makes the arrangement safe is the ordinary Raft one: **a record that has been committed to the metadata log is present on a majority of voters and is never removed**, so a newly elected controller's log already contains every committed metadata change. There is no second source of truth to reconcile against, which is the structural difference from the ZooKeeper arrangement rather than a mere reduction in process count.
+
+## Bootstrapping without an ensemble
+
+With no external ensemble to register against, cluster identity has to be supplied by the operator. A KRaft cluster is bootstrapped by **formatting each node's log directories against a shared cluster UUID** before first start.
 
 ```bash
-# 1. Mint one cluster ID (do this once, reuse it on every node)
+# 1. Mint one cluster ID; it is generated once and reused on every node
 KAFKA_CLUSTER_ID="$(bin/kafka-storage.sh random-uuid)"
 
-# 2. Format each node's log dirs against that ID + its config
+# 2. Format each node's log dirs against that ID plus its own config
 bin/kafka-storage.sh format \
     --cluster-id "$KAFKA_CLUSTER_ID" \
     --config config/server.properties
 ```
 
-A minimal single-node `server.properties` for a combined broker+controller looks like this. In production you separate the roles, but combined mode makes the moving parts obvious:
+The identifier is written into the log directories. Nodes formatted with different identifiers do not form one cluster; they form two, each convinced the other is a stranger.
+
+A minimal single-node configuration for a combined broker-plus-controller node makes the moving parts visible. Production deployments separate the roles onto distinct nodes.
 
 ```properties
 process.roles=broker,controller
@@ -46,15 +58,24 @@ inter.broker.listener.name=PLAINTEXT
 log.dirs=/var/lib/kafka/data
 ```
 
-`controller.quorum.voters` lists the quorum as `nodeId@host:port` entries — three or five voters in production for fault tolerance (a 3-node quorum tolerates one loss, 5 tolerates two). Kafka 4.1 later added *dynamic* quorums via `controller.quorum.bootstrap.servers`, letting you add and remove controllers with `kafka-metadata-quorum.sh` without editing every config — but the static form above is the 4.0 baseline and still valid.
+Three properties carry the load. `process.roles` declares whether a node is a broker, a controller, or both. `node.id` is the node's identity within the cluster and appears in the voter list. `controller.quorum.voters` enumerates the quorum as `nodeId@host:port` entries, and because commitment requires a majority, **a quorum of *n* voters tolerates the loss of ⌊(n−1)/2⌋ voters** — one loss at three voters, two at five. A controller listener must exist and be named in `controller.listener.names`; controller traffic does not share the inter-broker listener.
 
-## The other operational changes
+A later alternative exists: a cluster formatted for dynamic quorums discovers controllers through `controller.quorum.bootstrap.servers` and changes membership with `kafka-metadata-quorum.sh` rather than by editing the voter list in every configuration file. The static `controller.quorum.voters` form above remains valid and is the simpler arrangement to reason about.
 
-Two more things will bite you on upgrade:
+## Other changes that surface on upgrade
 
-- **Java 17 is required for brokers, Connect, and tools** (clients and Streams still run on Java 11). If your broker hosts are on Java 11, fix that before touching Kafka 4.0.
-- **The next-gen consumer rebalance protocol (KIP-848) is now GA** and enabled server-side by default. It moves rebalancing off the "stop-the-world" model — the coordinator drives partition moves incrementally, so a scaling event no longer freezes the whole group. Consumers still opt in per-app with `group.protocol=consumer`; leave it unset and you get the classic protocol.
+- **Java 17 is required for brokers, Connect and the command-line tools.** Clients and Kafka Streams continue to run on Java 11. Broker hosts still on Java 11 must be moved before the Kafka upgrade, not during it.
+- **The next-generation consumer rebalance protocol (KIP-848) is generally available** and enabled on the server side by default. It replaces the stop-the-world rebalance model: the group coordinator drives partition reassignment incrementally, so a scaling event does not suspend consumption for the whole group. **Consumers opt in per application with `group.protocol=consumer`**; when the property is unset, the classic protocol is used.
+- **Queues for Kafka (KIP-932) ships as early access**, providing share groups for queue-style consumption. Early access is not a general-availability guarantee.
+- **There is no in-place restart from a ZooKeeper-based cluster into 4.0.** Migration is performed on a 3.x bridge release first; the 4.0 upgrade follows. Upgrading a ZooKeeper-based cluster straight to 4.0 is not supported.
 
-There is no in-place "just restart into KRaft" from a ZooKeeper cluster on 4.0 — you migrate on a 3.x bridge release *first*, then upgrade. Jumping a ZooKeeper-based cluster straight to 4.0 is not supported. (Also new in 4.0: **Queues for Kafka**, KIP-932, shipped as *early access* — share groups for queue-style consumption, not yet production-GA.)
+The quorum's own state is inspectable at runtime. Against a running node, `bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status` reports the current leader, the leader epoch and the high-water mark of the metadata log — the three values that describe which controller is authoritative and how far the committed metadata extends.
 
-**Try next:** run the two commands above against a fresh `config/server.properties` from the 4.0 tarball, start the single node, then `bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status` to watch the Raft quorum — leader, epoch, and high-water mark — with not a single ZooKeeper process in sight.
+## Pitfalls
+
+- **Formatting nodes with separately generated cluster UUIDs produces two clusters that never converge.** `kafka-storage.sh random-uuid` is run once, and its output is reused for every format; running it per node writes a different identity into each set of log directories.
+- **An even number of voters buys no extra fault tolerance.** Four voters still require three for a majority and so tolerate one loss, the same as three voters, while adding a node whose failure must be replicated around.
+- **Deleting a controller's log directories deletes metadata replicas, not cached data.** Metadata durability now depends on the surviving majority of controller log directories, so treating them as a rebuildable cache loses committed cluster state once the majority is gone.
+- **Setting `group.protocol=consumer` on applications does not by itself obtain the new protocol.** A broker that does not implement or has not enabled it cannot serve the new request types, so the client property is not self-sufficient.
+- **Planning a direct ZooKeeper-to-4.0 jump strands the cluster mid-upgrade**, because 4.0 contains no ZooKeeper code path to fall back to; the migration must complete on a 3.x bridge release first.
+- **Reusing the inter-broker listener for controller traffic leaves `controller.listener.names` unsatisfied and the configuration fails validation at startup**, since the controller endpoint is a distinct listener in the KRaft configuration model.

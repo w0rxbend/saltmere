@@ -2,8 +2,8 @@
 title: "The Anti-Corruption Layer: translating at the boundary, not leaking it"
 date: 2026-07-31
 track: microservices
-summary: "Why you translate another context's model at the edge of your service instead of letting it seep into your domain. Where an ACL sits versus a BFF, a concrete translator sketch, and how to know when to delete it."
-reading_time: 5
+summary: "Translating another context's model at the edge of a service instead of letting it seep into the domain. Where an anti-corruption layer sits relative to a backend-for-frontend, a translator sketch, and the conditions under which it can be deleted."
+reading_time: 6
 tags: [microservices, ddd, bounded-context, anti-corruption-layer, integration, scala, migration]
 sources:
   - title: "Anti-Corruption Layer pattern — Azure Architecture Center"
@@ -18,86 +18,98 @@ sources:
     url: "https://quality.arc42.org/approaches/open-host-service"
 ---
 
-Every integration you build imports someone else's model whether you meant to or not. Call a legacy billing SOAP endpoint, deserialize its `CustAcctRec` with its `statusCd` of `"A" | "S" | "T"`, pass that object one layer inward, and you have just made another team's twenty-year-old vocabulary part of *your* domain. The **Anti-Corruption Layer** (ACL) is the deliberate refusal to do that.
+**Gist.** An integration imports the model of whatever system it calls: deserializing a legacy billing endpoint's `CustAcctRec`, with its `statusCd` drawn from `"A" | "S" | "T"`, and passing that object inward makes another team's vocabulary part of the consuming domain. The **anti-corruption layer** (ACL) is a translation boundary that maps foreign representations to local ones in both directions, so that only the layer knows both vocabularies. The cost is a component that must be written, tested, deployed and monitored, and an extra mapping step on every call — a cost that survives the reason it was introduced unless retirement is planned.
 
-Eric Evans named it in the 2003 blue book as a strategic-design pattern; it sits in the **context map** as a *downstream* defensive relationship — what you reach for when a cooperative relationship (shared kernel, customer/supplier) isn't on the table and you can't change the upstream. Sam Newman gives it a full section in *Building Microservices* 2nd ed. (O'Reilly, 2021), specifically as the thing that stops a monolith's model from bleeding into a new service during a strangler-fig migration.
+Eric Evans named the pattern in *Domain-Driven Design* (2003) as a strategic-design pattern. It occupies a position in the **context map** as a *downstream, defensive* relationship: one of the options for a downstream context, alongside cooperative relationships such as shared kernel and customer/supplier, and the one that does not require the upstream to change. Sam Newman treats it in *Building Microservices*, 2nd edition (O'Reilly, 2021) as the mechanism that stops a monolith's model from bleeding into a new service during a strangler-fig migration.
 
-## What "corruption" actually means
+## What corruption denotes
 
-It is not about bad data. Corruption is when the concepts, invariants, and language of a foreign **bounded context** start dictating the shape of your own code. Symptoms:
+Corruption here is not malformed data. It is the condition in which the concepts, invariants and language of a foreign **bounded context** begin to dictate the shape of local code. Three observable symptoms:
 
-- Your domain objects carry fields that only make sense to the other system (`legacyPartnerId`, `sapWbsElement`).
-- Your business logic branches on *their* status codes.
-- A change to their API forces edits deep inside your aggregates, not just at the edge.
+- Domain objects carry fields meaningful only to the other system (`legacyPartnerId`, `sapWbsElement`).
+- Local business logic branches on *foreign* status codes, which makes the foreign encoding an invariant of the local model.
+- A change to the upstream API forces edits inside aggregates rather than at the edge — the diagnostic property, because it shows the dependency has passed through the boundary.
 
-The ACL is a translation boundary that keeps their model on their side of a wall. Inside the wall you speak only your ubiquitous language; the layer maps in both directions.
+The ACL keeps the foreign model on the foreign side of a wall. Inside the wall only the local ubiquitous language appears.
 
-## Adapter, facade, translator — the three internals
+## Adapter, translator, facade
 
-The layer is usually described as three collaborating pieces, and it's worth keeping them distinct:
+The layer is conventionally decomposed into three collaborating pieces, and the separation is load-bearing because each has a different testability profile:
 
-- **Adapter** — deals with the *mechanics*: HTTP/SOAP client, retries, auth, deserialization into the foreign DTO. It knows nothing about your domain.
-- **Translator** — the heart of it: pure mapping between the foreign DTO and your domain type. No I/O, no side effects, trivially unit-testable.
-- **Facade** — the interface *your* code sees, expressed entirely in your terms (`AccountRepository.find(id): Account`). Callers never learn there's a legacy system behind it.
+- **Adapter** — the *mechanics*: HTTP or SOAP client, retries, authentication, deserialization into the foreign data transfer object (DTO). It carries no knowledge of the local domain, and it is the only part that performs input/output.
+- **Translator** — pure mapping between the foreign DTO and the local domain type. **No I/O and no side effects**, so it is testable by example without a fixture or a network stub.
+- **Facade** — the interface the local code sees, expressed entirely in local terms (`AccountRepository.find(id): Account`). Callers do not learn that a legacy system stands behind it.
 
-Keep business rules and orchestration *out* of the layer — Microsoft's guidance is explicit that the ACL is translation only. The moment you put a workflow in there it stops being a wall and becomes a second domain.
+Business rules and orchestration belong outside the layer. The Azure Architecture Center guidance describes the layer's responsibility as translation between the two systems' models; a workflow placed inside it makes the layer a second domain model, which reintroduces the coupling the wall was meant to prevent.
 
-## A translator sketch
+### Implementation sketch (Scala)
 
-Foreign model on the left, your domain on the right. The translator is a pure function — that's the property that makes an ACL cheap to trust.
+The foreign model appears on one side, the local domain on the other. The translator is a total function into `Either`, which is the property that makes the layer cheap to trust.
 
 ```scala
-// --- their model (from the legacy WSDL, do not let this escape the package) ---
-final case class CustAcctRec(acctId: String, statusCd: String, balCents: Long)
+// --- foreign model (from the legacy WSDL; must not escape this package) ---
+private[legacy] final case class CustAcctRec(acctId: String, statusCd: String, balCents: Long)
 
-// --- your model ---
+// --- local model ---
 enum AccountStatus:
   case Active, Suspended, Closed
 
 final case class Account(id: AccountId, status: AccountStatus, balance: Money)
 
-// --- translator: the only place that knows both vocabularies ---
-object AccountTranslator:
-  def toDomain(r: CustAcctRec): Either[TranslationError, Account] =
-    for
-      status <- r.statusCd match
-        case "A" => Right(AccountStatus.Active)
-        case "S" => Right(AccountStatus.Suspended)
-        case "T" => Right(AccountStatus.Closed)
-        case other => Left(TranslationError.UnknownStatus(other))
-    yield Account(AccountId(r.acctId), status, Money.ofCents(r.balCents))
+enum TranslationError:
+  case UnknownStatus(code: String)
 
-final case class TranslationError(msg: String)
+// --- translator: the only place that knows both vocabularies ---
+private[legacy] object AccountTranslator:
+  def toDomain(r: CustAcctRec): Either[TranslationError, Account] =
+    val status: Either[TranslationError, AccountStatus] = r.statusCd match
+      case "A"   => Right(AccountStatus.Active)
+      case "S"   => Right(AccountStatus.Suspended)
+      case "T"   => Right(AccountStatus.Closed)
+      case other => Left(TranslationError.UnknownStatus(other))
+    status.map(s => Account(AccountId(r.acctId), s, Money.ofCents(r.balCents)))
 ```
 
-Two things earn their keep here. The mapping is **total and explicit** — an unknown `statusCd` becomes a typed error at the boundary, not a surprise `case _ =>` deep in your service. And `CustAcctRec` is package-private; the compiler enforces that no other module can accidentally depend on it. That's the wall, made of types.
+Two properties earn their keep. The mapping is **total and explicit**: an unrecognised `statusCd` becomes a typed error at the boundary rather than a fall-through `case _ =>` reached deep inside a service, where the offending value's origin is no longer visible in the stack. And `CustAcctRec` is package-private, so the compiler — not a review convention — enforces that no other module depends on it. The wall is made of types.
 
-The facade wires the adapter and translator together and returns only `Account`:
+The facade composes adapter and translator and exposes only `Account`:
 
 ```scala
-class LegacyAccountRepository(client: LegacySoapClient):
-  def find(id: AccountId): IO[Account] =
-    client.fetchAcct(id.value)             // adapter: I/O, retries, auth
-      .map(AccountTranslator.toDomain)     // translator: pure
-      .flatMap(IO.fromEither)              // fail loudly at the edge
+final class LegacyAccountRepository(client: LegacySoapClient):
+  def find(id: AccountId): Account =
+    val rec = client.fetchAcct(id.value)          // adapter: I/O, retries, auth
+    AccountTranslator.toDomain(rec) match         // translator: pure
+      case Right(account) => account
+      case Left(err)      => throw TranslationFailed(err)
 ```
 
-## ACL vs BFF — different axes, not competitors
+The rejection of a `Left` at this line is the enforcement point of the invariant: **no value crosses the facade unless it is a well-formed domain value**. Anything the translator cannot map fails the call there, so downstream code never needs a branch for a state the local model does not define.
 
-They get conflated because both are "translation layers", but they translate along different axes:
+## Anti-corruption layer versus backend-for-frontend
 
-- An **ACL** protects *your model from an upstream's model*. It's inbound, defensive, and lives on the consumer side of a context boundary. Its dual on the provider side is the **Open Host Service** plus a **Published Language** — the upstream offering a clean, documented protocol so *fewer* consumers need their own ACL.
-- A **BFF** (backend-for-frontend) adapts *your* model outward to the needs of a specific client (mobile, web). It's about presentation and aggregation, not about defending a domain.
+The two are conflated because both are described as translation layers, but they translate along different axes.
 
-You can have both: a BFF that internally calls a service which itself sits behind an ACL over a legacy core. They compose; they don't overlap.
+- An **ACL** protects the local model from an *upstream's* model. It is inbound, defensive, and lives on the consumer side of a context boundary. Its counterpart on the provider side is the **Open Host Service** together with a **Published Language**: the upstream publishes a documented protocol, which reduces the number of consumers that need an ACL of their own.
+- A **backend-for-frontend** (BFF) adapts the local model *outward* to the needs of one client class, such as mobile or web. Its concerns are presentation and aggregation, not defence of a domain model.
 
-## When to retire it
+Both can be present simultaneously — a BFF calling a service that itself sits behind an ACL over a legacy core. They compose along orthogonal axes rather than competing.
 
-The trap is treating a migration-era ACL as permanent furniture. Decide up front which kind you built:
+## Retirement
 
-- **Temporary** — it exists only to bridge to a system you are actively strangling. When the last legacy call site is gone, *delete the layer*. Leaving it in place adds latency and a component to maintain for zero benefit, which is exactly the "don't use it when the semantics already match" case in the Azure guidance.
-- **Permanent** — the foreign system is here forever (a vendor SaaS, a mainframe of record). Then invest in it: monitoring with correlation IDs, circuit breakers and bulkheads so the translator can't become a shared point of failure.
+Treating a migration-era ACL as permanent furniture is the recurring failure. The two cases differ in what should be invested in the layer:
 
-A cheap tell that you can retire it: the translator has quietly become an identity mapping because the upstream now speaks your language. That's a delete, not a refactor.
+- **Temporary** — the layer bridges to a system being actively strangled. Once the last legacy call site is removed, the layer is deleted. Retaining it adds a network or mapping hop and a component to maintain with no remaining consumer, which matches the Azure guidance's advice against using the pattern when the semantics on both sides already match.
+- **Permanent** — the foreign system is durable (a vendor SaaS product, a mainframe system of record). The layer then warrants operational investment: correlation identifiers through the translation, and circuit breakers and bulkheads so that a single slow upstream cannot exhaust the resources of every caller sharing the layer.
 
-**Try next:** Pick one integration in your codebase where a foreign DTO is passed more than one call deep. Write a pure `toDomain` translator for it, make the foreign type package-private, and watch which call sites the compiler now rejects — that list is the corruption you'd been carrying.
+One observable signal for retirement: the translator has degenerated into an identity mapping because the upstream now speaks the local language. That condition indicates deletion rather than refactoring.
+
+A practical starting exercise: locate an integration in which a foreign DTO is passed more than one call deep, write a pure `toDomain` translator for it, make the foreign type package-private, and inspect which call sites the compiler then rejects. That list enumerates the corruption already present.
+
+## Pitfalls
+
+- **A non-total translator hides upstream drift.** A `case _ => Active` default turns a newly introduced upstream status code into silently wrong domain state; the error appears later as a business-rule anomaly with no trace back to the boundary.
+- **The foreign DTO is public.** If `CustAcctRec` is not visibility-restricted, a caller imports it for convenience, and the wall exists only by convention; the next upstream field rename then produces a compile error inside an aggregate.
+- **Orchestration migrates into the layer.** Once the ACL makes a second call to decide what to translate, it holds business rules, and changes to the local domain now require edits to the integration component.
+- **The layer becomes a shared point of failure.** A permanent ACL serving many callers with no bulkhead lets one slow upstream dependency consume the thread or connection budget of unrelated flows.
+- **The temporary layer outlives the migration.** After the last legacy call site is removed, an unretired ACL is a maintained, deployed, monitored component with no consumer, and its presence suggests to readers that the legacy system is still live.
+- **Both sides mutate the same object.** Returning the foreign DTO wrapped in a local type, rather than constructing a new domain value, leaves foreign fields reachable and reintroduces the dependency the translation was intended to sever.

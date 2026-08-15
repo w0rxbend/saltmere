@@ -1,9 +1,9 @@
 ---
-title: "Proxy-Wasm: Writing WebAssembly Filters for Envoy and Istio"
+title: "Proxy-Wasm: WebAssembly Filters for Envoy and Istio"
 date: 2026-08-10
 track: microservices
-summary: "How the Proxy-Wasm ABI lets you extend Envoy and Istio with sandboxed WebAssembly filters shipped independently of the proxy build — with a working Rust HttpContext example and the Envoy and Istio WasmPlugin deploy configs."
-reading_time: 6
+summary: "How the Proxy-Wasm ABI extends Envoy and Istio with sandboxed WebAssembly filters shipped independently of the proxy build — with a Rust HttpContext example and the Envoy and Istio WasmPlugin deploy configs."
+reading_time: 7
 tags:
   - envoy
   - istio
@@ -23,34 +23,34 @@ sources:
     url: "https://www.solo.io/blog/the-state-of-webassembly-in-envoy-proxy-f2b3f"
 ---
 
-Envoy is the data plane under most service meshes, and sooner or later you want it to do something it doesn't do out of the box: stamp a header, enforce a token, emit a custom metric, rewrite a body. Envoy has always been extensible — but historically your options were to fork it and write a C++ filter (rebuild the whole proxy, ship a custom binary, chase every upstream release) or to embed Lua for small in-request logic. Proxy-Wasm is the third door: compile your filter to a WebAssembly module and load it into an unmodified proxy at runtime.
+**Gist.** Envoy is the data plane under most service meshes, and custom behaviour — stamping a header, enforcing a token, emitting a metric, rewriting a body — historically required either a C++ filter welded to the proxy build or a small Lua snippet embedded in the request path. Proxy-Wasm defines a proxy-agnostic application binary interface (ABI) so a filter compiled to WebAssembly (Wasm) loads into an unmodified proxy at runtime, sandboxed in its own linear memory. The cost is the sandbox boundary itself: every header read and body chunk crosses it as a host call with copies, and the embedded Wasm runtime adds memory per virtual machine (VM).
 
-## Why Wasm instead of native C++ or Lua
+## What the sandbox buys and what it charges
 
-Three properties make Wasm compelling for proxy extension.
+Three properties distinguish Wasm from the two older extension paths.
 
-**A real sandbox.** A Wasm module runs in a linear-memory sandbox with no ambient access to the host. It can only touch the proxy through a narrow, explicit set of host-call functions defined by the ABI. A panic, an out-of-bounds write, or an infinite loop is contained to the module — it does not take down the proxy process. Native C++ filters share the proxy's address space, so a bug is a segfault in production.
+**Memory isolation.** A Wasm module executes over a linear memory region with **no ambient access to the host process**. Its only reach into the proxy is the explicit set of host-call functions the ABI declares. A panic, an out-of-bounds write, or a non-terminating loop is contained within the module rather than the proxy. A native C++ filter shares the proxy's address space, so the same defect is a segmentation fault in the serving process.
 
-**Independent shipping.** A native filter is welded to the Envoy build. Every Envoy bump means recompiling and revalidating your fork. A Wasm module is a separate artifact — a `.wasm` file, or an OCI image — that you version, sign, and roll out on its own cadence against a stock proxy. That decoupling is the whole point: your release train stops depending on Envoy's.
+**Independent release cadence.** A native filter is compiled into the Envoy binary, so every Envoy version bump forces a recompile and revalidation of the fork. A Wasm module is a **separate artifact** — a `.wasm` file or an Open Container Initiative (OCI) image — versioned, signed and rolled out on its own schedule against a stock proxy.
 
-**Multiple languages.** Because the contract is an ABI rather than a C++ API, you write filters in whatever language has a Proxy-Wasm SDK: Rust (`proxy-wasm-rust-sdk`), Go/TinyGo (`proxy-wasm-go-sdk`), C++, and AssemblyScript. Lua is fine for a five-line tweak; it is not where you want to build and test a stateful authz filter.
+**Language choice.** Because the contract is an ABI rather than a C++ API, any language with a Proxy-Wasm software development kit (SDK) can produce a filter: Rust (`proxy-wasm-rust-sdk`), Go/TinyGo (`proxy-wasm-go-sdk`), C++, and AssemblyScript.
 
-The cost is real too: Wasm modules pay a marshalling overhead crossing the sandbox boundary, cold-start and per-request copies aren't free, and the runtime (V8 or Wasmtime, embedded in Envoy) adds memory. For hot-path, latency-critical work, native still wins. Wasm is the right tool when safety and independent delivery matter more than the last microsecond.
+The charge is equally concrete. Modules pay marshalling overhead on each crossing of the sandbox boundary, cold start and per-request copies are not free, and the runtime embedded in Envoy — V8 or Wasmtime — consumes memory. For latency-critical hot paths a native filter remains faster; Wasm is the correct choice where isolation and independent delivery outweigh the last microsecond.
 
 ## The ABI and the host↔module model
 
-Proxy-Wasm is standardized as a proxy-agnostic ABI in [`proxy-wasm/spec`](https://github.com/proxy-wasm/spec). It defines two directions of calls:
+Proxy-Wasm is specified in [`proxy-wasm/spec`](https://github.com/proxy-wasm/spec) and defines calls in two directions:
 
-- **Module → host** (`proxy_*` imports): the module asks the proxy to do things — read a header, send a response, set shared data, dispatch an HTTP call.
-- **Host → module** (`proxy_on_*` exports): the proxy notifies the module of lifecycle and traffic events — VM start, plugin config, new stream, request headers, response body, log.
+- **Module → host**, the `proxy_*` imports: the module asks the proxy to read a header, send a response, set shared data, or dispatch an HTTP call.
+- **Host → module**, the `proxy_on_*` exports: the proxy notifies the module of lifecycle and traffic events — VM start, plugin configuration, new stream, request headers, response body, log.
 
-The published ABI versions are **0.1.0, 0.2.0, and 0.2.1**; 0.2.1 is the current one that mainstream hosts implement. It is stable enough to build on but still evolving (an ABI 0.3 is discussed upstream). Envoy is the reference host, but the same ABI is implemented by NGINX (Kong's `ngx_wasm_module`), Apache Traffic Server, MOSN, and others — a module built to the spec is portable across them.
+The specification publishes the ABI as versioned revisions — **0.1.0, 0.2.0 and 0.2.1** — with 0.2.1 the version mainstream hosts implement. Envoy is the reference host, but the same ABI is implemented by NGINX (Kong's `ngx_wasm_module`), Apache Traffic Server, and MOSN, so a module built to the specification is portable across them.
 
-The execution model has two context types. A **RootContext** exists once per plugin per worker and owns plugin-level config and shared lifecycle. For every request (or TCP stream) the proxy asks the root to mint a **stream context** — an `HttpContext` for HTTP filters — which receives the per-request callbacks. The SDK maps these directly onto traits.
+The execution model has **two context types**. A **RootContext** exists once per plugin per worker and owns plugin-level configuration and the plugin lifecycle. For each request — or each TCP stream — the proxy asks the root context to mint a **stream context**, an `HttpContext` for HTTP filters, which receives the per-request callbacks. Per-request state therefore lives in the stream context and is discarded with the stream; state that must outlive a request belongs on the root context or in the shared-data host calls. The SDKs map these two contexts directly onto traits.
 
 ## A minimal Rust filter
 
-Here is a complete HTTP filter using the [Rust SDK](https://github.com/proxy-wasm/proxy-wasm-rust-sdk) (crate `proxy-wasm`, current published `0.2.5`). It checks for an inbound `x-api-key` header, rejects the request with `403` if it is missing, and otherwise stamps an `x-wasm-filter` header before the request continues upstream.
+The following filter uses the [Rust SDK](https://github.com/proxy-wasm/proxy-wasm-rust-sdk) (crate `proxy-wasm`). It inspects the inbound `x-api-key` header, rejects the request with status `403` when the header is absent or empty, and otherwise stamps `x-wasm-filter` before the request proceeds upstream.
 
 {% raw %}
 ```rust
@@ -92,12 +92,12 @@ impl HttpContext for ApiKeyFilter {
         match self.get_http_request_header("x-api-key") {
             Some(key) if !key.is_empty() => {
                 info!("#{} authorized request", self.context_id);
-                // Add a header the upstream can see.
+                // Header added here is visible to the upstream service.
                 self.add_http_request_header("x-wasm-filter", "proxy-wasm");
                 Action::Continue
             }
             _ => {
-                // Short-circuit: reply directly from the filter, don't hit upstream.
+                // Response is produced in the filter; upstream is never contacted.
                 self.send_http_response(
                     403,
                     vec![("content-type", "text/plain")],
@@ -111,9 +111,9 @@ impl HttpContext for ApiKeyFilter {
 ```
 {% endraw %}
 
-Every name here is real SDK surface: `set_root_context`, the `Context` / `RootContext` / `HttpContext` traits, `get_type` returning `ContextType::HttpContext`, `create_http_context`, `on_http_request_headers`, `get_http_request_header`, `add_http_request_header`, `send_http_response`, and the `Action::Continue` / `Action::Pause` return values. `Continue` lets the filter chain proceed; `Pause` stops it — here because we've already produced the response.
+Every identifier above is real SDK surface: `set_root_context`, the `Context` / `RootContext` / `HttpContext` traits, `get_type` returning `ContextType::HttpContext`, `create_http_context`, `on_http_request_headers`, `get_http_request_header`, `add_http_request_header`, `send_http_response`, and the `Action` variants. The return value drives the filter chain: **`Action::Continue` allows the chain to proceed, `Action::Pause` stops it** — here because the response has already been produced locally.
 
-Build it as a cdylib for the Wasm target. The crate's `Cargo.toml` sets `crate-type = ["cdylib"]`; compile with:
+The module is built as a `cdylib` for the Wasm target. The crate's `Cargo.toml` sets `crate-type = ["cdylib"]`:
 
 ```bash
 rustup target add wasm32-wasip1
@@ -121,11 +121,11 @@ cargo build --target wasm32-wasip1 --release
 # -> target/wasm32-wasip1/release/apikey_filter.wasm
 ```
 
-(Older guides target `wasm32-unknown-unknown`; recent SDK releases build against `wasm32-wasip1`, the renamed `wasm32-wasi`.)
+Older guides target `wasm32-unknown-unknown`; recent SDK releases build against `wasm32-wasip1`, the renamed `wasm32-wasi`.
 
-## Deploying to raw Envoy
+## Deployment to a standalone Envoy
 
-For a standalone Envoy, load the module as an HTTP filter in the connection manager. The runtime is Envoy's embedded V8:
+Outside a mesh the module is loaded as an HTTP filter in the connection manager, here on Envoy's embedded V8 runtime:
 
 ```yaml
 http_filters:
@@ -145,11 +145,11 @@ http_filters:
     "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 ```
 
-The Wasm filter must sit before the `router` filter so it can act on the request. `code.local.filename` points at the module on disk; `code.remote` can fetch it from a URI with a SHA256 instead.
+**Ordering is load-bearing: the Wasm filter must precede the `router` filter**, because the router terminates the chain by forwarding upstream. `code.local.filename` names the module on disk; `code.remote` fetches it from a URI and validates it against a declared SHA256 digest.
 
-## Deploying through Istio's WasmPlugin
+## Deployment through Istio's WasmPlugin
 
-In a mesh you don't hand-edit Envoy config — Istio does it for you. The `WasmPlugin` custom resource ([API ref](https://istio.io/latest/docs/reference/config/proxy_extensions/wasm-plugin/)) is the supported path (it superseded raw `EnvoyFilter` for Wasm). Package the `.wasm` as an OCI image, push it to a registry, and reference it:
+Inside a mesh the Envoy configuration is generated rather than hand-edited. The `WasmPlugin` custom resource ([API reference](https://istio.io/latest/docs/reference/config/proxy_extensions/wasm-plugin/)) is the supported path for Wasm extensions, in place of hand-written `EnvoyFilter` resources. The module is packaged as an OCI image, pushed to a registry, and referenced:
 
 ```yaml
 apiVersion: extensions.istio.io/v1alpha1
@@ -169,10 +169,14 @@ spec:
     header_name: x-api-key  # arbitrary config handed to the module
 ```
 
-`phase` decides where in Istio's filter chain your module lands — `AUTHN` runs before Istio's own auth filters, `AUTHZ` after authentication, `STATS` near telemetry, and `UNSPECIFIED_PHASE` drops it at the end before the router. `priority` orders multiple plugins in the same phase. The `pluginConfig` struct is delivered to your RootContext's config callback, so the same module can be reused with different settings per workload. Istio's agent pulls the OCI artifact, caches it locally, and hot-loads it into the sidecar — no proxy restart, no mesh redeploy.
+`phase` places the module within Istio's filter chain: **`AUTHN` runs before Istio's own authentication filters, `AUTHZ` after authentication, `STATS` near telemetry, and `UNSPECIFIED_PHASE` places it at the end, before the router**. `priority` orders multiple plugins sharing a phase, with higher values first. The `pluginConfig` structure is delivered to the root context's configuration callback, so one module serves several workloads with different settings. The Istio agent pulls the OCI artifact, caches it locally, and loads it into the sidecar without a proxy restart.
 
-## Where this leaves you
+## Pitfalls
 
-Proxy-Wasm gives you a safe, language-flexible, independently-shipped extension point for the proxy that already fronts your services. The ABI is stable at 0.2.1, the Rust and Go SDKs are production-usable, and Istio's WasmPlugin makes rollout a `kubectl apply`. Start with something small — a header check like the one above — measure the latency cost on your own traffic, and grow from there.
-
-**Try next:** rebuild the filter to read `header_name` from `pluginConfig` in `on_configure`, package it as an OCI image with `buildah`/`docker`, and roll it to a single namespace via a `WasmPlugin` selector before widening the rollout.
+- **The Wasm filter placed after `envoy.filters.http.router`** never observes the request: the router forwards upstream and terminates the chain, so the filter's callbacks appear to be dead code.
+- **Returning `Action::Continue` after `send_http_response`** lets the chain proceed even though a response was already emitted locally; the pause is what prevents the upstream call.
+- **Storing per-request state on the RootContext** leaks across concurrent streams, because one root context serves every stream on that worker while stream contexts are created and destroyed per request.
+- **Building for `wasm32-unknown-unknown` with a recent SDK release** produces a module that may fail to build or to instantiate, because the SDK's generated code expects the WASI imports the `wasm32-wasip1` target supplies.
+- **Omitting `crate-type = ["cdylib"]`** yields an rlib rather than a loadable `.wasm` module, and the build succeeds without producing the artifact the proxy needs.
+- **Assuming an ABI version the host does not implement** breaks the module at VM start rather than at request time; the host refuses to instantiate a VM whose declared ABI it does not recognise.
+- **Treating a per-request body rewrite as free** ignores the copies made at each crossing of the sandbox boundary, which is where Wasm loses to a native filter on latency-critical paths.

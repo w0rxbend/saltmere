@@ -2,8 +2,8 @@
 title: "API Versioning: URI, Header, and the Expand-Contract Migration"
 date: 2026-08-14
 track: microservices
-summary: "Three ways to version an HTTP API — URI path, custom header, and content negotiation — plus the expand-and-contract (parallel change) pattern that lets you rename a field without breaking a single client or forcing a lockstep release."
-reading_time: 6
+summary: "Three ways to version an HTTP API — URI path, custom header, and content negotiation — plus the expand-and-contract (parallel change) pattern that renames a field without breaking a client or forcing a lockstep release."
+reading_time: 7
 tags: [api-design, versioning, microservices, backward-compatibility, rest]
 sources:
   - title: "Newman, S. — Building Microservices, 2nd Edition (schemas, contracts, avoiding lockstep)"
@@ -16,32 +16,36 @@ sources:
     url: "https://google.aip.dev/185"
 ---
 
-The moment a service has a consumer you did not write, its API is a contract. Changing that contract carelessly forces a **lockstep release** — client and server must deploy together — which is exactly the coupling microservices exist to avoid. Sam Newman's *Building Microservices* frames the goal plainly: change your service and deploy it *without* having to change or redeploy anyone else. Two things get you there: a versioning strategy for when you truly must break, and the expand-contract pattern so that most of the time you never do.
+**Gist.** Once a service has a consumer written by someone else, its hypertext transfer protocol (HTTP) interface is a contract, and an incompatible edit to that contract forces a **lockstep release**: client and server must deploy in the same window. Two mechanisms remove that constraint — an explicit version marker (path segment or media type) for changes that genuinely cannot be made compatible, and the **parallel change** pattern (also called expand-and-contract) for everything else, which keeps old and new shapes live at the same time. The cost of the second mechanism is a period during which the provider maintains two representations of the same data and must keep them consistent on every write path.
 
-## Where the version goes
+## Where the version marker goes
 
-**URI path** — `GET /v2/orders/42`. Explicit, cacheable, trivially routable at the gateway. Google's AIP-185 mandates exactly this: a single *major* version encoded as the first path segment (`v1`, `v2`), with no minor or patch numbers in the URL. Purists dislike that the same resource now has two URLs, but for operability it is hard to beat.
+**Uniform resource identifier (URI) path** — `GET /v2/orders/42`. The version is visible in access logs, is part of the cache key without further configuration, and can be routed at a gateway by prefix match alone. Google's AIP-185 describes this form: a single **major** version as the first path segment (`v1`, `v2`), with **no minor or patch component in the URL**. The structural objection is that one logical resource then has two identifiers.
 
-**Custom header / content negotiation** — keep the URL stable and version via `Accept`:
+**Content negotiation via a media type** — the identifier stays fixed and the representation is selected by the request header:
 
 ```http
 GET /orders/42 HTTP/1.1
 Accept: application/vnd.acme.order.v2+json
 ```
 
-The resource identity stays clean; the representation is negotiated. The cost is that a version is now invisible in logs and browser URLs, and caches must vary on the header.
+Resource identity remains single-valued. Two costs follow. The version no longer appears in a URL or in a log line that records only the path, and **any cache in front of the service must vary on `Accept`**, otherwise a `v1` response can be served to a `v2` request from the same cache entry.
 
-**Semantic versioning of the contract itself.** Regardless of transport, think in semver terms: additive/backward-compatible changes are minor and need no new endpoint; breaking changes are major and do. The discipline is deciding *which* is which — and that is where most teams get burned.
+**Versioning of the contract rather than the transport.** Independently of where the marker lives, the classification is the semantic-versioning one: additive, backward-compatible changes are minor and require no new endpoint; incompatible changes are major and do. The difficulty is the classification itself, not the notation.
 
-## Expand and contract: change without breaking
+## Expand and contract
 
-Most changes do not need a `/v2` at all if both sides follow **Postel's Law** — *be conservative in what you send, liberal in what you accept*. Fowler's **Tolerant Reader** says a consumer should read only the fields it needs and ignore everything else, so adding a field is a non-event. That property is what makes the **parallel change** pattern (Sato/Fowler; also called expand-and-contract) work. It has three phases:
+Most changes require no `/v2` if both sides observe **Postel's Law** — be conservative in what is sent, liberal in what is accepted. Fowler's **Tolerant Reader** states the consumer-side half: a consumer reads only the fields it needs and ignores the rest. That property is the precondition for parallel change, because it makes **field addition a non-event for every conforming consumer**. Where it does not hold — a deserializer configured to fail on unknown properties, or a validator that rejects extra keys — addition is itself a breaking change, and the pattern below does not apply.
 
-1. **Expand** — add the new shape alongside the old; both are populated.
-2. **Migrate** — move clients over, one at a time, on their own schedule.
-3. **Contract** — once no one reads the old shape, remove it.
+The pattern has three phases:
 
-Say you must rename `name` to `full_name`. A naive rename breaks every reader instantly. Expand-contract instead does this:
+1. **Expand** — the new shape is added alongside the old; both are populated.
+2. **Migrate** — consumers move across individually, on their own release schedule.
+3. **Contract** — once no consumer reads the old shape, the old shape is removed.
+
+The invariant that holds across phases 1 and 2 is that **every response satisfies both the old and the new schema simultaneously**. While that invariant holds, any consumer may be at any point in its own migration and still function; the provider is therefore free to deploy without coordination. Phase 3 breaks the invariant deliberately, which is why it is the only phase that requires evidence — not assumption — that no reader of the old shape remains.
+
+Renaming `name` to `full_name` illustrates the sequence. A direct rename breaks every reader at the instant of deployment.
 
 ```json
 // Phase 1 — EXPAND: write both, keep them in sync
@@ -51,27 +55,65 @@ Say you must rename `name` to `full_name`. A naive rename breaks every reader in
   "full_name": "Ada Lovelace"    // new field, tolerant readers pick this up
 }
 
-// Phase 2 — MIGRATE: clients switch to full_name at their own pace.
-//           Deprecate the old field explicitly:
-//   Deprecation: true
+// Phase 2 — MIGRATE: consumers switch to full_name at their own pace.
+//           The old field is deprecated explicitly:
+//   Deprecation: Wed, 01 Apr 2026 00:00:00 GMT
 //   Sunset: Wed, 01 Oct 2026 00:00:00 GMT
-//   Link: <https://api.acme.dev/docs/order-v2>; rel="deprecation"
+//   Link: <https://api.acme.dev/docs/order-v2>; rel="sunset"
 
-// Phase 3 — CONTRACT: after the sunset date, drop "name"
+// Phase 3 — CONTRACT: after the sunset date, "name" is dropped
 {
   "id": 42,
   "full_name": "Ada Lovelace"
 }
 ```
 
-The server does the double-write in phase 1 — often a one-line mapping in the serializer. Consumers migrate whenever they redeploy for other reasons; nobody is blocked. The `Deprecation` and `Sunset` HTTP headers (RFC 8594) turn "please stop using this" into a machine-readable signal your clients can alarm on, rather than an email nobody reads.
+The double-write in phase 1 belongs in the serializer, where a single mapping derives both keys from one internal value. Deriving both from **one source of truth rather than two stored columns** is what prevents the two fields from diverging: if each is written independently, any code path that updates one and not the other emits a response that violates the invariant, and the failure surfaces on the consumer that happens to read the stale key.
 
-## Making it safe in practice
+The `Sunset` HTTP response header (RFC 8594) carries the date after which the resource or field is expected to become unresponsive, and the companion `Deprecation` header (RFC 9745) carries the date the deprecation takes effect — both are date values, not flags. Together they make the retirement schedule machine-readable, so a consumer can detect and alarm on continued use of a deprecated field rather than depending on a notification being read by a person.
 
-- **Never remove or repurpose a field in place.** Removing `name` and later reusing the key for something else is the classic silent break. Add new keys; retire old ones only after the sunset window.
-- **Verify with consumer-driven contract tests.** Newman leans hard on these: each consumer publishes the shape it expects (e.g. Pact), and the provider's CI fails if a change would violate a real consumer's expectations — you learn at build time, not from a 2 a.m. page.
-- **Reserve a new major version for genuinely incompatible changes** — restructuring a resource, removing an operation, changing types. AIP-185 requires old and new majors to run *simultaneously* through a transition period so clients migrate gradually, never in lockstep.
+### Implementation sketch (Scala)
 
-Done well, "versioning" stops being a big-bang event. The expand-contract loop is small and repeatable, and a real `/v2` becomes the rare exception rather than the quarterly ritual.
+The load-bearing part is the serializer emitting both shapes from one value, and the reader tolerating either.
 
-**Try next:** pick an endpoint and add one field via expand-contract — double-write it, attach `Deprecation`/`Sunset` headers to the old field, and write a Pact-style contract test that fails if the old field disappears before the sunset date.
+```scala
+final case class Person(id: Long, fullName: String)
+
+enum Phase:
+  case Expand, Contract
+
+// One source of truth, two keys, chosen by migration phase.
+def encode(p: Person, phase: Phase): Map[String, Any] =
+  val base = Map[String, Any]("id" -> p.id, "full_name" -> p.fullName)
+  phase match
+    case Phase.Expand   => base + ("name" -> p.fullName) // same field re-read, not a second store
+    case Phase.Contract => base
+
+// Tolerant reader: unknown keys ignored, new key preferred, old key accepted.
+def decode(m: Map[String, Any]): Option[Person] =
+  for
+    id   <- m.get("id").collect { case l: Long => l }
+    name <- m.get("full_name").orElse(m.get("name")).collect { case s: String => s }
+  yield Person(id, name)
+
+// Retirement schedule as headers; both values are HTTP dates.
+def deprecationHeaders(deprecatedAt: String, sunset: String): Seq[(String, String)] =
+  Seq("Deprecation" -> deprecatedAt, "Sunset" -> sunset)
+```
+
+`decode` accepts a phase-1 response, a phase-3 response, and a legacy phase-0 response without branching on a version marker: the union of accepted shapes is what allows consumer and provider deployments to be ordered arbitrarily.
+
+## Operating the transition
+
+- **A field is never removed or repurposed in place.** Removing `name` and later binding the same key to a different meaning produces a silent break: the consumer parses successfully and computes on the wrong value. New keys are added; old keys are retired only after the sunset window.
+- **Consumer-driven contract tests supply the evidence for phase 3.** Newman treats these as the mechanism by which a provider learns what its consumers depend on: each consumer publishes the shape it expects, and the provider's continuous-integration run fails when a change would violate a published expectation. The failure occurs at build time rather than in production.
+- **A new major version is reserved for changes that cannot be expressed additively** — restructuring a resource, removing an operation, changing a field's type. The old and new major versions then run **simultaneously** for a transition period, so consumers migrate gradually rather than in lockstep; a major version that replaces its predecessor at the instant of deployment reintroduces exactly the lockstep the marker was meant to avoid.
+
+## Pitfalls
+
+- **A cache placed in front of a media-type-versioned endpoint without `Vary: Accept` serves a `v1` body to a `v2` request.** The cache key contains only the path, so the first response stored wins for every subsequent version.
+- **A deserializer configured to reject unknown properties turns an additive change into an outage.** The provider adds a field believing it compatible; the consumer fails at parse time on the field it was never meant to read.
+- **Two independently written columns behind the old and new field name drift.** Any write path that updates one and misses the other emits a response satisfying neither schema consistently, and the mismatch appears only on the consumer reading the stale key.
+- **Contracting before contract-test coverage is complete removes the field for an unobserved consumer.** Absence of traffic in the tested set is not evidence of absence of readers; the break appears when that consumer next runs.
+- **A `Sunset` date published without a corresponding gate in the provider's release process lapses without action.** The header records an intention that nothing enforces, so the old field persists and accumulates new readers.
+- **Encoding minor or patch numbers in the URI path multiplies routing entries.** Every compatible change creates a new cache key and a new gateway route, neither of which a major-version-only path segment produces.

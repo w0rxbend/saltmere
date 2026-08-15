@@ -2,8 +2,8 @@
 title: "Strangler Fig: decomposing a monolith one route at a time"
 date: 2026-07-30
 track: microservices
-summary: "You rarely get to rewrite a monolith in one shot — big-bang replacements fail because nobody fully understands the old behavior. The Strangler Fig pattern puts a proxy in front of the monolith and peels off one capability at a time, routing individual endpoints to new services while everything else keeps working. Here's the interceptor, the routing, the canary, and the data problem nobody warns you about."
-reading_time: 6
+summary: "Big-bang replacements of legacy systems fail because the undocumented behaviour is discovered only when the rewrite gets it wrong in production. The Strangler Fig pattern interposes a proxy in front of the monolith and moves one capability at a time, routing individual endpoints to new services while the remainder keeps serving. The mechanism covers the interception layer, the routing table, the canary, and the data-ownership problem that dominates the effort."
+reading_time: 7
 tags: [strangler-fig, monolith, migration, reverse-proxy, feature-flags, cdc]
 sources:
   - title: "StranglerFigApplication — Martin Fowler"
@@ -16,15 +16,17 @@ sources:
     url: "https://docs.aws.amazon.com/prescriptive-guidance/latest/modernization-decomposing-monoliths/strangler-fig.html"
 ---
 
-Martin Fowler named this pattern after a plant. On a 2001 trip through the Queensland rainforest he watched strangler figs germinate high on a host tree, send roots down around its trunk, and eventually grow into a self-supporting shape while the original tree rotted away inside. That is exactly the migration you want: the new system grows around the edges of the monolith until the monolith is hollow and can be removed — no flag day, no six-month code freeze, no "we'll cut over Saturday night and pray."
+**Gist.** Replacing a large legacy system wholesale fails because the expensive part of that system is behaviour nobody documented, and the divergence surfaces only in production. The Strangler Fig pattern interposes an interception layer — a reverse proxy — between clients and the monolith, so that replacement proceeds one route at a time, each slice individually reversible. The cost is a prolonged period of coexistence: two implementations of the same capability run simultaneously, the data must be kept consistent across both, and every request pays the proxy's latency.
 
-The reason to do it this way is not aesthetic. Big-bang rewrites fail because the hard part of a legacy system is the behavior nobody documented, and you only discover those nuances when the rewrite gets them wrong in production. Strangler Fig replaces the system in slices small enough that each slice's blast radius is one capability, and each slice can be rolled back.
+Martin Fowler named the pattern after a plant he encountered on a trip to Australia: strangler figs germinate high on a host tree, send roots down around its trunk, and grow into a self-supporting shape while the original tree rots away inside. The migration has the same shape — the new system grows around the edges of the monolith until the monolith is hollow and can be removed, with no flag day and no code freeze.
 
-## The interceptor is the whole trick
+## The interception layer
 
-Everything hinges on one component sitting between clients and the monolith: a **reverse proxy** (Fowler and the Azure/AWS write-ups all call it a *facade* or *interception layer*). Clients keep calling the same host. The proxy decides, per request, whether a call goes to the old monolith or a new service. On day one it forwards 100% to the monolith and does nothing else — which is the point, because you want to install and validate the interceptor *before* you've moved any behavior, so the proxy itself is never the risky change.
+Everything rests on one component between clients and the monolith. Fowler and the Azure and AWS write-ups call it a *facade* or *interception layer*; in practice it is a reverse proxy. **Clients continue to address the same host, and the proxy decides per request whether the call reaches the monolith or a new service.**
 
-Once it's in place, migrating a capability becomes a routing edit. Here's NGINX peeling the shipping-quote endpoint off to a new service while everything else stays on the monolith:
+The ordering of the two changes is load-bearing. **On day one the proxy forwards 100% of traffic to the monolith and does nothing else**, so the interceptor is installed and validated while its behaviour is still the identity function. If the proxy is introduced at the same moment as the first migrated capability, a production incident has two candidate causes and neither can be excluded by rollback of the other.
+
+Once the proxy is in place, migrating a capability is a routing edit. NGINX peeling the shipping-quote endpoint off to a new service:
 
 ```nginx
 upstream monolith   { server monolith.internal:8080; }
@@ -45,46 +47,89 @@ server {
 }
 ```
 
-That's the pattern in miniature. `location` blocks are your migration ledger: the more specific routes at the top point at new services, the catch-all `/` at the bottom is the shrinking monolith. Match order matters — exact and prefix matches must sit above the fallthrough or your new service never sees traffic. Envoy, HAProxy, an API gateway (AWS recommends API Gateway for exactly this), or a service mesh all do the same job; NGINX is just the smallest thing that shows the shape.
+The `location` blocks constitute the migration ledger: specific routes at the top point at new services, and the catch-all `/` at the bottom is the shrinking monolith. **Match order is a correctness condition — an exact or prefix match placed below the fallthrough never receives traffic, and the new service appears healthy while serving nothing.** Envoy, HAProxy, an API gateway or a service mesh perform the same function; NGINX is the smallest configuration that exhibits the shape.
 
-## Route by endpoint, not by guesswork
+## Choosing the seam
 
-Pick seams, not features you *wish* were separate. A good first slice is a capability that (a) has a clean HTTP surface you can name with a route, (b) reads and writes a bounded set of data, and (c) is valuable enough that shipping it proves the migration works. Newman's advice in *Monolith to Microservices* is to start with something low-risk and high-learning — you are as much migrating your deployment pipeline and on-call muscle as you are migrating code.
+A capability is a viable first slice when it has a hypertext transfer protocol (HTTP) surface nameable by a route, reads and writes a bounded set of data, and is valuable enough that shipping it demonstrates the migration works. Newman's advice in *Monolith to Microservices* is to begin with something low-risk and high-learning: the deployment pipeline and the on-call procedures are being migrated alongside the code.
 
-Watch out for the endpoints that *look* independent but aren't. `/api/shipping/quote` is a great candidate if it only needs address and weight. It's a trap if, three calls deep, the monolith's quote logic also decrements inventory and writes to the orders table — now you have two systems fighting over the same rows.
+The failure mode is an endpoint that appears independent and is not. `/api/shipping/quote` is a sound candidate if it consumes only address and weight. It is a trap if, several calls deep, the monolith's quote logic also decrements inventory and writes to the orders table — **the seam then cuts through a write path, and two systems contend for the same rows.**
 
-## Roll each capability out behind a toggle
+## Canary and reversibility
 
-Do not flip a route from monolith to new service in one commit. The interception layer is the natural place to do a **canary**: send 1% of `/api/shipping/quote` to `shipping_v2`, compare results and latency against the monolith, then ramp. Two common mechanisms:
+A route is not flipped from monolith to new service in a single commit. The interception layer is where the **canary** lives: a small fraction of `/api/shipping/quote` is sent to `shipping_v2`, its results and latency compared against the monolith, and the fraction increased. Two mechanisms are in common use:
 
-- **Weighted routing** at the proxy — split traffic by percentage. Envoy and most gateways express this as weighted clusters; you dial from 99/1 to 0/100 over days.
-- **A feature toggle** the proxy consults per request, so product or ops can shift or kill the new path without a redeploy.
+- **Weighted routing** at the proxy. Envoy and most gateways express this as weighted clusters, and the weights are moved gradually toward the new service.
+- **A feature toggle** consulted per request, so the new path can be shifted or disabled without a redeployment.
 
-Because the monolith is still running and still correct, rollback is free during this window: set the weight back to 0, or flip the flag off. AWS frames the whole middle phase as *coexist* precisely so this reversion stays cheap. You lose that safety net only after you delete the old code path — so don't delete it until the canary has been at 100% and quiet for a while.
+**Reversibility holds only while the monolith path still exists and is still correct.** During that window rollback is a weight change or a toggle flip; the published descriptions of the pattern all treat this coexistence phase as the point of it. Deleting the old code path ends the window: from that point a defect in the new service requires a forward fix under incident conditions.
 
-You can even run **dark / shadow traffic** first: mirror requests to `shipping_v2`, throw away its responses, and diff them against the monolith's. That catches the undocumented-behavior bugs before a single real user is affected.
+**Shadow traffic** narrows the risk further: requests are mirrored to `shipping_v2`, its responses discarded, and the two outputs compared offline. This exercises the undocumented-behaviour cases against real inputs without any user observing the new service's output.
 
-## The data layer is where it gets hard
+### Implementation sketch (Scala)
 
-Routing HTTP is easy. The moment your new service and the monolith both need the same data, the neat picture breaks. Three realities, roughly in order of pain:
+The interceptor's decision function, isolated from transport concerns. The routing table is an ordered sequence, so precedence is explicit rather than emergent, and the canary weight is derived from a stable request key so that one client does not oscillate between implementations.
+
+```scala
+enum Target { case Monolith, Candidate }
+
+final case class Route(
+    matches: String => Boolean,
+    candidateWeight: Int, // 0..100; 0 keeps the route on the monolith
+    shadow: Boolean       // mirror to candidate, discard its response
+)
+
+final class Interceptor(table: Seq[(String, Route)]):
+
+  /** First match wins: entries earlier in `table` take precedence. */
+  private def lookup(path: String): Option[Route] =
+    table.collectFirst { case (_, r) if r.matches(path) => r }
+
+  /** Stable across retries of the same request, so a client does not flip
+    * between implementations mid-session. */
+  private def bucket(key: String): Int =
+    math.floorMod(scala.util.hashing.MurmurHash3.stringHash(key), 100)
+
+  def decide(path: String, sessionKey: String): (Target, Boolean) =
+    lookup(path) match
+      case None => (Target.Monolith, false)
+      case Some(r) =>
+        val target =
+          if bucket(sessionKey) < r.candidateWeight then Target.Candidate
+          else Target.Monolith
+        (target, r.shadow && target == Target.Monolith)
+```
+
+`decide` returns the serving target and whether to mirror. Mirroring is suppressed when the candidate already serves the request, which would otherwise double the load it receives.
+
+## Data ownership
+
+Routing HTTP requests is the tractable half. The difficulty concentrates where the new service and the monolith require the same data.
 
 | Stage | What the new service does with data | Risk |
 |---|---|---|
-| Shared DB | Reads/writes the monolith's tables directly | Fast to ship, but you haven't actually decoupled — the schema is still a shared contract |
-| CDC sync | Owns a new store; Change Data Capture streams the monolith's writes into it | Eventual consistency; must handle lag and replay |
-| System of record | New store is authoritative; monolith reads *from* the service | Cutover of writes is the genuinely scary step |
+| Shared DB | Reads/writes the monolith's tables directly | Fast to ship, but decoupling has not occurred — the schema remains a shared contract |
+| CDC sync | Owns a new store; change data capture (CDC) streams the monolith's writes into it | Eventual consistency; lag and replay must be handled |
+| System of record | New store is authoritative; monolith reads *from* the service | Cutover of writes is the genuinely hazardous step |
 
-The usual path (spelled out in the Azure guidance) is: let the new service read/write the shared monolith database at first, extract its tables into a domain-owned store via ETL, keep them in sync with CDC, then promote the new store to system of record and remove the old tables. Shield the new service's model from the monolith's schema with an **anti-corruption layer** so the legacy data model doesn't leak into your clean design and calcify it.
+The sequence the write-ups converge on is: the new service first reads and writes the shared monolith database; its tables are then extracted into a domain-owned store; CDC keeps the two in sync; the new store is finally promoted to system of record and the old tables removed. **An anti-corruption layer sits between the new service's model and the monolith's schema**, so the legacy data model is translated at the boundary rather than propagating into the new design.
 
-## When NOT to reach for it
+## When the pattern does not apply
 
-Strangler Fig is not free, and a few situations make it the wrong tool:
+- **The calls cannot be intercepted.** The pattern presupposes that a facade can be placed in front and can route. Where clients reach the backend over channels that admit no such facade, there is nothing to strangle.
+- **The system is small.** If replacement in a single step is achievable, the transitional proxy, dual data paths and CDC plumbing are pure overhead. Fowler presents the pattern as the alternative to rewriting a system in a single step.
+- **Decommissioning is urgent.** Coexistence can run for months. A compliance deadline or licence expiry that forces rapid removal works against the pattern.
+- **Source access to the monolith is unavailable.** Disabling the migrated feature inside the old code and redirecting its internal calls generally requires modifying it; a black-box binary bounds how completely it can be strangled.
 
-- **You can't intercept the calls.** The entire pattern assumes a proxy can sit in front and route. If clients talk to the backend through channels you can't put a facade on, there's nothing to strangle.
-- **The system is small.** If a straight rewrite-and-replace is genuinely achievable in one go, the transitional proxy, dual data paths, and CDC plumbing are overhead you don't need. Fowler's own warning: this is for the systems too big or too risky to replace wholesale.
-- **You need the old system gone *now*.** The strangler is deliberately slow; coexistence can run for months. If a compliance deadline or license cliff forces a fast decommission, this pattern fights you.
-- **You lack source access to the monolith.** You often need to disable the migrated feature inside the old code and redirect its internal calls; a black-box binary you can't change limits how completely you can strangle it.
+The interceptor is on the path of every request. It is a single point of failure and a latency tax on all traffic, migrated or not, and its value derives from being the one component whose behaviour is stable while everything behind it changes.
 
-And don't forget the interceptor is now on every request's path: it's a single point of failure and a latency tax. Keep it dumb, horizontally scaled, and boring — its whole value is being the one component you trust while everything behind it churns.
+## Pitfalls
 
-**Try next:** Put NGINX (forwarding 100% to your monolith) in front of one real service in staging, change nothing else, and prove no behavior shifted. Then pick one read-only endpoint, stand up a trivial replacement, and mirror shadow traffic to it — diff the two responses before you route a single user there.
+- A prefix or exact `location` placed below the catch-all `/` never matches; the new service reports zero errors because it receives zero traffic, and the migration appears complete while the monolith still serves the route.
+- Introducing the proxy and the first migrated route in the same change leaves an incident with two candidate causes, and rolling back one does not exonerate the other.
+- Choosing a seam whose handler writes to shared tables produces two writers on the same rows; the symptom is lost updates or constraint violations under concurrency, not a routing error.
+- Canary assignment computed per request rather than from a stable key sends successive calls of one session to different implementations, so a client observes state written by one and absent from the other.
+- Mirroring shadow traffic to a candidate that also serves live traffic doubles its load, and a capacity failure is then misread as the new implementation being too slow.
+- Deleting the monolith's code path before the canary has run at full weight removes the rollback mechanism; the next defect must be fixed forward during an incident.
+- Treating CDC replication as synchronous means the new service reads a store lagging the monolith; the symptom is a read-after-write anomaly for users whose write went to the monolith and whose read went to the service.
+- Allowing the monolith's schema into the new service's domain model — omitting the anti-corruption layer — makes the legacy shape permanent, since it must then be preserved when the old tables are dropped.
