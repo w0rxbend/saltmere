@@ -1,18 +1,35 @@
 ---
 layout: default
 ---
-{% assign track = site.tracks | where: "id", page.track | first %}
-<article class="article">
-  <p class="crumb"><a href="{{ '/' | relative_url }}">Saltmere</a>
-    {% if track %} → <a href="{{ '/#' | append: track.id | relative_url }}">{{ track.name }}</a>{% endif %}
+{%- assign track = site.tracks | where: "id", page.track | first -%}
+
+{%- comment -%}
+  Find this article's neighbours inside its own track so the reader can walk
+  the track forwards and backwards. `siblings` is newest-first, so the entry
+  *before* this one is the newer article and the one *after* is the older.
+{%- endcomment -%}
+{%- assign siblings = site.articles | where: "track", page.track | sort: "date" | reverse -%}
+{%- assign idx = 0 -%}
+{%- for a in siblings -%}
+  {%- if a.url == page.url -%}{%- assign idx = forloop.index0 -%}{%- endif -%}
+{%- endfor -%}
+{%- assign last_i = siblings.size | minus: 1 -%}
+
+<div class="progress" aria-hidden="true"></div>
+
+<article class="article" data-track="{{ page.track }}">
+  <p class="crumb">
+    <a href="{{ '/' | relative_url }}">Index</a>
+    {%- if track %} / <a href="{{ '/tracks/' | append: track.id | append: '/' | relative_url }}">{{ track.name }}</a>{%- endif -%}
   </p>
 
   <header class="article-head">
     {% if track %}<p class="eyebrow">{{ track.name }}</p>{% endif %}
     <h1>{{ page.title }}</h1>
     <p class="meta">
-      {% if page.date %}<time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%B %-d, %Y" }}</time>{% endif %}
-      {% if page.reading_time %}<span class="dot">·</span>{{ page.reading_time }} min read{% endif %}
+      {%- if page.date %}<time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%Y.%m.%d" }}</time>{% endif -%}
+      {%- if page.reading_time %}<span class="dot">·</span>{{ page.reading_time }} min read{% endif -%}
+      {%- if siblings.size > 1 %}<span class="dot">·</span>{{ idx | plus: 1 }} of {{ siblings.size }} in track{% endif -%}
     </p>
     {% if page.summary %}<p class="summary">{{ page.summary }}</p>{% endif %}
   </header>
@@ -22,7 +39,7 @@ layout: default
   </div>
 
   {% if page.tags and page.tags.size > 0 %}
-  <p class="tags">{% for tag in page.tags %}<span class="tag">#{{ tag }}</span> {% endfor %}</p>
+  <p class="tags">{% for tag in page.tags %}<span class="tag">#{{ tag }}</span>{% endfor %}</p>
   {% endif %}
 
   {% if page.sources and page.sources.size > 0 %}
@@ -30,11 +47,32 @@ layout: default
     <h2>Sources &amp; further reading</h2>
     <ul>
       {% for s in page.sources %}
-      <li><a href="{{ s.url }}" rel="noopener">{{ s.title }}</a></li>
+      <li><a href="{{ s.url }}" rel="noopener noreferrer" target="_blank">{{ s.title }}</a></li>
       {% endfor %}
     </ul>
   </div>
   {% endif %}
 
-  <p class="article-foot"><a href="{{ '/' | relative_url }}">← Back to all articles</a></p>
+  <nav class="pager" aria-label="More in this track">
+    {% if idx > 0 %}
+      {% assign pi = idx | minus: 1 %}{% assign newer = siblings[pi] %}
+      <a class="prev" href="{{ newer.url | relative_url }}" data-track="{{ page.track }}">
+        <span class="dir">← Newer in track</span>
+        <span class="t">{{ newer.title }}</span>
+      </a>
+    {% else %}<span></span>{% endif %}
+
+    {% if idx < last_i %}
+      {% assign ni = idx | plus: 1 %}{% assign older = siblings[ni] %}
+      <a class="next" href="{{ older.url | relative_url }}" data-track="{{ page.track }}">
+        <span class="dir">Older in track →</span>
+        <span class="t">{{ older.title }}</span>
+      </a>
+    {% else %}<span></span>{% endif %}
+  </nav>
+
+  <p class="article-foot muted" style="margin-top:26px">
+    <a href="{{ '/tracks/' | append: page.track | append: '/' | relative_url }}">All {{ siblings.size }} articles in {{ track.name | default: page.track }}</a>
+    · <a href="#" data-search-open>Search everything</a>
+  </p>
 </article>

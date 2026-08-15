@@ -1,69 +1,123 @@
 <!DOCTYPE html>
-<html lang="{{ site.lang | default: 'en' }}">
+<html lang="{{ site.lang | default: 'en' }}" class="no-js">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#14120f">
+  <meta name="theme-color" content="#05070a">
   {% seo %}
 
-  <!-- Set theme before paint to avoid a flash -->
+  <!-- Apply the saved theme before the first paint, otherwise a visitor who
+       chose light mode sees a dark flash on every page load. -->
   <script>
     (function () {
       try {
         var t = localStorage.getItem('saltmere-theme');
         if (t) document.documentElement.setAttribute('data-theme', t);
       } catch (e) {}
+      document.documentElement.classList.remove('no-js');
     })();
   </script>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..600&family=Literata:ital,opsz,wght@0,7..72,400..600;1,7..72,400..500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ '/assets/style.css' | relative_url }}">
+  <link rel="alternate" type="application/atom+xml" href="{{ '/feed.xml' | relative_url }}" title="{{ site.title }}">
 </head>
 <body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  {%- comment -%}
+    Track ids → display names, handed to the search script so results can show
+    "Distributed Systems" instead of the raw "distributed-systems" id.
+  {%- endcomment -%}
+  {%- capture track_names -%}
+    {%- for t in site.tracks -%}"{{ t.id }}":{{ t.name | jsonify }}{% unless forloop.last %},{% endunless %}{%- endfor -%}
+  {%- endcapture -%}
+
   <header class="site-header">
     <div class="wrap header-inner">
       <a class="brand" href="{{ '/' | relative_url }}">
-        <span class="brand-mark">✦</span> Saltmere
+        <span class="brand-mark" aria-hidden="true">◆</span> Saltmere
       </a>
-      <nav class="site-nav">
-        {% for t in site.tracks %}
-        <a href="{{ '/#' | append: t.id | relative_url }}">{{ t.name }}</a>
-        {% endfor %}
-      </nav>
-      <button class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle light / dark">
-        <span class="tt-sun" aria-hidden="true">☀</span>
-        <span class="tt-moon" aria-hidden="true">☾</span>
-      </button>
+      <span class="brand-sub">{{ site.articles.size }} articles · auto-published</span>
+
+      <span class="header-spacer"></span>
+
+      <div class="header-actions">
+        <button class="hud-btn search-trigger" type="button" data-search-open aria-label="Search articles">
+          <span class="st-label">
+            <span aria-hidden="true">⌕</span>
+            <span class="st-text">Search articles…</span>
+          </span>
+          <kbd>⌘K</kbd>
+        </button>
+
+        <div class="tracks-menu" data-open="false">
+          <button class="hud-btn" type="button" aria-expanded="false" aria-haspopup="true">
+            Tracks <span aria-hidden="true">▾</span>
+          </button>
+          <div class="tracks-panel">
+            {% for t in site.tracks %}
+            {% assign n = site.articles | where: "track", t.id | size %}
+            <a href="{{ '/tracks/' | append: t.id | append: '/' | relative_url }}" data-track="{{ t.id }}">
+              <span class="tm-dot" aria-hidden="true"></span>
+              {{ t.name }}
+              <span class="tm-count">{{ n }}</span>
+            </a>
+            {% endfor %}
+          </div>
+        </div>
+
+        <button class="theme-toggle hud-btn" type="button" aria-label="Toggle color theme">
+          <span class="tt-glyph" aria-hidden="true">◐</span>
+        </button>
+      </div>
     </div>
   </header>
 
-  <main class="wrap">
+  <main class="wrap" id="main">
     {{ content }}
   </main>
 
   <footer class="site-footer">
-    <div class="wrap">
-      <p class="foot-tag">{{ site.tagline }}</p>
-      <p class="muted">Auto-published twice daily · 09:00 &amp; 21:00 Europe/Kyiv · <a href="https://github.com/w0rxbend/saltmere">source</a></p>
+    <div class="wrap footer-grid">
+      <div>
+        <p class="foot-tag">{{ site.tagline }}</p>
+        <p class="foot-meta">Auto-published twice daily · 09:00 &amp; 21:00 Europe/Kyiv</p>
+      </div>
+      <div>
+        <p class="foot-meta">
+          <a href="{{ '/' | relative_url }}">Index</a> ·
+          <a href="#" data-search-open>Search</a> ·
+          <a href="https://github.com/w0rxbend/saltmere">Source</a>
+        </p>
+        <p class="foot-meta">{{ site.articles.size }} articles across {{ site.tracks.size }} tracks</p>
+      </div>
     </div>
   </footer>
 
-  <script>
-    (function () {
-      var btn = document.querySelector('.theme-toggle');
-      if (!btn) return;
-      function current() {
-        return document.documentElement.getAttribute('data-theme')
-          || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-      }
-      btn.addEventListener('click', function () {
-        var next = current() === 'dark' ? 'light' : 'dark';
-        document.documentElement.setAttribute('data-theme', next);
-        try { localStorage.setItem('saltmere-theme', next); } catch (e) {}
-      });
-    })();
-  </script>
+  <!-- Client-side search. The index is fetched on first open, not on load. -->
+  <div class="palette" id="palette" data-open="false" role="dialog" aria-modal="true" aria-label="Search articles"
+       data-index="{{ '/search.json' | relative_url }}"
+       data-track-names='{ {{ track_names }} }'>
+    <div class="palette-box">
+      <div class="palette-input-row">
+        <span class="prompt" aria-hidden="true">&gt;</span>
+        <input id="palette-input" type="search" placeholder="search titles, summaries, tags…"
+               autocomplete="off" autocorrect="off" spellcheck="false">
+        <span class="palette-hint" id="palette-count"></span>
+      </div>
+      <ul class="palette-results" id="palette-results"></ul>
+      <p class="palette-empty" id="palette-empty" hidden></p>
+      <div class="palette-foot">
+        <span><kbd>↑↓</kbd> navigate</span>
+        <span><kbd>↵</kbd> open</span>
+        <span><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ '/assets/app.js' | relative_url }}" defer></script>
 </body>
 </html>

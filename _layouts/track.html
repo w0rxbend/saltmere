@@ -1,0 +1,57 @@
+---
+layout: default
+---
+{%- assign t = site.tracks | where: "id", page.track | first -%}
+{%- assign items = site.articles | where: "track", page.track | sort: "date" | reverse -%}
+
+<div data-track="{{ page.track }}">
+  <p class="crumb"><a href="{{ '/' | relative_url }}">Index</a> / {{ t.name }}</p>
+
+  <section class="hero">
+    <p class="kicker">Track · {{ items.size }} articles</p>
+    <h1>{{ t.name }}</h1>
+    <p class="lede">{{ t.blurb }}</p>
+
+    <div class="hud-stats">
+      <div class="hud-stat"><span class="v">{{ items.size }}</span><span class="k">Articles</span></div>
+      {%- assign newest = items | first -%}
+      {%- assign oldest = items | last -%}
+      <div class="hud-stat"><span class="v">{{ newest.date | date: "%b %-d" }}</span><span class="k">Newest</span></div>
+      <div class="hud-stat"><span class="v">{{ oldest.date | date: "%b %-d" }}</span><span class="k">First</span></div>
+    </div>
+  </section>
+
+  <nav class="filters" aria-label="Other tracks">
+    <a class="chip" href="{{ '/' | relative_url }}">← All tracks</a>
+    {%- for other in site.tracks %}
+    {%- unless other.id == page.track %}
+    {%- assign n = site.articles | where: "track", other.id | size %}
+    <a class="chip" href="{{ '/tracks/' | append: other.id | append: '/' | relative_url }}" data-track="{{ other.id }}">
+      <span class="dot" aria-hidden="true"></span>{{ other.name }} <span class="n">{{ n }}</span>
+    </a>
+    {%- endunless %}
+    {%- endfor %}
+  </nav>
+
+  <section class="home-section">
+    <div class="section-head">
+      <h2>All articles</h2>
+      <span class="rule"></span>
+      <span class="count">newest first</span>
+    </div>
+    <ul class="list">
+      {%- for a in items %}
+      <li>
+        <a class="row" href="{{ a.url | relative_url }}">
+          <span class="row-date">{{ a.date | date: "%Y.%m.%d" }}</span>
+          <span class="row-main">
+            <span class="row-title">{{ a.title }}</span>
+            {%- if a.summary %}<span class="row-summary">{{ a.summary | strip_html | truncate: 160 }}</span>{% endif %}
+          </span>
+          <span class="row-time">{% if a.reading_time %}{{ a.reading_time }} min{% endif %}</span>
+        </a>
+      </li>
+      {%- endfor %}
+    </ul>
+  </section>
+</div>
